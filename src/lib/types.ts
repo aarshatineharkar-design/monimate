@@ -48,7 +48,8 @@ export type GameEvent =
   | { type: 'school_missed'; day: number }
   | { type: 'purchase'; amount: number; category: string; label: string }
   | { type: 'achievement_unlocked'; id: string }
-  | { type: 'life_event'; id: string };
+  | { type: 'life_event'; id: string }
+  | { type: 'level_started'; level: number };
 
 export interface DayRecord {
   day: number;
@@ -120,6 +121,8 @@ export interface WorldFlags {
   dailyMarks: string[];
   busPass: { validUntil: number } | null;
   hasBike: boolean;
+  /** prepaid bus rides left on a 10-trip card (School Level 3) */
+  rideCredits?: number;
 }
 
 // ── Whole simulation state ─────────────────────────────────────────────────
@@ -153,4 +156,9 @@ export interface GameState {
   sleeping: boolean;
   /** a rolled life event waiting on a player response, if any */
   pendingLifeEvent?: { id: string; emoji: string; text: string; choiceIds: string[] };
+  /** The level (one week each) being played on this path, how many are finished, and the best
+   *  star rating (1–3) earned on each. Older saves are filled in by the GameStore constructor. */
+  level?: number;
+  levelsCompleted?: number;
+  levelStars?: Record<string, number>;
 }

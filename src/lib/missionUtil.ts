@@ -17,3 +17,5 @@ export const resolvedThisWeek = (s: GameState, id: string) => {
   const st = s.missions.find(m => m.id === id)?.state;
   return st === 'completed' || st === 'expired';
 };
+/** Levels `from` and up (to the last level any path has). */
+export const fromLevel = (from: number, to = 10): number[] => Array.from({ length: to - from + 1 }, (_, i) => from + i);

@@ -81,7 +81,11 @@ export function takeLegacySave(email: string, lifePath: LifePath): GameState | n
 }
 
 /** Where a saved game is up to, for the path-select screen. */
-export interface SaveSummary { minutes: number; cash: number | null; savedAt: number }
+export interface SaveSummary {
+  minutes: number; cash: number | null; savedAt: number;
+  /** the level being played, how many are finished, and best stars per level */
+  level: number; levelsCompleted: number; stars: Record<string, number>;
+}
 const ALL_PATHS: LifePath[] = ['school', 'university', 'international', 'working'];
 
 /** Every life path this player has a save for (newest of this device and the cloud). Never throws. */
@@ -89,18 +93,30 @@ export async function listSaves(supabase: SupabaseClient, userId: string): Promi
   const out: Partial<Record<LifePath, SaveSummary>> = {};
   for (const path of ALL_PATHS) {
     const local = readLocal(userId, path);
-    if (local?.state) out[path] = { minutes: local.state.minutes, cash: local.state.finance?.accounts?.cash ?? null, savedAt: local.savedAt };
+    if (local?.state) {
+      const st = local.state;
+      out[path] = {
+        minutes: st.minutes, cash: st.finance?.accounts?.cash ?? null, savedAt: local.savedAt,
+        level: st.level ?? 1, levelsCompleted: st.levelsCompleted ?? (st.world?.flags?.includes('level1_complete') ? 1 : 0), stars: st.levelStars ?? {},
+      };
+    }
   }
   try {
     const { data, error } = await supabase
       .from('game_saves')
-      .select('life_path, game_minutes, updated_at, cash:state->finance->accounts->cash')
+      .select('life_path, game_minutes, updated_at, cash:state->finance->accounts->cash, level:state->level, done:state->levelsCompleted, stars:state->levelStars')
       .eq('user_id', userId);
     if (!error && Array.isArray(data)) {
-      for (const row of data as { life_path: LifePath; game_minutes: number; updated_at: string; cash?: number | null }[]) {
+      type Row = { life_path: LifePath; game_minutes: number; updated_at: string; cash?: number | null; level?: number | null; done?: number | null; stars?: Record<string, number> | null };
+      for (const row of data as Row[]) {
         const at = new Date(row.updated_at).getTime();
         const mine = out[row.life_path];
-        if (!mine || at > mine.savedAt) out[row.life_path] = { minutes: row.game_minutes, cash: typeof row.cash === 'number' ? row.cash : mine?.cash ?? null, savedAt: at };
+        if (!mine || at > mine.savedAt) {
+          out[row.life_path] = {
+            minutes: row.game_minutes, cash: typeof row.cash === 'number' ? row.cash : mine?.cash ?? null, savedAt: at,
+            level: row.level ?? mine?.level ?? 1, levelsCompleted: row.done ?? mine?.levelsCompleted ?? 0, stars: row.stars ?? mine?.stars ?? {},
+          };
+        }
       }
     }
   } catch { /* offline: this device's saves are still listed */ }

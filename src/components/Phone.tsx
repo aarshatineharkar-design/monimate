@@ -106,6 +106,7 @@ function HomeScreen({ store, inboxCount, open }: { store: GameStore; inboxCount:
       <div style={{ textAlign: 'center', margin: '8px 0 18px' }}>
         <div style={{ fontSize: 34, fontWeight: 700 }}>{formatTime(store.state.minutes)}</div>
         <div style={{ opacity: 0.7, fontSize: 12 }}>{DAY_NAMES[p.dayOfWeek]} · Week {p.week}</div>
+        <div style={{ fontSize: 12, color: '#ffd23f', marginTop: 4 }}>Level {store.level} · {store.levelInfo.name}</div>
       </div>
       {inboxCount > 0 && (
         <button style={st.notice} onClick={() => open('messages')}>
@@ -198,7 +199,8 @@ function BankApp({ store }: { store: GameStore }) {
   const max = rows[0]?.[1] ?? 1, total = rows.reduce((n, [, v]) => n + v, 0);
   const studentLoan = f.debt.loans.filter(l => l.kind === 'student').reduce((n, l) => n + l.principal, 0);
   const owed = f.debt.loans.filter(l => l.kind !== 'student').reduce((n, l) => n + l.principal, 0);
-  const sv = store.rules.savings;
+  const sv = store.savingsInfo;
+  const plan = store.budgetPlan(), act = store.budgetActuals();
   const [, redraw] = useState(0);
   const move = (ok: boolean) => { if (ok) redraw(n => n + 1); };
   const subs = f.expenses.recurring.filter(r => r.category === 'subscription');
@@ -226,6 +228,22 @@ function BankApp({ store }: { store: GameStore }) {
             </div>
           )}
       </div>
+      {plan && (
+        <>
+          <div style={st.section}>THIS WEEK'S BUDGET</div>
+          {([['food', '🍎', 'Food'], ['transport', '🚌', 'Transport'], ['fun', '🎮', 'Fun & shopping'], ['save', '🐷', 'Saved']] as const).map(([k, icon, label]) => {
+            const used = Math.max(0, act[k]), cap = Math.max(plan[k], 0.01), over = k !== 'save' && used > plan[k] + 0.5;
+            const done = k === 'save' && used >= plan[k];
+            return (
+              <div key={k} style={{ marginBottom: 6 }}>
+                <div style={st.row}><span>{icon} {label}</span><span style={{ color: over ? '#ff8080' : done ? '#7cfc00' : undefined }}>${used.toFixed(2)} / ${plan[k].toFixed(2)}</span></div>
+                <div style={st.barTrack}><div style={{ ...st.barFill, width: `${Math.min(100, (used / cap) * 100)}%`, background: over ? '#ff6b6b' : done ? '#3fb950' : '#f0c038' }} /></div>
+              </div>
+            );
+          })}
+        </>
+      )}
+      {(s.world.rideCredits ?? 0) > 0 && <div style={st.row}><span>🎫 10-trip bus card</span><span>{s.world.rideCredits} rides left</span></div>}
       {studentLoan > 0 && (
         <div style={st.row}><span>🎓 Student loan (interest-free while you study)</span><span>${studentLoan.toFixed(2)}</span></div>
       )}
@@ -318,7 +336,7 @@ function CalendarApp({ store }: { store: GameStore }) {
         return (
           <div key={name} style={{ ...st.thread, borderColor: today ? '#f0c038' : '#2a2d36', opacity: past ? 0.55 : 1 }}>
             <div style={{ fontWeight: 700, fontSize: 12, marginBottom: 4 }}>{today ? '▶ ' : ''}{name}{d < 5 ? ' · School 8:30' : ''}</div>
-            {store.rules.calendar.filter(e => e.day === d).map(e => {
+            {store.levelInfo.calendar.filter(e => e.day === d).map(e => {
               const state = e.missionId ? store.runtime(e.missionId)?.state : undefined;
               const mark = past || today ? (state === 'completed' ? ' ✓' : state === 'expired' ? ' ✗' : '') : '';
               return <div key={e.text} style={{ fontSize: 12 }}>{e.icon} {e.text}{mark}</div>;

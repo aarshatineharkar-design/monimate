@@ -17,8 +17,8 @@ import { EnergySystem } from '../game/systems/energySystem';
 import { ActivitySystem, type ActivityClock, type ActivityPlayer } from '../game/systems/activitySystem';
 import { HELP_PARENTS } from '../game/content/schoolActivities';
 import { migrateSave } from './saveMigration';
-import { getWeekGoal, type LifePath, type WeekGoalDef } from './gameData';
-import { pathRules, type PathRules } from './pathRules';
+import { getWeekGoal, getLifePath, type LifePath, type WeekGoalDef } from './gameData';
+import { pathRules, levelMeta, maxLevel, type PathRules, type LevelMeta } from './pathRules';
 import { didWeeklyShop } from './content/university';
 
 /** Small deterministic RNG (mulberry32), so a given save + day always rolls the same tasks. */
@@ -38,7 +38,7 @@ function hashString(str: string): number {
   return h >>> 0;
 }
 import {
-  Emit, MissionChoice, MissionDef, getDef, initialMissionRuntime, markKey, hasMark,
+  Emit, MissionChoice, MissionDef, getDef, initialMissionRuntime, markKey, hasMark, inLevel,
   missionDefs, missionsOnDayStart, missionsOnEvent, missionsOnMinute, missionWindowOpen, offeredToday,
 } from './missions';
 import type { MissionStep } from './missions';
@@ -91,6 +91,7 @@ export function createInitialState(
     today: emptyDay(0, finance.accounts.cash),
     currentActivity: null,
     weekDays: [], weeks: [], lifePath, xp: 0, ride: null, sleeping: false,
+    level: 1, levelsCompleted: 0, levelStars: {},
   };
 }
 
@@ -123,6 +124,12 @@ export interface LevelSummary {
    *  lines — the School recap keeps its dedicated fields above. */
   path: LifePath;
   highlights: RecapLine[];
+  /** the level this week was, its star rating (1–3), and what comes next Monday */
+  level: number;
+  stars: number;
+  levelName: string;
+  savingsEmoji: string;
+  next: { level: number; name: string; isNew: boolean } | null;
 }
 export interface RecapLine { icon: string; text: string; tone: 'good' | 'bad' | 'neutral' }
 
@@ -144,6 +151,8 @@ const WEEK_FLAG_PREFIXES = [
   'did_homework', 'got_pocket_money', 'week_started', 'on_time', 'pocket_money_done', 'birthday_resolved',
   'team_', 'lent_jordan', 'jordan_owes_', 'project_day_', 'baked_cookies', 'fell_for_scam', 'spotted_scam',
 ];
+/** Level 2 "No impulse buys": the choices that count as one. */
+const IMPULSE_FLAGS = ['wk_impulse', 'wk_mystery', 'wk_ate_now', 'wk_bag_mall', 'bought_sneakers', 'fell_for_scam'];
 /** Energy lost per game-hour of free play (activities like class carry their own costs). */
 const ENERGY_DRAIN_PER_HOUR = 3;
 const LOW_ENERGY = 15;
@@ -205,6 +214,11 @@ export class GameStore {
     this.state = state;
     this.rules = pathRules(state.lifePath);
     this.cast = NPCS.filter(n => this.rules.cast.includes(n.id));
+    // Saves from before levels existed: finishing the first week's recap meant Level 1 was done.
+    if (state.levelsCompleted === undefined) state.levelsCompleted = state.world.flags.includes('level1_complete') ? 1 : 0;
+    if (state.level === undefined) state.level = Math.min(maxLevel(state.lifePath), state.levelsCompleted >= 1 && parts(state.minutes).week >= 2 ? 2 : 1);
+    if (!state.levelStars) state.levelStars = {};
+    if (state.world.rideCredits === undefined) state.world.rideCredits = 0;
     // A save can be written while a menu had the clock paused (e.g. the "switch life path?" prompt);
     // a freshly loaded game always starts running.
     state.paused = false;
@@ -322,6 +336,16 @@ export class GameStore {
     if (p.minute === 0) this.emit({ type: 'hour', minutes: s.minutes });
 
     if (p.minuteOfDay === 0) {
+      // A new week starts the next level — if the last one's Sunday recap was finished.
+      if (p.dayOfWeek === 0 && p.day > 0) {
+        const next = Math.min(maxLevel(s.lifePath), (s.levelsCompleted ?? 0) + 1);
+        if (next !== s.level) { s.level = next; this.emit({ type: 'level_started', level: next }); }
+      }
+      // Level 3 onwards: Route 1 fares go up on Thursday (and stay up — prices rarely come back down).
+      if (p.dayOfWeek === 3 && (s.level ?? 1) >= 3 && !s.world.flags.includes('fare_rise')) {
+        s.world.flags.push('fare_rise');
+        this.pushNotice('Route 1 fares are now $2.50 a ride.');
+      }
       this.emit({ type: 'day_start', day: p.day, minutes: s.minutes });
       s.world.dailyMarks = s.world.dailyMarks.filter(m => Number(m.split(':').pop()) >= p.day - 1);
       missionsOnDayStart(s, this.defs, p.day);
@@ -365,6 +389,19 @@ export class GameStore {
     if (p.dayOfWeek === 5 && this.weekGoalId() === 'save_event' && f.accounts.savings > 0 && f.accounts.cash < 10) {
       this.pushNotice('Fair day! Take your savings out of the piggy bank before you head to school.');
     }
+    // Kids Saver (School Level 2+): a little interest every Sunday, plus a $1 bonus for any week
+    // you didn't take money out.
+    if (p.dayOfWeek === 6 && s.world.flags.includes('bank_account_open') && f.accounts.savings > 0) {
+      const interest = Math.round(f.accounts.savings * 0.04 / 52 * 100) / 100;
+      const bonus = s.world.flags.includes('wk_withdrew') ? 0 : 1;
+      const total = Math.round((interest + bonus) * 100) / 100;
+      if (total > 0) {
+        this.money.recordTransaction({ account: 'savings', amount: total, category: 'interest', type: 'income', description: bonus ? 'Kids Saver interest + no-withdrawal bonus' : 'Kids Saver interest' }, s.minutes);
+        s.world.flags = s.world.flags.filter(x => !x.startsWith('wk_interest:'));
+        s.world.flags.push(`wk_interest:${total}`);
+        this.pushNotice(bonus ? `Kids Saver paid $${total.toFixed(2)} — interest plus your $1 bonus for not withdrawing.` : `Kids Saver paid $${interest.toFixed(2)} interest. (No bonus: you withdrew this week.)`);
+      }
+    }
     const job = f.income.job;
     if (p.dayOfWeek === 3 && job) {
       this.earn(job.payPerHour * job.hoursPerWeek, 'income', `${job.name} pay`, job.location);
@@ -401,14 +438,50 @@ export class GameStore {
   /** Piggy bank: move cash into savings (and back). Recorded as a linked pair of transfers. */
   moveToSavings(amount: number): boolean {
     if (!(amount > 0) || !this.money.canAfford('cash', amount)) return false;
-    this.money.transfer('cash', 'savings', amount, this.state.minutes, this.rules.savings.atHome ? 'Into the piggy bank' : 'Into savings');
+    this.money.transfer('cash', 'savings', amount, this.state.minutes, `Into ${this.savingsInfo.atHome ? 'the piggy bank' : this.savingsInfo.name}`);
     return true;
   }
   takeFromSavings(amount: number): boolean {
     if (!(amount > 0) || !this.money.canAfford('savings', amount)) return false;
-    this.money.transfer('savings', 'cash', amount, this.state.minutes, this.rules.savings.atHome ? 'Out of the piggy bank' : 'Out of savings');
+    this.money.transfer('savings', 'cash', amount, this.state.minutes, `Out of ${this.savingsInfo.atHome ? 'the piggy bank' : this.savingsInfo.name}`);
+    if (!this.state.world.flags.includes('wk_withdrew')) this.state.world.flags.push('wk_withdrew');
     return true;
   }
+  /** Where savings live right now: School's piggy bank at home becomes a Kids Saver at the Bank
+   *  once you open one (Level 2); the other paths have a savings account from the start. */
+  get savingsInfo(): { name: string; emoji: string; atHome: boolean } {
+    if (this.state.lifePath === 'school' && this.state.world.flags.includes('bank_account_open')) {
+      return { name: 'Kids Saver', emoji: '🏦', atHome: false };
+    }
+    return this.rules.savings;
+  }
+  /** This level's name, blurb and calendar. */
+  get levelInfo(): LevelMeta { return levelMeta(this.state.lifePath, this.state.level ?? 1); }
+  get level(): number { return this.state.level ?? 1; }
+  /** Route 1's fare right now (it rises in School Level 3). */
+  busFare(): number { return BUS_ROUTE.fare + (this.state.world.flags.includes('fare_rise') ? 0.5 : 0); }
+
+  /** The week's budget plan (School Level 3), if one was made: dollars per envelope. */
+  budgetPlan(): { food: number; transport: number; fun: number; save: number } | null {
+    const f = this.state.world.flags.find(x => x.startsWith('wk_budget:'));
+    if (!f) return null;
+    const [food, transport, fun, save] = f.split(':').slice(1).map(Number);
+    return { food, transport, fun, save };
+  }
+  /** What actually went into each envelope this week (Monday 0:00 onwards). */
+  budgetActuals(): { food: number; transport: number; fun: number; save: number } {
+    const s = this.state, p = parts(s.minutes);
+    const tx = this.transactionsSince(at(p.day - p.dayOfWeek, 0, 0));
+    const spent = (cats: string[]) => tx.filter(t => t.account === 'cash' && t.amount < 0 && t.type === 'expense' && cats.includes(t.category)).reduce((n, t) => n - t.amount, 0);
+    const startSavings = Number(s.world.flags.find(f => f.startsWith('wk_start_savings:'))?.split(':')[1] ?? s.finance.accounts.savings);
+    return {
+      food: spent(['food']),
+      transport: spent(['transport']),
+      fun: spent(['entertainment', 'shopping', 'gift', 'subscription']),
+      save: Math.round((s.finance.accounts.savings - startSavings) * 100) / 100,
+    };
+  }
+
   /** Transactions since a game minute (e.g. this week), newest last. */
   transactionsSince(minute: number): Transaction[] {
     return this.state.finance.transactions.recent.filter(t => t.timestamp >= minute);
@@ -472,16 +545,23 @@ export class GameStore {
     const seen = new Set(s.world.flags.filter(f => f.startsWith(`seen:${week}:`)).map(f => f.split(':')[2]));
     for (const [pool, cfg] of Object.entries(DAILY_POOLS)) {
       const rnd = this.dayRandom(`pool:${pool}`);
-      const candidates = this.defs.filter(d => d.pool === pool && d.paths.includes(s.lifePath)
+      const candidates = this.defs.filter(d => d.pool === pool && d.paths.includes(s.lifePath) && inLevel(s, d)
         && d.window.days.includes(p.dayOfWeek) && (!d.requires || d.requires(s)));
       const fresh = candidates.filter(d => !seen.has(d.id)), repeats = candidates.filter(d => seen.has(d.id));
+      // Across weeks: tasks you have never had come first, then the ones you had longest ago.
+      const lastWeek = (id: string) => Number(s.world.flags.find(f => f.startsWith(`last:${id}:`))?.split(':')[2] ?? -1);
       for (let i = 0; i < cfg.count; i++) {
         const bag = fresh.length ? fresh : repeats;
         if (!bag.length) break;
-        const pick = bag.splice(Math.floor(rnd() * bag.length), 1)[0];
+        const oldest = Math.min(...bag.map(d => lastWeek(d.id)));
+        const group = bag.filter(d => lastWeek(d.id) === oldest);
+        const pick = group[Math.floor(rnd() * group.length)];
+        bag.splice(bag.indexOf(pick), 1);
         if (rnd() < cfg.chance) {
           s.world.dailyMarks.push(markKey(`pool:${pick.id}`, p.day));
           s.world.flags.push(`seen:${week}:${pick.id}`);
+          s.world.flags = s.world.flags.filter(f => !f.startsWith(`last:${pick.id}:`));
+          s.world.flags.push(`last:${pick.id}:${week}`);
         }
       }
     }
@@ -493,8 +573,10 @@ export class GameStore {
   }
   /** The step as the player sees it today: the day's variant (if any), minus options hidden right now. */
   stepFor(def: MissionDef, rt: MissionRuntime): MissionStep | undefined {
-    const base = def.steps[rt.stepIndex];
-    if (!base) return undefined;
+    const raw = def.steps[rt.stepIndex];
+    if (!raw) return undefined;
+    const lv = raw.byLevel?.[this.state.level ?? 1];
+    const base: MissionStep = lv ? { ...raw, speaker: lv.speaker ?? raw.speaker, lines: lv.lines ?? raw.lines, choices: lv.choices ?? raw.choices } : raw;
     let step: MissionStep = base;
     if (base.variants?.length) {
       const v = base.variants[Math.floor(this.dayRandom(`variant:${def.id}:${base.id}`)() * base.variants.length)];
@@ -521,6 +603,35 @@ export class GameStore {
     if (effect === 'bnpl_headphones') {
       // Three more $35 instalments still to pay: shown as money owed in the Bank app.
       s.finance.debt.loans.push({ id: `paylater_${s.minutes}`, kind: 'other', principal: 105, apr: 0, paymentPerPeriod: 35, periodDays: 14, nextDueAt: s.minutes + 14 * MIN_PER_DAY });
+    }
+    if (effect === 'open_kids_saver') {
+      if (!s.world.flags.includes('bank_account_open')) s.world.flags.push('bank_account_open');
+      if (s.finance.accounts.cash >= 5) this.moveToSavings(5);
+    }
+    if (effect === 'save_gift_10') this.moveToSavings(10);
+    if (effect === 'ten_trip_card') s.world.rideCredits = (s.world.rideCredits ?? 0) + 10;
+    if (effect === 'tuck_tab_4') {
+      s.finance.debt.loans.push({ id: 'tuck_tab', kind: 'other', principal: 4, apr: 0, paymentPerPeriod: 4, periodDays: 7, nextDueAt: s.minutes + 3 * MIN_PER_DAY });
+    }
+    if (effect === 'pay_tab') s.finance.debt.loans = s.finance.debt.loans.filter(l => l.id !== 'tuck_tab');
+    if (effect === 'tab_late_fee') { const t = s.finance.debt.loans.find(l => l.id === 'tuck_tab'); if (t) t.principal += 1; }
+    if (effect === 'premium_trial' && !s.finance.expenses.recurring.some(r => r.id === 'game_premium')) {
+      s.finance.expenses.recurring.push({ id: 'game_premium', category: 'subscription', name: 'Pixel Racer Premium', amount: 6.99, periodDays: 7, nextDueAt: s.minutes + 7 * MIN_PER_DAY });
+    }
+    if (effect === 'mark_attended') this.markSchoolAttended();
+    if (effect === 'packed_lunch_day') { const k = `wk_packed:${p.day}`; if (!s.world.flags.includes(k)) s.world.flags.push(k); }
+    if (effect === 'buy_bike') { s.world.hasBike = true; if (!s.world.flags.includes('owns_bike')) s.world.flags.push('owns_bike'); }
+    if (effect === 'save_coins') this.moveToSavings(6.4);
+    if (effect === 'budget_shift_food') {
+      const plan = this.budgetPlan();
+      if (plan && plan.fun >= 2) {
+        s.world.flags = s.world.flags.filter(f => !f.startsWith('wk_budget:'));
+        s.world.flags.push(`wk_budget:${plan.food + 2}:${plan.transport}:${plan.fun - 2}:${plan.save}`);
+      }
+    }
+    if (effect === 'cancel_premium') s.finance.expenses.recurring = s.finance.expenses.recurring.filter(r => r.id !== 'game_premium');
+    if (effect === 'cousin_loan') {
+      s.finance.debt.loans.push({ id: 'cousin_phone', kind: 'other', principal: 50, apr: 0, paymentPerPeriod: 10, periodDays: 7, nextDueAt: s.minutes + 7 * MIN_PER_DAY });
     }
     if (effect === 'save_5_matched' && this.moveToSavings(5)) {
       // Mum's "interest": $1 on top of every $5 saved, straight into the piggy bank.
@@ -639,6 +750,53 @@ export class GameStore {
         const judged = !!this.pendingLevelSummary || this.runtime(this.rules.recap)?.state === 'completed';
         return { def, achieved: judged && onTrack, progress: onTrack ? (judged ? 1 : 0.5) : 0,
           detail: `${onTrack ? 'On track' : 'Someone feels let down'} · Jordan ❤${j} · Riley ❤${r}` };
+      }
+      // ── School Level 2: Saving Up ──
+      case 'l2_bike': {
+        const bought = flags.includes('wk_bought_bike');
+        const achieved = bought || saved >= 30;
+        return { def, achieved, progress: achieved ? 1 : Math.min(1, saved / 30),
+          detail: bought ? 'Bought the bike!' : achieved ? `${money(saved)} saved — enough for the bike` : `${this.savingsInfo.emoji} ${money(saved)} / $30 saved` };
+      }
+      case 'l2_bank': {
+        const open = flags.includes('bank_account_open');
+        const achieved = open && saved >= 15;
+        return { def, achieved, progress: open ? Math.min(1, saved / 15) : 0,
+          detail: !open ? 'Open a Kids Saver at the Bank (Mon–Tue)' : achieved ? `${money(saved)} in your Kids Saver` : `🏦 ${money(saved)} / $15 in the Kids Saver` };
+      }
+      case 'l2_patience': {
+        const slips = IMPULSE_FLAGS.filter(x => flags.includes(x)).length;
+        const judged = !!this.pendingLevelSummary || this.runtime(this.rules.recap)?.state === 'completed';
+        return { def, achieved: judged && slips === 0, progress: slips ? 0 : judged ? 1 : 0.5,
+          detail: slips ? `${slips} impulse buy${slips === 1 ? '' : 's'} this week` : 'No impulse buys so far' };
+      }
+      case 'l2_gift': {
+        const given = flags.includes('wk_gift_given');
+        const ready = flags.includes('wk_gift_bought') || flags.includes('wk_gift_homemade');
+        return { def, achieved: given, progress: given ? 1 : ready ? 0.6 : 0,
+          detail: given ? 'Mum loved it' : ready ? "Ready for Sunday's birthday" : "Mum's birthday is Sunday — shop Saturday" };
+      }
+      // ── School Level 3: Budgeting ──
+      case 'l3_on_budget': {
+        const plan = this.budgetPlan(), act = this.budgetActuals();
+        if (!plan) return { def, achieved: false, progress: 0, detail: 'Make a budget plan (Budget app, Monday)' };
+        const over = (['food', 'transport', 'fun'] as const).filter(k => act[k] > plan[k] + 0.5);
+        const judged = !!this.pendingLevelSummary || this.runtime(this.rules.recap)?.state === 'completed';
+        return { def, achieved: judged && over.length === 0, progress: over.length ? 0.2 : judged ? 1 : 0.6,
+          detail: over.length ? `Over budget on ${over.join(' & ')}` : 'On budget so far — check the Bank app' };
+      }
+      case 'l3_save': {
+        const put = Math.max(0, this.budgetActuals().save);
+        return { def, achieved: put >= 8, progress: Math.min(1, put / 8), detail: `${this.savingsInfo.emoji} ${money(put)} / $8 saved this week` };
+      }
+      case 'l3_trip': {
+        const went = flags.includes('wk_trip_went'), owes = s.finance.debt.loans.some(l => l.id === 'tuck_tab');
+        return { def, achieved: went && !owes, progress: went ? (owes ? 0.5 : 1) : flags.includes('wk_trip_paid') ? 0.5 : 0,
+          detail: owes ? 'You still owe the tuck shop' : went ? 'Trip done, debts clear' : flags.includes('wk_trip_paid') ? 'Paid — trip is Friday' : '$12 due Thursday 3 PM' };
+      }
+      case 'l3_packed': {
+        const n = flags.filter(x => x.startsWith('wk_packed:')).length;
+        return { def, achieved: n >= 4, progress: Math.min(1, n / 4), detail: `🥪 ${n} / 4 packed lunches` };
       }
       // ── University ──
       case 'uni_buffer': {
@@ -1076,7 +1234,7 @@ export class GameStore {
     for (const rt of s.missions) {
       const def = this.def(rt.id);
       if (!def) continue;
-      if (rt.state === 'locked' && def.trigger.type === 'interaction' && !rt.triggered
+      if (rt.state === 'locked' && def.trigger.type === 'interaction' && !rt.triggered && inLevel(s, def)
         && missionWindowOpen(def, s.minutes) && (!def.requires || def.requires(s))) {
         out.add(def.trigger.npcId);
       }
@@ -1302,11 +1460,15 @@ export class GameStore {
       if (!s.world.flags.includes('pocket_money_done')) s.world.flags.push('pocket_money_done');
       this.weekStartBalance = s.finance.accounts.cash;
       // survives a reload mid-week, since the instance field above doesn't persist with the save
-      s.world.flags = s.world.flags.filter(f => !f.startsWith('wk_start_balance:'));
+      s.world.flags = s.world.flags.filter(f => !f.startsWith('wk_start_balance:') && !f.startsWith('wk_start_savings:'));
       s.world.flags.push(`wk_start_balance:${s.finance.accounts.cash}`);
+      s.world.flags.push(`wk_start_savings:${s.finance.accounts.savings}`);
     }
     if (def.id === this.rules.recap) {
       this.buildLevelSummary(s);
+      const sm = this.pendingLevelSummary!;
+      s.levelsCompleted = Math.max(s.levelsCompleted ?? 0, sm.level);
+      s.levelStars = { ...(s.levelStars ?? {}), [sm.level]: Math.max(s.levelStars?.[sm.level] ?? 0, sm.stars) };
       if (this.pendingLevelSummary?.goal?.achieved && !s.world.flags.includes('week_goal_met')) s.world.flags.push('week_goal_met');
     }
 
@@ -1353,8 +1515,85 @@ export class GameStore {
       busSpent: this.transactionsSince(at(parts(s.minutes).day - parts(s.minutes).dayOfWeek, 0, 0))
         .filter(t => t.category === 'transport' && t.amount < 0).reduce((sum, t) => sum - t.amount, 0),
       path: s.lifePath,
-      highlights: s.lifePath === 'university' ? this.universityHighlights(daysAttended, daysTotal) : [],
+      highlights: [],
+      level: s.level ?? 1, stars: 1, levelName: '', next: null, savingsEmoji: this.savingsInfo.emoji,
     };
+    const sm = this.pendingLevelSummary, lvl = sm.level;
+    sm.highlights = s.lifePath === 'university' ? this.universityHighlights(daysAttended, daysTotal)
+      : lvl === 2 ? this.schoolL2Highlights()
+      : lvl >= 3 ? this.schoolL3Highlights()
+      : [];
+    // Stars: 1 for finishing the week, 1 for the goal, 1 for a clean week (nothing that went badly)
+    // that still ended with money in your pocket.
+    const rough = s.lifePath === 'school' && lvl === 1
+      ? sm.birthdayOutcome === 'declined' || !sm.schoolProjectDone || sm.daysAttended < 4
+      : sm.highlights.some(h => h.tone === 'bad');
+    sm.stars = 1 + (sm.goal?.achieved ? 1 : 0) + (!rough && sm.endBalance > 0 ? 1 : 0);
+    const names = getLifePath(s.lifePath).levelNames;
+    sm.levelName = names[lvl - 1] ?? this.levelInfo.name;
+    const top = maxLevel(s.lifePath);
+    sm.next = lvl < top ? { level: lvl + 1, name: names[lvl] ?? levelMeta(s.lifePath, lvl + 1).name, isNew: true }
+      : names[lvl] ? { level: lvl + 1, name: names[lvl], isNew: false } : null;
+  }
+
+  /** School Level 2 — "Saving Up". */
+  private schoolL2Highlights(): RecapLine[] {
+    const s = this.state, f = s.world.flags, has = (x: string) => f.includes(x);
+    const out: RecapLine[] = [];
+    const line = (icon: string, text: string, tone: RecapLine['tone']) => out.push({ icon, text, tone });
+    if (has('wk_opened_bank')) line('🏦', `Opened a Kids Saver — $${s.finance.accounts.savings.toFixed(2)} in it now`, 'good');
+    else if (has('bank_account_open')) line('🏦', `Kids Saver: $${s.finance.accounts.savings.toFixed(2)}`, 'good');
+    else line('🐷', 'Kept your savings in the piggy bank (no interest)', 'neutral');
+    const interest = f.find(x => x.startsWith('wk_interest:'));
+    if (interest) line('💰', `Kids Saver paid $${Number(interest.split(':')[1]).toFixed(2)} on Sunday${has('wk_withdrew') ? '' : ' (with the no-withdrawal bonus)'}`, 'good');
+    if (has('wk_waited')) line('🍫', 'Waited — and got two chocolates instead of one', 'good');
+    else if (has('wk_ate_now')) line('🍫', 'Ate the chocolate straight away', 'neutral');
+    if (has('wk_bag_fixed')) line('🎒', 'Fixed your old bag for free', 'good');
+    else if (has('wk_bag_market')) line('🎒', 'Waited for the $12 market bag (saved $16)', 'good');
+    else if (has('wk_bag_mall')) line('🎒', 'Bought a new bag at the Mall for $28', 'neutral');
+    else if (has('wk_bag_market_plan')) line('🎒', 'Planned to buy a bag at the market — never did', 'bad');
+    if (has('wk_chore_contract') && !has('wk_contract_broken')) line('🍽️', 'Kept the dishes deal every night', 'good');
+    else if (has('wk_contract_broken')) line('🍽️', 'Broke the dishes deal with Mum', 'bad');
+    if (has('wk_interest_right')) line('📈', 'Worked out compound interest in class', 'good');
+    if (has('wk_mystery')) {
+      const won = this.runtime('l2_mystery_result')?.outcome === 'win';
+      line('📦', won ? "Jordan's mystery boxes paid off — this time. It was luck." : "Jordan's mystery boxes lost most of your $10", won ? 'neutral' : 'bad');
+    } else if (this.runtime('l2_mystery_boxes')?.outcome === 'no') line('📦', "Said no to Jordan's mystery boxes", 'good');
+    if (has('owns_bike') && has('wk_bought_bike')) line('🚲', 'Bought the second-hand bike with money you saved', 'good');
+    if (has('wk_gift_bought')) line('🎁', 'Bought Mum a birthday present', 'good');
+    else if (has('wk_gift_homemade')) line('🎁', 'Made Mum a card and breakfast in bed', 'good');
+    else line('🎁', "Nothing for Mum's birthday", 'bad');
+    return out;
+  }
+
+  /** School Level 3 — "Budgeting": the plan against what really happened. */
+  private schoolL3Highlights(): RecapLine[] {
+    const s = this.state, f = s.world.flags, has = (x: string) => f.includes(x);
+    const out: RecapLine[] = [];
+    const line = (icon: string, text: string, tone: RecapLine['tone']) => out.push({ icon, text, tone });
+    const plan = this.budgetPlan(), act = this.budgetActuals();
+    const m = (n: number) => `$${n.toFixed(2).replace(/\.00$/, '')}`;
+    if (!plan) line('📊', 'No budget plan this week — no way to know where the money went', 'bad');
+    else {
+      for (const [key, icon, label] of [['food', '🍎', 'Food'], ['transport', '🚌', 'Transport'], ['fun', '🎮', 'Fun & shopping']] as const) {
+        const over = act[key] - plan[key];
+        line(icon, `${label}: spent ${m(act[key])} of ${m(plan[key])} planned`, over > 0.5 ? 'bad' : 'good');
+      }
+      line('🐷', `Saved ${m(Math.max(0, act.save))} of ${m(plan.save)} planned`, act.save >= plan.save ? 'good' : 'bad');
+    }
+    const packed = f.filter(x => x.startsWith('wk_packed:')).length;
+    line('🥪', `Packed your own lunch ${packed} day${packed === 1 ? '' : 's'}`, packed >= 4 ? 'good' : packed >= 2 ? 'neutral' : 'bad');
+    if (has('wk_trip_went')) line('🦕', 'Went on the museum trip', 'good');
+    else if (has('wk_trip_paid')) line('🦕', 'Paid for the museum trip', 'good');
+    else line('🦕', 'Missed the museum trip', 'neutral');
+    if (has('wk_tab_paid')) line('🥧', 'Paid off the tuck-shop tab on time', 'good');
+    else if (s.finance.debt.loans.some(l => l.id === 'tuck_tab')) line('🥧', 'Still owe the tuck shop — with a late fee', 'bad');
+    if (has('wk_split_fair')) line('🍕', 'Paid for what you ate at the pizza place', 'good');
+    else if (has('wk_split_even')) line('🍕', 'Split the pizza bill evenly (paid for more than you ate)', 'neutral');
+    if (has('wk_ten_trip')) line('🎫', 'Bought a 10-trip card before the fare rise', 'good');
+    if (s.finance.expenses.recurring.some(r => r.id === 'game_premium')) line('🎮', 'Pixel Racer Premium is still charging $6.99 a week', 'bad');
+    else if (has('wk_trial_cancelled')) line('🎮', 'Cancelled the free trial before it charged', 'good');
+    return out;
   }
 
   /** The University week's story, read back off what actually happened. */
@@ -1470,13 +1709,15 @@ export class GameStore {
     const bus = busAtStop(fromStop, s.minutes);
     if (!bus) return { ok: false, reason: 'The bus has not arrived yet.' };
     const pass = s.world.busPass && s.world.busPass.validUntil > s.minutes;
-    const fare = pass ? 0 : BUS_ROUTE.fare;
+    const credit = !pass && (s.world.rideCredits ?? 0) > 0;
+    const fare = pass || credit ? 0 : this.busFare();
     if (!this.canAfford(fare)) return { ok: false, reason: `You need $${fare.toFixed(2)} for the fare.` };
     const energyCost = GameStore.BUS_BOARD_ENERGY_COST;
     if (s.energy.current < energyCost) {
       return { ok: false, reason: `You're too tired to catch the bus right now.` };
     }
     if (fare > 0) this.spend(fare, 'transport', 'Bus fare', BUS_ROUTE.id);
+    if (credit) s.world.rideCredits = (s.world.rideCredits ?? 0) - 1;
     this.consumeEnergy(energyCost);
     const ride = rideMinutes(fromStop, toStop);
     s.ride = { fromStop, toStop, startedAt: s.minutes, endsAt: s.minutes + Math.max(2, ride), fare };

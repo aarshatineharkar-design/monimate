@@ -99,7 +99,7 @@ export const DAILY_MISSIONS: MissionDef[] = [
     id: 'jordan_loan', pool: 'morning', kind: 'side', priority: 42, name: 'Can I Borrow $4?', emoji: '🤝',
     journalText: 'Jordan forgot lunch money and wants to borrow $4 until Friday.',
     storySetup: 'Jordan texts in a panic.',
-    paths: ['school'], repeat: 'daily',
+    paths: ['school'], repeat: 'daily', levels: [1],
     window: { days: [0, 1, 2], from: hm(7), until: hm(8, 10) },
     trigger: { type: 'time' },
     requires: s => !hasFlag(s, 'lent_jordan'),

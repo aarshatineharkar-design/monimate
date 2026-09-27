@@ -29,7 +29,7 @@ import { buildJournal, MissionChoice, MissionDef, trackedMission } from '../../l
 import { dayToSummaryView, weekToSummaryView } from '../../lib/summary';
 import type { GameState, NpcRuntime } from '../../lib/types';
 import { formatDay, formatTime, parts } from '../../lib/clock';
-import { pathRules, pathText, placeName } from '../../lib/pathRules';
+import { pathText, placeName, pathUnlocked, maxLevel, LEVELS_TO_UNLOCK } from '../../lib/pathRules';
 import { LIFE_EVENTS } from '../../lib/lifeEvents';
 import Phone, { type PhoneApp } from '../../components/Phone';
 
@@ -274,19 +274,49 @@ function PathSelect({ supabase, userId, current, onChoose, onBack }: {
           {LIFE_PATHS.map(p => {
             const sv = saves?.[p.id];
             const here = p.id === current;
+            const done: Partial<Record<LifePath, number>> = { school: saves?.school?.levelsCompleted ?? 0, university: saves?.university?.levelsCompleted ?? 0 };
+            const unlocked = pathUnlocked(p.id, done);
+            const playable = p.available && unlocked;
+            const level = sv?.level ?? 1;
             return (
-              <div key={p.id} style={{ ...ps.card, borderColor: p.available ? p.color : '#30363d', opacity: p.available ? 1 : 0.5 }}>
+              <div key={p.id} style={{ ...ps.card, borderColor: playable ? p.color : '#30363d', opacity: playable ? 1 : 0.62 }}>
                 {here && <div style={{ ...ps.badge, background: p.color, color: '#0d1117' }}>YOU ARE HERE</div>}
-                {!p.available && <div style={ps.badge}>COMING SOON</div>}
-                <div style={{ fontSize: 34 }}>{p.emoji}</div>
+                {!unlocked && <div style={ps.badge}>🔒 LOCKED</div>}
+                {unlocked && !p.available && <div style={ps.badge}>COMING SOON</div>}
+                <div style={{ fontSize: 34, filter: unlocked ? undefined : 'grayscale(1)' }}>{unlocked ? p.emoji : '🔒'}</div>
                 <div style={ps.name}>{p.name}</div>
                 <div style={ps.tagline}>{p.tagline}</div>
                 <div style={ps.desc}>{p.description}</div>
-                {p.available && (
-                  <div style={ps.level}>LEVEL 1 · {p.levelNames[0].toUpperCase()}</div>
+                {!unlocked && (
+                  <div style={ps.lockBox}>
+                    <div style={{ marginBottom: 6 }}>Finish {LEVELS_TO_UNLOCK} levels in School and University to unlock.</div>
+                    {(['school', 'university'] as LifePath[]).map(k => {
+                      const n = Math.min(LEVELS_TO_UNLOCK, done[k] ?? 0);
+                      return (
+                        <div key={k} style={{ marginBottom: 4 }}>
+                          <div style={{ display: 'flex', justifyContent: 'space-between' }}><span>{k === 'school' ? '🧑‍🎓 School' : '🎓 University'}</span><span>{n}/{LEVELS_TO_UNLOCK}</span></div>
+                          <div style={ps.track}><div style={{ ...ps.fill, width: `${(n / LEVELS_TO_UNLOCK) * 100}%` }} /></div>
+                        </div>
+                      );
+                    })}
+                  </div>
                 )}
-                {p.available && (
+                {playable && (
                   <>
+                    <div style={ps.level}>LEVEL {level} · {(p.levelNames[level - 1] ?? p.levelNames[p.levelNames.length - 1]).toUpperCase()}</div>
+                    <div style={ps.levels} aria-label="Levels">
+                      {p.levelNames.map((name, i) => {
+                        const stars = sv?.stars?.[i + 1] ?? 0;
+                        const built = i + 1 <= maxLevel(p.id);
+                        const reached = built && i + 1 <= Math.max(level, (sv?.levelsCompleted ?? 0) + 1);
+                        return (
+                          <div key={name} title={`Level ${i + 1}: ${name}${built ? '' : ' (coming soon)'}`} style={{ ...ps.levelDot, borderColor: reached ? p.color : '#30363d', color: reached ? '#fff' : '#555', borderStyle: built ? 'solid' : 'dashed' }}>
+                            <div>{i + 1}</div>
+                            <div style={{ fontSize: 9, letterSpacing: -1 }}>{stars ? '★'.repeat(stars) : reached ? '·' : built ? '🔒' : '⏳'}</div>
+                          </div>
+                        );
+                      })}
+                    </div>
                     <button style={{ ...ps.cta, background: p.color }} onClick={() => (here && onBack ? onBack() : onChoose(p.id))}>
                       {sv ? `▶ ${here ? 'KEEP PLAYING' : 'CONTINUE'}` : '✦ START THIS LIFE'}
                     </button>
@@ -332,6 +362,11 @@ const ps: Record<string, React.CSSProperties> = {
   link: { background: 'none', border: 'none', color: '#8b949e', textDecoration: 'underline', cursor: 'pointer', fontFamily: "'VT323', monospace", fontSize: 17, alignSelf: 'center' },
   confirm: { fontSize: 17, color: '#ffa0a0', background: '#2a1416', padding: 8, border: '2px solid #5a2328' },
   dangerBtn: { flex: 1, fontFamily: "'VT323', monospace", fontSize: 17, background: '#ff6b6b', color: '#0d1117', border: '2px solid #000', cursor: 'pointer' },
+  lockBox: { fontSize: 17, color: '#cfd8e3', background: '#0d1117', border: '2px solid #30363d', padding: 8, marginTop: 6 },
+  track: { height: 6, background: '#30363d' },
+  fill: { height: '100%', background: '#7cfc00' },
+  levels: { display: 'flex', gap: 4, flexWrap: 'wrap', marginTop: 4 },
+  levelDot: { width: 30, height: 32, border: '2px solid', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', fontFamily: "'Press Start 2P', monospace", fontSize: 8, color: '#fff', background: '#0d1117' },
   ghostBtn: { flex: 1, fontFamily: "'VT323', monospace", fontSize: 17, background: '#30363d', color: '#e6edf3', border: '2px solid #000', cursor: 'pointer' },
 };
 
@@ -448,7 +483,13 @@ function GameCanvas({ supabase, player, initialState, notice, onChangePath }: {
     const id = setInterval(save, 30_000);
     const onHide = () => { if (document.visibilityState === 'hidden') save(); };
     document.addEventListener('visibilitychange', onHide);
-    const offEvent = store.onEvent(e => { if (e.type === 'day_end' || e.type === 'week_end') save(); });
+    const offEvent = store.onEvent(e => {
+      if (e.type === 'day_end' || e.type === 'week_end') save();
+      if (e.type === 'level_started') {
+        const info = store.levelInfo;
+        pushToast({ icon: '⬆️', label: 'NEW LEVEL', lines: [`Level ${e.level} · ${info.name}`, info.blurb], tone: 'gold', ms: 9000 });
+      }
+    });
     return () => { clearInterval(id); document.removeEventListener('visibilitychange', onHide); offEvent(); save(); };
   }, [save, store]);
   const logout = async () => { await writeSave(supabase, player.id, store.state); await signOut(); };
@@ -771,7 +812,7 @@ function GameCanvas({ supabase, player, initialState, notice, onChangePath }: {
       {/* HUD — blueprint section 20: time + objective top-left, money/energy/goal top-right, the
           phone bottom-right. Everything else lives in the phone. */}
       <div style={hud.topLeft}>
-        <div style={hud.clock}>{day.slice(0, 3)} <b>{time}</b></div>
+        <div style={hud.clock}>{day.slice(0, 3)} <b>{time}</b> <span style={{ color: '#ffd23f', fontSize: 11, marginLeft: 6 }}>LV {store.level}</span></div>
         <div style={hud.objective}>
           {inbox.length > 0 ? (
             <button style={hud.objectiveBtn} onClick={() => setPhoneApp('messages')}>
@@ -889,10 +930,10 @@ function GameCanvas({ supabase, player, initialState, notice, onChangePath }: {
       {nearStopId && !actionable && !nearbyItem && (
         <div style={hud.buyPrompt}>
           <div style={{ fontSize: 11, opacity: 0.8, marginBottom: 2 }}>
-            🚏 {stopName(nearStopId)} · {BUS_ROUTE.name} · Fare ${BUS_ROUTE.fare.toFixed(2)}
+            🚏 {stopName(nearStopId)} · {BUS_ROUTE.name} · Fare ${store.busFare().toFixed(2)}{(s.world.rideCredits ?? 0) > 0 ? ` · 🎫 ${s.world.rideCredits} rides left` : ''}
           </div>
           {busArrived
-            ? `E: Board the bus — $${BUS_ROUTE.fare.toFixed(2)} · -1 energy`
+            ? `E: Board the bus — ${(s.world.rideCredits ?? 0) > 0 ? '1 ride from your card' : `$${store.busFare().toFixed(2)}`} · -1 energy`
             : nextBus
               ? `Waiting for the bus — next arrives at ${formatTime(nextBus.arrivesAt)}`
               : 'No more buses today'}
@@ -915,7 +956,7 @@ function GameCanvas({ supabase, player, initialState, notice, onChangePath }: {
           speaker={`${stopName(boardingAt)} — Route 1`}
           lines={['Where to?']}
           choices={Object.values(BUS_STOPS).filter(st => st.id !== boardingAt).map(st => ({
-            id: st.id, label: pathText(s.lifePath, st.name), sublabel: `~${rideMinutes(boardingAt, st.id)} min · $${BUS_ROUTE.fare.toFixed(2)} · -1 energy`,
+            id: st.id, label: pathText(s.lifePath, st.name), sublabel: `~${rideMinutes(boardingAt, st.id)} min · ${(s.world.rideCredits ?? 0) > 0 ? '🎫 1 ride' : `$${store.busFare().toFixed(2)}`} · -1 energy`,
             cost: 0, minutes: 0, consequence: '',
           }))}
           onChoose={(c) => {
@@ -1144,9 +1185,9 @@ function GameCanvas({ supabase, player, initialState, notice, onChangePath }: {
       {s.player.place === 'home' && (
         <div style={hud.homeBtns}>
           <button style={{ ...hud.sleepBtn, position: 'static' }} onClick={() => store.sleep(false)}>🛏️ Go to sleep</button>
-          {rules.savings.atHome
-            ? <button style={{ ...hud.sleepBtn, position: 'static', background: '#f0a0c0' }} onClick={() => setShowPiggy(true)}>{rules.savings.emoji} {rules.savings.name} · ${s.finance.accounts.savings.toFixed(2)}</button>
-            : <button style={{ ...hud.sleepBtn, position: 'static', background: '#79c0ff' }} onClick={() => setPhoneApp('bank')}>{rules.savings.emoji} Savings · ${s.finance.accounts.savings.toFixed(2)}</button>}
+          {store.savingsInfo.atHome
+            ? <button style={{ ...hud.sleepBtn, position: 'static', background: '#f0a0c0' }} onClick={() => setShowPiggy(true)}>{store.savingsInfo.emoji} {store.savingsInfo.name} · ${s.finance.accounts.savings.toFixed(2)}</button>
+            : <button style={{ ...hud.sleepBtn, position: 'static', background: '#79c0ff' }} onClick={() => setPhoneApp('bank')}>{store.savingsInfo.emoji} {store.savingsInfo.name} · ${s.finance.accounts.savings.toFixed(2)}</button>}
         </div>
       )}
       {showPiggy && s.player.place === 'home' && <PiggyBank store={store} onClose={() => setShowPiggy(false)} />}
@@ -1264,7 +1305,7 @@ function LevelSummaryModal({ summary: sm, onClose }: { summary: LevelSummary; on
     let live = true;
     setMentorTake(null);
     askMentorWeeklyRecap({
-      lifePath: sm.path, highlights: sm.highlights.map(h => h.text),
+      lifePath: `${sm.path} (level ${sm.level}: ${sm.levelName})`, highlights: sm.highlights.map(h => h.text),
       startBalance: sm.startBalance, endBalance: sm.endBalance,
       daysAttended: sm.daysAttended, daysTotal: sm.daysTotal,
       schoolProjectDone: sm.schoolProjectDone, birthdayOutcome: sm.birthdayOutcome,
@@ -1287,8 +1328,20 @@ function LevelSummaryModal({ summary: sm, onClose }: { summary: LevelSummary; on
   return (
     <div style={hud.modalBackdrop}>
       <div style={{ ...hud.modal, width: 'min(400px, 92vw)' }}>
-        <h2 style={{ marginBottom: 4 }}>📅 Your Week</h2>
-        <div style={{ opacity: 0.7, fontSize: 13, marginBottom: 12 }}>Here's how the week actually went.</div>
+        <div style={{ fontSize: 11, letterSpacing: 1, color: '#ffd23f' }}>LEVEL {sm.level} COMPLETE · {sm.levelName.toUpperCase()}</div>
+        <div style={{ fontSize: 30, margin: '2px 0 4px' }} aria-label={`${sm.stars} of 3 stars`}>
+          {[1, 2, 3].map(n => <span key={n} style={{ opacity: n <= sm.stars ? 1 : 0.2 }}>⭐</span>)}
+        </div>
+        <div style={{ opacity: 0.7, fontSize: 12, marginBottom: 12 }}>
+          ⭐ finished the week · ⭐ hit your goal · ⭐ a clean week with money left
+        </div>
+        {sm.next && (
+          <div style={{ marginBottom: 12, padding: '10px 12px', borderRadius: 8, background: '#161b22', border: `1px solid ${sm.next.isNew ? '#ffd23f' : '#30363d'}` }}>
+            {sm.next.isNew
+              ? <><div style={{ fontSize: 11, color: '#ffd23f' }}>UNLOCKED · STARTS MONDAY</div><div style={{ fontWeight: 700 }}>Level {sm.next.level}: {sm.next.name}</div></>
+              : <><div style={{ fontSize: 11, opacity: 0.7 }}>COMING SOON</div><div>Level {sm.next.level}: {sm.next.name} — until then, replay this level for more stars.</div></>}
+          </div>
+        )}
         {sm.goal && (
           <div style={{ padding: '10px 12px', borderRadius: 8, marginBottom: 12, background: sm.goal.achieved ? '#12351c' : '#3a1c1c', border: `1px solid ${sm.goal.achieved ? '#3fb950' : '#ff8080'}` }}>
             <div style={{ fontSize: 11, opacity: 0.7 }}>YOUR GOAL</div>
@@ -1301,8 +1354,8 @@ function LevelSummaryModal({ summary: sm, onClose }: { summary: LevelSummary; on
           <div style={{ fontSize: 20, opacity: 0.5, alignSelf: 'center' }}>→</div>
           <div><div style={{ fontSize: 11, opacity: 0.6 }}>ENDED WITH</div><div style={{ fontSize: 18, fontWeight: 700, color: net >= 0 ? '#7cfc00' : '#ff8080' }}>${sm.endBalance.toFixed(2)}</div></div>
         </div>
-        <div style={{ marginBottom: 6 }}>💵 Earned ${sm.earned.toFixed(2)} · Spent ${sm.spent.toFixed(2)}{sm.savings > 0 ? ` · ${pathRules(sm.path).savings.emoji} $${sm.savings.toFixed(2)} saved` : ''}</div>
-        {sm.path !== 'school' ? (
+        <div style={{ marginBottom: 6 }}>💵 Earned ${sm.earned.toFixed(2)} · Spent ${sm.spent.toFixed(2)}{sm.savings > 0 ? ` · ${sm.savingsEmoji} $${sm.savings.toFixed(2)} saved` : ''}</div>
+        {sm.path !== 'school' || sm.level > 1 ? (
           sm.highlights.map((h, i) => (
             <div key={i} style={{ marginBottom: 6, color: h.tone === 'good' ? '#aef0a0' : h.tone === 'bad' ? '#ffa0a0' : undefined }}>
               {h.icon} {h.text}

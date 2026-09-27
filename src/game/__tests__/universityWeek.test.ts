@@ -252,7 +252,7 @@ test('University Week C: a student who stays in all week still reaches Sunday, a
   // Next Monday: StudyLink pays again and last week's flags are gone.
   advanceTo(store, 7, 7, 1);
   choose(store, 'uni_payday', 'take');
-  assert.ok(!store.state.world.flags.some(f => f.startsWith('wk_') && !f.startsWith('wk_start_balance:')), 'week flags cleared on payday');
+  assert.ok(!store.state.world.flags.some(f => f.startsWith('wk_') && !f.startsWith('wk_start_')), 'week flags cleared on payday');
 });
 
 test('University: Monday rent message waits until StudyLink has paid', () => {
@@ -274,7 +274,7 @@ test('University: every in-person step happens somewhere that is open during its
       }
     }
   }
-  assert.ok(pathRules('university').calendar.every(e => missionDefs('university').some(d => d.id === e.missionId)), 'calendar only lists real missions');
+  assert.ok(pathRules('university').levels[0].calendar.every(e => missionDefs('university').some(d => d.id === e.missionId)), 'calendar only lists real missions');
 });
 
 test('Bug fix: a shift started just before its window closes is not marked "missed" halfway through', () => {

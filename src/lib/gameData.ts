@@ -28,7 +28,20 @@ export const UNI_WEEK_GOALS: WeekGoalDef[] = [
   { id: 'uni_ready', emoji: '📚', name: 'Nail your first assignment' },
   { id: 'uni_social', emoji: '🤝', name: 'Make friends in week one' },
 ];
-const ALL_WEEK_GOALS = [...WEEK_GOALS, ...UNI_WEEK_GOALS];
+/** School Level 2 ("Saving Up") and Level 3 ("Budgeting") goals. */
+export const L2_WEEK_GOALS: WeekGoalDef[] = [
+  { id: 'l2_bike', emoji: '🚲', name: 'Save $30 for a bike', target: 30 },
+  { id: 'l2_bank', emoji: '🏦', name: 'Open a Kids Saver, keep $15 in it', target: 15 },
+  { id: 'l2_patience', emoji: '⏳', name: 'No impulse buys all week' },
+  { id: 'l2_gift', emoji: '🎁', name: "A birthday gift for Mum" },
+];
+export const L3_WEEK_GOALS: WeekGoalDef[] = [
+  { id: 'l3_on_budget', emoji: '📊', name: 'Stick to your budget plan' },
+  { id: 'l3_save', emoji: '🐷', name: 'Save $8 of your $30', target: 8 },
+  { id: 'l3_trip', emoji: '🏛️', name: 'Go on the trip, owe nobody' },
+  { id: 'l3_packed', emoji: '🥪', name: 'Pack your lunch 4 days' },
+];
+const ALL_WEEK_GOALS = [...WEEK_GOALS, ...UNI_WEEK_GOALS, ...L2_WEEK_GOALS, ...L3_WEEK_GOALS];
 export const getWeekGoal = (id: string) => ALL_WEEK_GOALS.find(g => g.id === id);
 
 /** A savings target as authored in a life-path config. */
@@ -67,7 +80,7 @@ export const LIFE_PATHS: LifePathConfig[] = [
     goals: [
       // Pack 2 replaces this with the goal the player picks on Monday morning.
     ],
-    levelNames: ['Money Basics', 'Saving Up', 'Budgeting', 'Bigger Goals'],
+    levelNames: ['Money Basics', 'Saving Up', 'Budgeting', 'Earning Money', 'Bigger Goals', 'Smart Money'],
     color: '#60b8ff', available: true,
   },
   {
