@@ -65,11 +65,11 @@ function freshDefaultStore() {
 });
 (0, node_test_1.default)('RelationshipAdjust 8: adjusting a relationship does not change money, time, or energy', () => {
     const store = freshDefaultStore();
-    const balanceBefore = store.state.finance.balance;
+    const balanceBefore = store.state.finance.accounts.cash;
     const minutesBefore = store.state.minutes;
     const energyBefore = store.getEnergy().current;
     store.adjustRelationship('Mum', -1);
-    strict_1.default.equal(store.state.finance.balance, balanceBefore);
+    strict_1.default.equal(store.state.finance.accounts.cash, balanceBefore);
     strict_1.default.equal(store.state.minutes, minutesBefore);
     strict_1.default.equal(store.getEnergy().current, energyBefore);
 });

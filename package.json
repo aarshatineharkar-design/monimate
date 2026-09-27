@@ -6,7 +6,9 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "eslint"
+    "lint": "eslint",
+    "test": "tsc -p tsconfig.game-test.json && node --test dist-game-test/**/*.test.js",
+    "pretest": "node scripts/clean-dist.mjs"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.116.0",

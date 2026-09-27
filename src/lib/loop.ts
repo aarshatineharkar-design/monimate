@@ -40,6 +40,8 @@ function atBuildingDoor(px: number, py: number): string | null {
 export class GameLoop {
   camera = new SmoothCamera();
   private lastTs = 0;
+  /** the closed door the player is currently standing at, so its notice shows once, not every frame */
+  private blockedDoor: string | null = null;
   pulseT = 0;
 
   constructor(public store: GameStore, private mover: MoverConfig = DEFAULT_MOVER) {}
@@ -60,9 +62,15 @@ export class GameLoop {
       const { movedTiles } = stepMovement(s.player, input, dt, this.mover, collides);
       this.store.tick(dt, movedTiles, 'walk');
 
-      // entering a building through its door
+      // entering a building through its door; a closed door says why, once per visit to it
       const hit = atBuildingDoor(s.player.x, s.player.y);
-      if (hit) this.store.enterPlace(hit);
+      if (hit) {
+        const res = this.store.enterPlace(hit);
+        if (!res.ok && this.blockedDoor !== hit) this.store.pushNotice(`${getPlace(hit)?.name ?? 'It'}: ${res.reason ?? 'Closed.'}`);
+        this.blockedDoor = res.ok ? null : hit;
+      } else {
+        this.blockedDoor = null;
+      }
 
       // park has no walls; report entry/exit as a zone
       const park = getPlace('park');

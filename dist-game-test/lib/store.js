@@ -12,13 +12,18 @@ exports.createInitialState = createInitialState;
  * calling `advance(minutes)`, so a bus ride, a lunch break, a sleep and a walk all move the same clock.
  */
 const clock_1 = require("./clock");
+const financeSystem_1 = require("../game/systems/financeSystem");
+const energySystem_1 = require("../game/systems/energySystem");
+const activitySystem_1 = require("../game/systems/activitySystem");
+const mondayActivities_1 = require("../game/content/school/mondayActivities");
+const schoolActivities_1 = require("../game/content/schoolActivities");
+const saveMigration_1 = require("./saveMigration");
 const missions_1 = require("./missions");
 const achievements_1 = require("./achievements");
 const lifeEvents_1 = require("./lifeEvents");
 const world_1 = require("./world");
 exports.BASE_MINUTES_PER_SECOND = clock_1.TIME_SCALE;
 const RIDE_REAL_SECONDS = 6; // a bus trip plays out over ~6 real seconds
-const SCHOOL_START = (0, clock_1.hm)(8, 30);
 const SCHOOL_END = (0, clock_1.hm)(15, 30);
 const PASS_OUT_AT = (0, clock_1.hm)(2, 0); // stay up past 2 AM and you fall asleep where you are
 const WAKE_AT = (0, clock_1.hm)(7, 0);
@@ -26,7 +31,7 @@ const emptyDay = (day, balance) => ({
     day, startBalance: balance, endBalance: balance, spent: 0, earned: 0, schoolAttended: null,
     missionsCompleted: [], missionsMissed: [], socialActivities: 0, travel: [], lateToSchool: false, bedtimeMinuteOfDay: null,
 });
-function createInitialState(lifePath, finance) {
+function createInitialState(lifePath, finance, goals = { active: [], completed: [] }) {
     const defs = (0, missions_1.missionDefs)(lifePath);
     const start = (0, clock_1.at)(0, 7, 0); // Monday 7:00 AM, at home, sun rising
     const home = (0, world_1.tileToPx)((0, world_1.doorTile)('home')); // outdoor px — used only for lastDoor (where we pop back out to)
@@ -38,20 +43,21 @@ function createInitialState(lifePath, finance) {
         ? { x: homeInterior.spawn.x * world_1.INTERIOR_TILE_PX, y: homeInterior.spawn.y * world_1.INTERIOR_TILE_PX }
         : { x: home.x, y: home.y };
     return {
-        version: 2, minutes: start, paused: false, timeMultiplier: 1,
+        version: 3, minutes: start, paused: false, timeMultiplier: 1,
         player: { x: spawnPx.x, y: spawnPx.y, vx: 0, vy: 0, facing: Math.PI / 2, scene: 'interior_home', place: 'home', status: 'idle', lastDoor: { placeId: 'home', x: home.x, y: home.y, facing: Math.PI / 2 } },
         finance,
-        // Step 6: matches the Core Simulation's own School-campaign default (createInitialGameState.ts).
-        energy: { current: 100, max: 100 },
+        goals,
+        energy: { current: 100, max: 100, recoveryPerHourAsleep: 12.5 },
         world: { flags: [], relationships: { Mum: 3, Jordan: 2, Riley: 1 }, dailyMarks: [], busPass: null, hasBike: false },
         missions: (0, missions_1.initialMissionRuntime)(defs),
         npcs: {},
-        ledger: [],
-        today: emptyDay(0, finance.balance),
+        today: emptyDay(0, finance.accounts.cash),
         currentActivity: null,
         weekDays: [], weeks: [], lifePath, xp: 0, ride: null, sleeping: false,
     };
 }
+const CLASS_BELL = (0, clock_1.hm)(8, 30);
+const LAST_CLASS_START = (0, clock_1.hm)(11, 30);
 class GameStore {
     constructor(state) {
         /** newly available missions waiting for the UI to offer them */
@@ -77,6 +83,8 @@ class GameStore {
          *  for the Friday recap, since leftover balance from a previous week means "start of week" isn't
          *  simply the weekly income figure once you're past week one. */
         this.weekStartBalance = 0;
+        /** One-line notices for the HUD (e.g. "Closed — opens at 7:30 AM"), drained by takeNotices(). */
+        this.noticeQueue = [];
         // ── subscription (React) ──────────────────────────────────────────────────
         this.subscribe = (fn) => { this.listeners.add(fn); return () => { this.listeners.delete(fn); }; };
         this.getVersion = () => this.version;
@@ -87,13 +95,20 @@ class GameStore {
             this.eventListeners.forEach(l => l(e));
         };
         this.state = state;
-        // Step 6: self-heal saves made before Energy existed as a GameState field — old saves
-        // (version 2, pre-Energy) simply won't have this key.
-        if (!state.energy)
-            state.energy = { current: 100, max: 100 };
-        // Step 18: self-heal saves made before currentActivity existed — same pattern as Energy above.
         if (state.currentActivity === undefined)
             state.currentActivity = null;
+        this.money = new financeSystem_1.FinanceSystem(state.finance, tx => this.onTransaction(tx));
+        this.energySys = new energySystem_1.EnergySystem(state.energy);
+        const clock = { advance: m => this.advance(m), getTime: () => ({ minutes: this.state.minutes }) };
+        const player = {
+            getLocation: () => this.state.player.place,
+            changeLocation: placeId => { if (placeId && placeId !== this.state.player.place) {
+                this.exitPlace();
+                this.enterPlace(placeId);
+            } },
+            setCurrentActivity: tag => this.setCurrentActivity(tag),
+        };
+        this.activities = new activitySystem_1.ActivitySystem(clock, player, this.energySys, this.money);
         // Self-heal saves made while the interior spawn-point bug was live: if the player is "inside"
         // a room but their x/y sit outside that room's own tile grid, they'd be wedged against a wall
         // with movement permanently zeroed. Snap them back to that interior's spawn tile instead.
@@ -110,6 +125,13 @@ class GameStore {
             }
         }
         this.defs = (0, missions_1.missionDefs)(state.lifePath);
+        // A save made while a mission had more steps than it does now points past its last step;
+        // clamp it so the mission can still finish instead of silently hanging until it expires.
+        for (const rt of state.missions) {
+            const def = this.def(rt.id);
+            if (def && rt.stepIndex >= def.steps.length)
+                rt.stepIndex = def.steps.length - 1;
+        }
         this.initNpcs(true);
         // Missions that should already be open at the start time get evaluated immediately
         this.evaluateMissions();
@@ -215,80 +237,175 @@ class GameStore {
     evaluateMissions() {
         (0, missions_1.missionsOnMinute)(this.state, this.defs, this.emit, (def, rt) => this.onMissionExpired(def, rt));
     }
-    // ══ ECONOMY (ported from your processTimeEvents, now driven by the same clock) ═══════
+    // ══ ECONOMY ══════════════════════════════════════════════════════════════
+    /** 9 AM each day: weekly pay on Thursday, then any recurring expense that has come due (rent,
+     *  phone bill…). A bill you can't cover isn't silently skipped — it becomes arrears you owe. */
     economyOnMinute(p) {
         const s = this.state, f = s.finance;
         if (p.minuteOfDay !== (0, clock_1.hm)(9))
             return;
-        // Thursday payday
-        if (p.dayOfWeek === 3 && f.job && f.job.id !== 'allowance') {
-            const pay = f.job.payPerHour * f.job.hoursPerWeek;
-            this.earn(pay, 'income', `${f.job.name} pay`);
+        const job = f.income.job;
+        if (p.dayOfWeek === 3 && job) {
+            this.earn(job.payPerHour * job.hoursPerWeek, 'income', `${job.name} pay`, job.location);
         }
-        // Monday rent
-        if (p.dayOfWeek === 0 && f.rentAmount > 0 && p.day > 0) {
-            if (f.balance >= f.rentAmount)
-                this.spend(f.rentAmount, 'rent', 'Rent');
-            else {
-                f.debt += f.rentAmount;
-            }
+        for (const bill of f.expenses.recurring) {
+            if (bill.nextDueAt > s.minutes)
+                continue;
+            bill.nextDueAt += bill.periodDays * clock_1.MIN_PER_DAY;
+            const category = bill.category === 'food' || bill.category === 'other' ? 'other' : bill.category;
+            if (this.spend(bill.amount, category, bill.name, 'system'))
+                continue;
+            const arrears = f.debt.loans.find(l => l.id === 'arrears');
+            if (arrears)
+                arrears.principal += bill.amount;
+            else
+                f.debt.loans.push({ id: 'arrears', kind: 'other', principal: bill.amount, apr: 0, paymentPerPeriod: 0, periodDays: 30, nextDueAt: s.minutes + 30 * clock_1.MIN_PER_DAY });
+            this.pushNotice(`Couldn't pay ${bill.name} ($${bill.amount.toFixed(2)}) — it's been added to what you owe.`);
         }
-        f.rentDueInDays = f.rentAmount > 0 ? (7 - p.dayOfWeek) % 7 || 7 : 999;
     }
     // ══ MONEY ════════════════════════════════════════════════════════════════
-    spend(amount, category, label) {
-        if (amount <= 0)
-            return;
-        const s = this.state;
-        s.finance.balance -= amount;
-        s.finance.totalSpent += amount;
-        s.today.spent += amount;
-        this.pushLedger({ minutes: s.minutes, amount: -amount, category, label });
-        this.emit({ type: 'purchase', amount, category, label });
+    /** Cash in hand — what the HUD shows and what purchases are checked against. */
+    get cash() { return this.state.finance.accounts.cash; }
+    canAfford(amount) { return this.money.canAfford('cash', amount); }
+    /** Pay `amount` from cash. Returns false (and changes nothing) if the player can't afford it —
+     *  money never goes negative. `label` is the reason shown in the ledger; `source` is who/where. */
+    spend(amount, category, label, source) {
+        if (!(amount > 0))
+            return true;
+        if (!this.money.canAfford('cash', amount))
+            return false;
+        this.money.recordTransaction({ account: 'cash', amount: -amount, category, type: 'expense', description: label, source }, this.state.minutes);
+        return true;
     }
-    earn(amount, category, label) {
-        if (amount <= 0)
+    earn(amount, category, label, source) {
+        if (!(amount > 0))
             return;
-        const s = this.state;
-        s.finance.balance += amount;
-        s.finance.totalEarned += amount;
-        s.today.earned += amount;
-        this.pushLedger({ minutes: s.minutes, amount, category, label });
+        this.money.recordTransaction({ account: 'cash', amount, category, type: 'income', description: label, source }, this.state.minutes);
     }
-    pushLedger(e) { this.state.ledger.push(e); if (this.state.ledger.length > 400)
-        this.state.ledger.shift(); }
+    /** Piggy bank: move cash into savings (and back). Recorded as a linked pair of transfers. */
+    moveToSavings(amount) {
+        if (!(amount > 0) || !this.money.canAfford('cash', amount))
+            return false;
+        this.money.transfer('cash', 'savings', amount, this.state.minutes, 'Into the piggy bank');
+        return true;
+    }
+    takeFromSavings(amount) {
+        if (!(amount > 0) || !this.money.canAfford('savings', amount))
+            return false;
+        this.money.transfer('savings', 'cash', amount, this.state.minutes, 'Out of the piggy bank');
+        return true;
+    }
+    /** Transactions since a game minute (e.g. this week), newest last. */
+    transactionsSince(minute) {
+        return this.state.finance.transactions.recent.filter(t => t.timestamp >= minute);
+    }
+    /** Keeps the day record, events and achievements in step with every transaction, whatever made it. */
+    onTransaction(tx) {
+        const s = this.state;
+        if (tx.type !== 'transfer') {
+            if (tx.amount < 0)
+                s.today.spent += -tx.amount;
+            else
+                s.today.earned += tx.amount;
+        }
+        if (tx.amount < 0 && tx.type === 'expense')
+            this.emit({ type: 'purchase', amount: -tx.amount, category: tx.category, label: tx.description });
+        this.touch();
+    }
     // ══ ENERGY (Step 6) ═══════════════════════════════════════════════════════
     /** Read-only snapshot — callers get the current {current,max}, never a mutable reference they
      *  could edit outside these methods. */
-    getEnergy() { return { ...this.state.energy }; }
-    /** Mirrors spend()'s shape exactly (mutate the one authoritative field + touch()) — the same
-     *  pattern every other live resource in GameStore already uses. Clamped at 0 rather than
-     *  throwing: unlike FinanceSystem/EnergySystem (Core Simulation), which reject an over-budget
-     *  call outright, the live game's own spend()/earn() never guarded against going out of range
-     *  either — callers (the adapter) are expected to have already validated the amount via
-     *  ActivitySystem.canExecute() before this is ever called. */
+    getEnergy() { return { current: this.state.energy.current, max: this.state.energy.max }; }
+    /** Energy spent by a choice or action. Clamped at 0: tiredness is a consequence, not a lock. */
     consumeEnergy(amount) {
-        if (amount <= 0)
+        if (!(amount > 0))
             return;
-        const s = this.state;
-        s.energy.current = Math.max(0, s.energy.current - amount);
+        this.energySys.consume(Math.min(amount, this.state.energy.current));
         this.touch();
     }
     restoreEnergy(amount) {
-        if (amount <= 0)
+        if (!(amount > 0))
             return;
-        const s = this.state;
-        s.energy.current = Math.min(s.energy.max, s.energy.current + amount);
+        this.energySys.restore(amount);
         this.touch();
+    }
+    // ══ ACTIVITIES ═══════════════════════════════════════════════════════════
+    /** Run a timed activity (class, chores, …) through ActivitySystem against the live game: it
+     *  checks place/energy/money first, then moves the real clock, energy and ledger. */
+    runActivity(def) {
+        const r = this.activities.execute(def);
+        if (!r.success)
+            return { ok: false, reason: r.reason, message: r.message, minutesAdvanced: 0, energyConsumed: 0, amountEarned: 0 };
+        this.touch(true);
+        return {
+            ok: true, minutesAdvanced: r.timeAdvancedMinutes, energyConsumed: r.energyConsumed,
+            amountEarned: r.transaction && r.transaction.amount > 0 ? r.transaction.amount : 0,
+        };
+    }
+    /** Sit through a lesson. Attendance is recorded only if the lesson actually happened. */
+    attendClass() {
+        const out = this.runActivity(mondayActivities_1.ATTEND_CLASS);
+        if (out.ok)
+            this.markSchoolAttended();
+        return out;
+    }
+    helpParents() {
+        return this.runActivity(schoolActivities_1.HELP_PARENTS);
     }
     // ══ ACTIVITY STATE (Step 18) ═════════════════════════════════════════════
     /** The one public write path for `currentActivity` — a synchronized copy of whatever Core
-     *  Simulation's ActivitySystem computed for a successful adapter-driven activity (see
-     *  src/game/integration/mondayAdapter.ts). Mirrors consumeEnergy()/restoreEnergy()'s shape
+     *  Simulation's ActivitySystem computed for a successful activity (see runActivity()). Mirrors consumeEnergy()/restoreEnergy()'s shape
      *  exactly: mutate the one authoritative field, notify subscribers, touch nothing else. */
     setCurrentActivity(tag) {
         this.state.currentActivity = tag;
         this.touch();
+    }
+    /** This step: `s.paused` already existed and `tick()` already fully respected it ("if (s.paused ||
+     *  s.sleeping) return;"), but nothing ever wrote to it — it was a dead field. That's what let the
+     *  bus destination-picker race: opening it doesn't stop the clock, and `BUS_ROUTE.dwellMin` is only
+     *  1 game-minute (== 1 real second at the default time scale), so simply reading the two-choice
+     *  panel could run the clock past `departsAt` before the player picks a destination, making
+     *  `boardBus()` correctly (per Step 16's own validate-first rule) refuse with "the bus has not
+     *  arrived yet" — silently, with the panel just closing and no ride ever starting. Exposing the
+     *  existing pause flag, rather than inventing a new one, lets page.tsx freeze the clock for exactly
+     *  the span of that one time-sensitive menu without touching boardBus()/finishRide()/fare/energy at
+     *  all. */
+    setPaused(v) {
+        this.state.paused = v;
+        this.touch();
+    }
+    // ══ NOTICES ══════════════════════════════════════════════════════════════
+    pushNotice(text) { this.noticeQueue.push(text); }
+    takeNotices() { const n = this.noticeQueue; this.noticeQueue = []; return n; }
+    // ══ DAILY MARKS ══════════════════════════════════════════════════════════
+    /** Once-per-day facts ("helped Mum today") live in the saved GameState, so a page reload can't
+     *  reset them the way the old React-state flags could. Cleared automatically after a day. */
+    hasDoneToday(name) { return (0, missions_1.hasMark)(this.state, name); }
+    markDoneToday(name) {
+        const key = (0, missions_1.markKey)(name, (0, clock_1.parts)(this.state.minutes).day);
+        if (!this.state.world.dailyMarks.includes(key))
+            this.state.world.dailyMarks.push(key);
+        this.touch(true);
+    }
+    // ══ SCHOOL DAY ═══════════════════════════════════════════════════════════
+    /** What the Attend Class prompt should say right now, or null when school isn't relevant. */
+    classStatus() {
+        const s = this.state, p = (0, clock_1.parts)(s.minutes);
+        if (s.lifePath !== 'school' || p.dayOfWeek > 4 || s.player.place !== 'university')
+            return null;
+        if ((0, missions_1.hasMark)(s, 'at_school'))
+            return 'done';
+        if (p.minuteOfDay > LAST_CLASS_START)
+            return 'too_late';
+        if (s.player.scene !== 'interior_school_classroom')
+            return 'go_to_classroom';
+        return 'ready';
+    }
+    /** Arrived early? Sit down and wait for the 8:30 bell (the clock really moves). */
+    waitForBell() {
+        const p = (0, clock_1.parts)(this.state.minutes);
+        if (p.minuteOfDay < CLASS_BELL)
+            this.advance(CLASS_BELL - p.minuteOfDay);
     }
     // ══ RELATIONSHIPS (Step 27) ══════════════════════════════════════════════
     /** Public write path for a relationship delta outside the mission-choice engine — e.g. an
@@ -321,7 +438,7 @@ class GameStore {
                 best = item;
             }
         }
-        return best ? { ...best, affordable: this.state.finance.balance >= best.price } : null;
+        return best ? { ...best, affordable: this.canAfford(best.price) } : null;
     }
     /** Buy whatever's currently in reach. Money updates immediately (Rule 21); the game never picks
      *  for the player between e.g. the $3.50 and $6.00 milk (Rule 28). */
@@ -350,7 +467,10 @@ class GameStore {
                 return { ok: false, reason: 'You already picked that up.' };
             }
         }
-        this.spend(item.price, 'shop', `${item.brand ? item.brand + ' ' : ''}${item.name}`);
+        const isFood = s.player.place === 'supermarket' || s.player.place === 'dairy';
+        if (!this.spend(item.price, isFood ? 'food' : 'shopping', `${item.brand ? item.brand + ' ' : ''}${item.name}`, s.player.place ?? undefined)) {
+            return { ok: false, reason: "You can't afford that." };
+        }
         // Credit this purchase toward any active mission whose current step is a shopping list for
         // the place you're standing in (Phase: mission <-> real-purchase integration).
         for (const rt of s.missions) {
@@ -437,19 +557,6 @@ class GameStore {
             this.missionPurchaseLog.delete(rt.id);
         }
     }
-    /** legacy panels (bank, shops) that mutate finance directly can call this to keep the ledger/day record honest */
-    recordFinanceDelta(before, label = 'Purchase') {
-        const d = this.state.finance.balance - before.balance;
-        if (d < 0) {
-            this.state.today.spent += -d;
-            this.pushLedger({ minutes: this.state.minutes, amount: d, category: 'shop', label });
-        }
-        if (d > 0) {
-            this.state.today.earned += d;
-            this.pushLedger({ minutes: this.state.minutes, amount: d, category: 'income', label });
-        }
-        this.touch(true);
-    }
     // ══ PLACES / SCENES ══════════════════════════════════════════════════════
     isOpenNow(placeId) { return (0, world_1.isOpen)(placeId, this.state.minutes); }
     closedMessage(placeId) { return (0, world_1.closedReason)(placeId, this.state.minutes); }
@@ -472,6 +579,7 @@ class GameStore {
             this.warpToInteriorSpawn(s.player.scene);
         s.player.vx = s.player.vy = 0;
         this.emit({ type: 'entered_place', placeId });
+        this.evaluateMissions(); // a mission waiting on "walk in here" starts the moment you do
         this.touch(true);
         return { ok: true };
     }
@@ -515,9 +623,11 @@ class GameStore {
         const s = this.state;
         if (s.player.scene !== 'outdoor' || s.player.place === placeId)
             return;
-        if (placeId)
-            this.emit({ type: 'entered_place', placeId });
         s.player.place = placeId;
+        if (placeId) {
+            this.emit({ type: 'entered_place', placeId });
+            this.evaluateMissions();
+        }
         this.touch();
     }
     // ══ NPCs ═════════════════════════════════════════════════════════════════
@@ -592,19 +702,77 @@ class GameStore {
             npc.visible = this.npcOutside(def.id, npc.place, npc.moving);
         }
     }
-    /** NPC the player can talk to right now: outdoors near a visible NPC, or in the interior where the NPC is. */
+    /** NPCs standing in the room the player is in, with where they stand (interior pixels). The
+     *  renderer draws them here and proximity is measured from here, so what you see is what you can
+     *  talk to. School NPCs are spread across rooms by npcRoomAt(). */
+    interiorNpcs() {
+        const s = this.state, pl = s.player;
+        const interior = (0, world_1.getInterior)(pl.scene);
+        if (!interior || !pl.place)
+            return [];
+        const here = Object.values(s.npcs).filter(n => {
+            if (n.place !== pl.place || n.moving)
+                return false;
+            const room = (0, world_1.npcRoomAt)(n.id, n.place, s.minutes);
+            return !room || room === pl.scene;
+        });
+        const T = world_1.INTERIOR_TILE_PX;
+        return here.map((npc, i) => ({
+            npc,
+            x: (interior.widthTiles / 2 + (i - (here.length - 1) / 2) * 1.4) * T,
+            y: Math.min(interior.heightTiles - 1.5, 1.4) * T,
+        }));
+    }
+    /** The closest NPC in talking range: outdoors a visible NPC within ~1.4 tiles, indoors within ~1.8. */
     npcNearPlayer() {
         const s = this.state, pl = s.player;
-        for (const npc of Object.values(s.npcs)) {
-            if (pl.scene === 'outdoor') {
-                if (npc.visible && Math.hypot(npc.x - pl.x, npc.y - pl.y) < world_1.TILE_PX * 1.4)
-                    return npc;
-            }
-            else if (pl.place && npc.place === pl.place && !npc.moving) {
-                return npc;
+        let best = null, bestD = Infinity;
+        if (pl.scene === 'outdoor') {
+            for (const npc of Object.values(s.npcs)) {
+                const d = Math.hypot(npc.x - pl.x, npc.y - pl.y);
+                if (npc.visible && d < world_1.TILE_PX * 1.4 && d < bestD) {
+                    best = npc;
+                    bestD = d;
+                }
             }
         }
-        return null;
+        else {
+            for (const { npc, x, y } of this.interiorNpcs()) {
+                const d = Math.hypot(x - pl.x, y - pl.y);
+                if (d < world_1.INTERIOR_TILE_PX * 1.8 && d < bestD) {
+                    best = npc;
+                    bestD = d;
+                }
+            }
+        }
+        return best;
+    }
+    /** Is this NPC with the player right now (same room indoors, a few steps away outdoors)? */
+    npcPresent(npcId) {
+        const s = this.state, pl = s.player;
+        if (pl.scene === 'outdoor') {
+            const npc = s.npcs[npcId];
+            return !!npc && npc.visible && Math.hypot(npc.x - pl.x, npc.y - pl.y) < world_1.TILE_PX * 3;
+        }
+        return this.interiorNpcs().some(e => e.npc.id === npcId);
+    }
+    /** NPCs who have something to say to the player right now (a mission waiting on a chat with
+     *  them). The renderer puts a speech bubble over their head so the player knows who to talk to. */
+    npcsWantingToTalk() {
+        const s = this.state, out = new Set();
+        for (const rt of s.missions) {
+            const def = this.def(rt.id);
+            if (!def)
+                continue;
+            if (rt.state === 'locked' && def.trigger.type === 'interaction' && !rt.triggered
+                && (0, missions_1.missionWindowOpen)(def, s.minutes) && (!def.requires || def.requires(s))) {
+                out.add(def.trigger.npcId);
+            }
+            const step = def.steps[rt.stepIndex];
+            if ((rt.state === 'active' || rt.state === 'available') && step?.withNpc && step.npcId)
+                out.add(step.npcId);
+        }
+        return out;
     }
     talkTo(npcId) {
         this.emit({ type: 'talked_to', npcId });
@@ -635,7 +803,7 @@ class GameStore {
      *  nothing, but it never needs to run on every single game-minute tick either. */
     evaluateAchievements() {
         const s = this.state;
-        if (s.finance.debt > 0 && !s.world.flags.includes('ever_in_debt'))
+        if (s.finance.debt.loans.some(l => l.principal > 0) && !s.world.flags.includes('ever_in_debt'))
             s.world.flags.push('ever_in_debt');
         for (const id of (0, achievements_1.checkAchievements)(s)) {
             s.world.flags.push(`ach:${id}`);
@@ -658,10 +826,12 @@ class GameStore {
         const def = lifeEvents_1.LIFE_EVENTS.find(e => e.id === pending.id);
         const choice = def?.choices.find(c => c.id === choiceId);
         if (choice) {
-            if (choice.amount < 0)
-                this.spend(-choice.amount, 'life_event', def.text.slice(0, 30));
-            else if (choice.amount > 0)
-                this.earn(choice.amount, 'life_event', def.text.slice(0, 30));
+            if (choice.amount < 0 && !this.spend(-choice.amount, 'life_event', def.text.slice(0, 40))) {
+                this.pushNotice("You can't afford that right now.");
+                return;
+            }
+            if (choice.amount > 0)
+                this.earn(choice.amount, 'life_event', def.text.slice(0, 40));
             if (choice.relationship) {
                 const cur = s.world.relationships[choice.relationship.npc] ?? 0;
                 s.world.relationships[choice.relationship.npc] = Math.max(-5, Math.min(5, cur + choice.relationship.delta));
@@ -700,13 +870,17 @@ class GameStore {
      * player is in front of them, instead of requiring a separate, nonexistent "accept mission" UI. */
     actionableStep() {
         const s = this.state;
-        for (const rt of s.missions) {
-            if (rt.state !== 'active' && rt.state !== 'available')
-                continue;
+        // Highest priority first, so e.g. a story beat beats a daily lunch prompt in the same room.
+        const live = s.missions
+            .filter(rt => rt.state === 'active' || rt.state === 'available')
+            .sort((a, b) => (this.def(b.id)?.priority ?? 0) - (this.def(a.id)?.priority ?? 0));
+        for (const rt of live) {
             const def = this.def(rt.id), step = def.steps[rt.stepIndex];
             if (!step || step.completeOnArrival || step.awaitsPurchase)
                 continue;
-            if (step.remote || s.player.place === step.place) {
+            const reachable = step.remote
+                || (step.withNpc && step.npcId ? this.npcPresent(step.npcId) : s.player.place === step.place);
+            if (reachable) {
                 if (rt.state === 'available')
                     this.startMission(rt.id);
                 return { def, rt, step };
@@ -714,16 +888,21 @@ class GameStore {
         }
         return null;
     }
+    /** Apply a dialogue choice. Returns false (changing nothing) if the player can't afford it. */
     applyChoice(missionId, choice) {
         const s = this.state;
         const rt = this.runtime(missionId), def = this.def(missionId);
         if (!rt || !def)
-            return;
+            return false;
         const step = def.steps[rt.stepIndex];
-        if (choice.cost < 0)
-            this.spend(-choice.cost, 'mission', choice.label);
-        else if (choice.cost > 0)
-            this.earn(choice.cost, 'mission', choice.label);
+        const label = choice.label.replace(/^\P{L}+/u, '').replace(/\s*\(.*\)$/, '') || def.name;
+        const source = step?.npcId ?? step?.place;
+        if (choice.cost < 0 && !this.spend(-choice.cost, choice.category ?? 'other', label, source)) {
+            this.pushNotice("You can't afford that.");
+            return false;
+        }
+        if (choice.cost > 0)
+            this.earn(choice.cost, choice.category ?? 'income', label, source);
         // Step 22: Energy is a consequence of the choice, not a precondition — consumeEnergy() already
         // clamps at 0 and no-ops for amount <= 0, so a choice with no/zero energyCost, or one whose cost
         // exceeds current Energy, still applies normally with no new failure path.
@@ -746,6 +925,7 @@ class GameStore {
             rt.stepIndex = Math.min(rt.stepIndex + 1, def.steps.length - 1);
             this.touch(true);
         }
+        return true;
     }
     completeMission(rt, def, outcome) {
         if (rt.state === 'completed')
@@ -756,17 +936,17 @@ class GameStore {
         rt.outcome = outcome;
         s.xp += def.rewards.xp;
         if (def.rewards.money)
-            this.earn(def.rewards.money, 'reward', def.name);
+            this.earn(def.rewards.money, 'mission_reward', def.name, def.id);
         if (def.rewards.flag && !s.world.flags.includes(def.rewards.flag))
             s.world.flags.push(def.rewards.flag);
         s.today.missionsCompleted.push(def.id);
         this.emit({ type: 'mission_completed', missionId: def.id });
         // "Make It to Friday" story hooks — real numbers, not scripted ones.
         if (def.id === 'pocket_money') {
-            this.weekStartBalance = s.finance.balance;
+            this.weekStartBalance = s.finance.accounts.cash;
             // survives a reload mid-week, since the instance field above doesn't persist with the save
             s.world.flags = s.world.flags.filter(f => !f.startsWith('wk_start_balance:'));
-            s.world.flags.push(`wk_start_balance:${s.finance.balance}`);
+            s.world.flags.push(`wk_start_balance:${s.finance.accounts.cash}`);
         }
         if (def.id === 'friday_recap')
             this.buildLevelSummary(s);
@@ -791,11 +971,14 @@ class GameStore {
                 : 'none';
         this.pendingLevelSummary = {
             startBalance: this.weekStartBalance,
-            endBalance: s.finance.balance,
+            endBalance: s.finance.accounts.cash,
             daysAttended, daysTotal,
             schoolProjectDone: s.world.flags.includes('school_project_done'),
             birthdayOutcome, unexpectedOutcome,
             wentToArcade: s.world.flags.includes('arcade_visit'),
+            busRides: [...s.weekDays, s.today].reduce((n, d) => n + d.travel.filter(t => t === 'bus').length, 0),
+            busSpent: this.transactionsSince((0, clock_1.at)((0, clock_1.parts)(s.minutes).day - (0, clock_1.parts)(s.minutes).dayOfWeek, 0, 0))
+                .filter(t => t.category === 'transport' && t.amount < 0).reduce((sum, t) => sum - t.amount, 0),
         };
     }
     dismissLevelSummary() { this.pendingLevelSummary = null; this.touch(true); }
@@ -816,38 +999,8 @@ class GameStore {
         }
     }
     // ══ SCHOOL ═══════════════════════════════════════════════════════════════
-    /** LEGACY / currently unused: this was written to be called on ENTERING the school building.
-     *  It is never called from anywhere in the codebase today (confirmed by the Step 11 audit) — kept
-     *  as-is rather than deleted, since deleting it isn't proven safer than leaving it dormant, and it
-     *  still models a coherent (if currently unused) "arrival" notion of attendance. It is NOT the
-     *  write path for attendance going forward: Step 12's design decision is that "attended school"
-     *  means completed Attend Class, not merely walked in the door — see `markSchoolAttended()` below,
-     *  which is the new, sole, authoritative write path. Do not wire this method into `enterPlace()`. */
-    noteSchoolArrival() {
-        const s = this.state, p = (0, clock_1.parts)(s.minutes);
-        if (s.lifePath !== 'school' || p.dayOfWeek > 4 || p.minuteOfDay >= SCHOOL_END)
-            return;
-        const key = (0, missions_1.markKey)('at_school', p.day);
-        if (!s.world.dailyMarks.includes(key)) {
-            s.world.dailyMarks.push(key);
-            s.today.schoolAttended = true;
-            if (p.minuteOfDay >= SCHOOL_START)
-                s.today.lateToSchool = true;
-            this.emit({ type: 'school_attended', day: p.day });
-        }
-    }
-    /**
-     * Step 12 — the one authoritative write path for "the player attended school today," recorded
-     * only once Attend Class (src/game/content/school/mondayActivities.ts's ATTEND_CLASS, run through
-     * src/game/integration/mondayAdapter.ts's executeAttendClass()) has actually SUCCEEDED — never on
-     * mere arrival at the building. Reuses the exact same existing attendance state
-     * `noteSchoolArrival()` already wrote (the `at_school:<day>` entry in `world.dailyMarks`, which
-     * `hasMark()`/`attendedToday()` in missions.ts already read, and `today.schoolAttended`, already
-     * read by the SCHOOL_END absence sweep and the weekly recap) — there is exactly one attendance
-     * flag, this is just a second, later, correctly-gated call site for it, not a new one. Deliberately
-     * does NOT set `lateToSchool` (that is an arrival-timing concept `get_to_school`'s own mission
-     * already owns) and does NOT touch anything else — time/energy/location are the adapter's job.
-     */
+    /** The one write path for "attended school today": called by attendClass() only after the lesson
+     *  actually happened (never on merely walking in). */
     markSchoolAttended() {
         const s = this.state, p = (0, clock_1.parts)(s.minutes);
         if (s.lifePath !== 'school')
@@ -857,6 +1010,7 @@ class GameStore {
             s.world.dailyMarks.push(key);
             s.today.schoolAttended = true;
             this.emit({ type: 'school_attended', day: p.day });
+            this.evaluateMissions(); // anything waiting on "attended today" can open right now
             this.touch(true);
         }
     }
@@ -899,14 +1053,14 @@ class GameStore {
             return { ok: false, reason: 'The bus has not arrived yet.' };
         const pass = s.world.busPass && s.world.busPass.validUntil > s.minutes;
         const fare = pass ? 0 : world_1.BUS_ROUTE.fare;
-        if (s.finance.balance < fare)
+        if (!this.canAfford(fare))
             return { ok: false, reason: `You need $${fare.toFixed(2)} for the fare.` };
         const energyCost = GameStore.BUS_BOARD_ENERGY_COST;
         if (s.energy.current < energyCost) {
             return { ok: false, reason: `You're too tired to catch the bus right now.` };
         }
         if (fare > 0)
-            this.spend(fare, 'transport', 'Bus fare');
+            this.spend(fare, 'transport', 'Bus fare', world_1.BUS_ROUTE.id);
         this.consumeEnergy(energyCost);
         const ride = (0, world_1.rideMinutes)(fromStop, toStop);
         s.ride = { fromStop, toStop, startedAt: s.minutes, endsAt: s.minutes + Math.max(2, ride), fare };
@@ -941,7 +1095,7 @@ class GameStore {
             return;
         const p = (0, clock_1.parts)(s.minutes);
         s.today.bedtimeMinuteOfDay = passedOut ? PASS_OUT_AT : p.minuteOfDay;
-        s.today.endBalance = s.finance.balance;
+        s.today.endBalance = s.finance.accounts.cash;
         if (s.lifePath === 'school' && p.dayOfWeek < 5 && s.today.schoolAttended === null)
             s.today.schoolAttended = false;
         const record = { ...s.today, missionsCompleted: [...s.today.missionsCompleted], missionsMissed: [...s.today.missionsMissed], travel: [...s.today.travel] };
@@ -967,7 +1121,7 @@ class GameStore {
         const newP = (0, clock_1.parts)(s.minutes);
         if (newP.dayOfWeek === 0 && s.weekDays.length >= 1)
             this.finalizeWeek();
-        s.today = emptyDay(newP.day, s.finance.balance);
+        s.today = emptyDay(newP.day, s.finance.accounts.cash);
         this.pendingDaySummary = record;
         this.emit({ type: 'day_start', day: newP.day, minutes: s.minutes });
         this.evaluateMissions();
@@ -981,17 +1135,18 @@ class GameStore {
             week: (0, clock_1.parts)(s.minutes).week - 1,
             income: days.reduce((a, d) => a + d.earned, 0),
             spending: days.reduce((a, d) => a + d.spent, 0),
-            savings: s.finance.savings,
+            savings: s.finance.accounts.savings,
             missionsCompleted: days.reduce((a, d) => a + d.missionsCompleted.length, 0),
             socialActivities: days.reduce((a, d) => a + d.socialActivities, 0),
             schoolDaysAttended: schoolDays.filter(d => d.schoolAttended).length,
             schoolDaysTotal: schoolDays.length,
             majorDecisions: s.world.flags.filter(f => ['errand_impulse_buy', 'errand_under_budget', 'arcade_visit', 'park_alternative', 'ate_home_lunch', 'bought_canteen'].includes(f)),
-            goalsProgress: s.finance.goals.map(g => ({ id: g.id, name: g.name, pct: Math.min(100, Math.round((g.saved / g.target) * 100)) })),
+            goalsProgress: s.goals.active.flatMap(g => g.kind === 'financial'
+                ? [{ id: g.id, name: g.name, pct: Math.min(100, Math.round((g.saved / Math.max(1, g.target)) * 100)) }]
+                : [{ id: g.id, name: g.description, pct: g.completed ? 100 : 0 }]),
             days,
         };
         s.weeks.push(week);
-        s.ledger = [];
         this.pendingWeekSummary = week;
         this.emit({ type: 'week_end', week: week.week, minutes: s.minutes });
     }
@@ -1001,10 +1156,8 @@ class GameStore {
     serialize() { return JSON.stringify(this.state); }
     static hydrate(json) {
         try {
-            const st = JSON.parse(json);
-            if (st.version !== 2)
-                return null;
-            return new GameStore(st);
+            const st = (0, saveMigration_1.migrateSave)(JSON.parse(json));
+            return st ? new GameStore(st) : null;
         }
         catch {
             return null;
@@ -1012,19 +1165,5 @@ class GameStore {
     }
 }
 exports.GameStore = GameStore;
-/**
- * Step 16 — the flat live-world Energy cost of boarding any normal bus, independent of ride
- * distance. This is deliberately NOT copied from Core Simulation's `TAKE_BUS.energyCost` (1) —
- * that value belongs to a fixed, unrelated Monday-school ActivityDef with its own fixed
- * fare/duration that doesn't match the real, variable `BUS_ROUTE` system (see the Step 16 audit).
- * It happens to land on the same number, arrived at independently: nothing else in the live game
- * currently assigns any Energy cost to movement/travel at all (inspected `tick()`, `travelTo()`,
- * `boardBus()`'s prior form, and every mission choice in missions.ts — none consume energy), so
- * there is no existing live convention to defer to. On the current 0-100 scale, the two adapter-
- * driven activities cost 5 (a 30-minute chore) and 15 (a 4-hour class) energy; a single bus ride
- * is a much smaller, low-exertion action than either, so the smallest non-zero, clearly-intentional
- * cost (1) is used rather than 0 (indistinguishable from "still uncosted") or a value large enough
- * to compete with actual activities. This is a flat per-ride cost, not distance-based, per Step
- * 16's explicit instruction not to invent a distance-based energy model in this step.
- */
+/** Flat energy cost of boarding a bus (a low-effort trip compared with class at 15 or chores at 5). */
 GameStore.BUS_BOARD_ENERGY_COST = 1;

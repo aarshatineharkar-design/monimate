@@ -15,22 +15,22 @@ exports.ACHIEVEMENTS = [
     {
         id: 'first_paycheck', name: 'First Paycheck', emoji: '💵',
         description: 'Earn money for the first time.',
-        check: s => s.finance.totalEarned > 0,
+        check: s => s.finance.totals.totalEarned > 0,
     },
     {
         id: 'saver_100', name: 'Saver', emoji: '🐷',
         description: 'Get your savings to $100.',
-        check: s => s.finance.savings >= 100,
+        check: s => s.finance.accounts.savings >= 100,
     },
     {
         id: 'goal_reached', name: 'Goal Getter', emoji: '🎯',
         description: 'Fully fund one of your savings goals.',
-        check: s => s.finance.goals.some(g => g.saved >= g.target && g.target > 0),
+        check: s => s.goals.active.some(g => g.kind === 'financial' && g.target > 0 && g.saved >= g.target),
     },
     {
         id: 'debt_free', name: 'Debt Free', emoji: '🧾',
         description: 'Clear all debt after having owed money.',
-        check: s => s.world.flags.includes('ever_in_debt') && s.finance.debt <= 0,
+        check: s => s.world.flags.includes('ever_in_debt') && s.finance.debt.loans.every(l => l.principal <= 0),
     },
     {
         id: 'first_mission', name: 'Getting Started', emoji: '📋',

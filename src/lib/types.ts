@@ -1,4 +1,8 @@
-import type { FinancialState } from './financeTypes';
+import type { FinancialState } from '../game/types/finance';
+import type { EnergyState } from '../game/types/energy';
+import type { GoalState } from '../game/types/goal';
+import type { ActivityTag } from '../game/types/player';
+export type { ActivityTag };
 
 export type PlaceId = string; // matches LOCATIONS ids in the map ('home','university','bus_stop',...)
 export type SceneId =
@@ -45,9 +49,6 @@ export type GameEvent =
   | { type: 'purchase'; amount: number; category: string; label: string }
   | { type: 'achievement_unlocked'; id: string }
   | { type: 'life_event'; id: string };
-
-// ── Ledger for day/week summaries ──────────────────────────────────────────
-export interface LedgerEntry { minutes: number; amount: number; category: string; label: string }
 
 export interface DayRecord {
   day: number;
@@ -121,49 +122,26 @@ export interface WorldFlags {
   hasBike: boolean;
 }
 
-/**
- * Step 18: mirrors src/game/types/player.ts's `ActivityTag` exactly (same literal values),
- * declared independently rather than imported — for the same reason ClockSystem is independent of
- * lib/clock.ts (see clockSystem.ts's own module comment): nothing in src/lib/ imports from
- * src/game/, and src/game/integration/mondayAdapter.ts is the one deliberate seam that's allowed
- * to know about both sides. Importing Core Simulation's own `ActivityTag` type here would make
- * this foundational lib file depend on src/game/ existing at all, which would hold even for a
- * type-only import (TypeScript still resolves the module graph), breaking that invariant for the
- * first time outside the adapter. Keeping the two unions structurally identical means a Core
- * Simulation value assigns straight into this type at the adapter's one bridging call site with no
- * cast — if the two ever drift, TypeScript itself will flag the mismatch right there instead of
- * silently coercing it.
- */
-export type ActivityTag =
-  | 'walking' | 'in_conversation' | 'shopping' | 'studying' | 'working'
-  | 'socializing' | 'resting' | 'sleeping' | 'chore' | 'exercising' | 'exploring';
-
 // ── Whole simulation state ─────────────────────────────────────────────────
 export interface GameState {
-  version: 2;
+  /** 3 = one engine: money, energy and goals use the src/game model. Older saves are upgraded on
+   *  load by migrateSave() in src/lib/saveMigration.ts. */
+  version: 3;
   minutes: number;               // THE clock
   paused: boolean;
   timeMultiplier: 1 | 2 | 4;     // fast-forward when waiting / sleeping
   player: PlayerWorld;
+  /** Accounts (cash, savings…), income, recurring expenses, debt and the full transaction ledger.
+   *  Changed only through FinanceSystem (GameStore.spend/earn/transfer), never edited directly. */
   finance: FinancialState;
-  /** Step 6: the third live resource alongside time (`minutes`) and money (`finance`). Mirrors
-   *  the Core Simulation's EnergyState shape (src/game/types/energy.ts) on purpose, so the two
-   *  stay conceptually interchangeable — see GameStore's consumeEnergy()/restoreEnergy() and
-   *  src/game/integration/mondayAdapter.ts for how a Core Simulation activity's energy cost gets
-   *  synchronized into this one authoritative value. */
-  energy: { current: number; max: number };
-  /** Step 18: a synchronized copy of whatever Core Simulation's ActivitySystem last computed for
-   *  the player's activity tag on a SUCCESSFUL adapter-driven activity (see GameStore's
-   *  setCurrentActivity() and src/game/integration/mondayAdapter.ts) — never written to directly,
-   *  never derived independently. `null` until the first such activity succeeds (older saves,
-   *  which won't have this key at all, self-heal to `null` in GameStore's constructor, same
-   *  pattern used for `energy` in Step 6). Nothing currently reads this value; it exists purely to
-   *  stop discarding a real Core Simulation result that used to be computed and thrown away. */
+  /** The player's goals (Pack 2 adds the Monday goal picker). */
+  goals: GoalState;
+  energy: EnergyState;
+  /** What the player is doing right now, as computed by ActivitySystem. */
   currentActivity: ActivityTag | null;
   world: WorldFlags;
   missions: MissionRuntime[];
   npcs: Record<string, NpcRuntime>;
-  ledger: LedgerEntry[];         // current week
   today: DayRecord;
   weekDays: DayRecord[];
   weeks: WeekRecord[];
@@ -173,6 +151,6 @@ export interface GameState {
   ride: null | { fromStop: string; toStop: string; startedAt: number; endsAt: number; fare: number };
   /** true between "go to bed" and the morning summary being dismissed */
   sleeping: boolean;
-  /** a rolled life event waiting on a player response, if any (optional — older saves simply won't have one) */
+  /** a rolled life event waiting on a player response, if any */
   pendingLifeEvent?: { id: string; emoji: string; text: string; choiceIds: string[] };
 }

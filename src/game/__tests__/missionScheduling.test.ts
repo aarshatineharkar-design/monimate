@@ -9,7 +9,6 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { GameStore, createInitialState } from '../../lib/store';
 import { makeInitialFinance, LIFE_PATHS } from '../../lib/gameData';
-import { executeAttendClass } from '../integration/mondayAdapter';
 
 const SCHOOL_CONFIG = LIFE_PATHS.find((p) => p.id === 'school')!;
 
@@ -24,10 +23,13 @@ function freshDefaultStore(): GameStore {
  *  pattern as mondayAdapter.test.ts's storeAtUniversity(). */
 function storeAttendedAndHome(): GameStore {
   const store = freshDefaultStore();
-  store.advance(65); // 7:00 -> 8:05 AM
-  store.earn(20, 'test', 'seed pocket money for test');
+  // Monday starts with Mum's pocket-money message (a phone message, highest priority) — accept it
+  // the way a player would, so later actionableStep() calls surface the mission under test.
+  const pm = store.actionableStep()!;
+  store.applyChoice(pm.def.id, pm.step.choices![0]);
+  store.advance(64); // -> 8:05 AM
   store.enterPlace('university');
-  const outcome = executeAttendClass(store);
+  const outcome = store.attendClass();
   if (!outcome.ok) throw new Error('test fixture: executeAttendClass unexpectedly failed');
   store.enterPlace('home');
   return store;
@@ -51,7 +53,7 @@ test('pickup_groceries B: becomes available during the intended Monday-afternoon
 test('pickup_groceries C: remains locked in its Monday window when attendedToday is false (class was never attended)', () => {
   const store = freshDefaultStore(); // never attended class
   store.advance(65);
-  store.earn(20, 'test', 'seed');
+  store.earn(20, 'other', 'seed');
   store.enterPlace('home'); // at the right place...
   store.advance(8 * 60); // ...and well into the 15:30-19:00 window (7:00 -> ~15:00, then some)
   // Advance further to be solidly inside the window without ever attending class.
@@ -69,9 +71,9 @@ test('pickup_groceries D: the Tuesday 15:30-19:00 slot does NOT open the mission
   // "any day", this would incorrectly open on Tuesday; with the Step 13 fix it must not.
   store.advance(24 * 60); // Monday 7:00 AM -> Tuesday 7:00 AM, never attending, never at home-idle
   store.advance(65); // Tuesday 7:00 -> 8:05 AM
-  store.earn(20, 'test', 'seed pocket money for test');
+  store.earn(20, 'other', 'seed pocket money for test');
   store.enterPlace('university');
-  const outcome = executeAttendClass(store);
+  const outcome = store.attendClass();
   assert.equal(outcome.ok, true); // Tuesday's attendedToday is now genuinely true
   store.enterPlace('home');
   store.advance(3 * 60 + 30); // Tuesday 12:05 -> Tuesday 15:35 — inside 15:30-19:00, at home, attended
@@ -92,9 +94,9 @@ test('pickup_groceries E: existing mission behavior is not regressed — the mis
   assert.ok(actionable, 'expected the grocery errand step to be actionable at home');
   assert.equal(actionable!.def.id, 'pickup_groceries');
 
-  const balanceBefore = store.state.finance.balance;
+  const balanceBefore = store.state.finance.accounts.cash;
   store.applyChoice('pickup_groceries', actionable!.step.choices![0]);
-  assert.equal(store.state.finance.balance, balanceBefore + 15); // "On it" choice hands over $15
+  assert.equal(store.state.finance.accounts.cash, balanceBefore + 15); // "On it" choice hands over $15
   assert.equal(store.state.world.flags.includes('errand_accepted'), true);
   // Mission has advanced to its second step (the real shopping step) — not completed by this
   // choice alone, since `finish` is not set on it (completion happens via awaitsPurchase).

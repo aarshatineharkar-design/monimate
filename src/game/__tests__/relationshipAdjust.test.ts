@@ -70,11 +70,11 @@ test('RelationshipAdjust 7: adjusting one NPC does not affect another NPC\'s rel
 
 test('RelationshipAdjust 8: adjusting a relationship does not change money, time, or energy', () => {
   const store = freshDefaultStore();
-  const balanceBefore = store.state.finance.balance;
+  const balanceBefore = store.state.finance.accounts.cash;
   const minutesBefore = store.state.minutes;
   const energyBefore = store.getEnergy().current;
   store.adjustRelationship('Mum', -1);
-  assert.equal(store.state.finance.balance, balanceBefore);
+  assert.equal(store.state.finance.accounts.cash, balanceBefore);
   assert.equal(store.state.minutes, minutesBefore);
   assert.equal(store.getEnergy().current, energyBefore);
 });

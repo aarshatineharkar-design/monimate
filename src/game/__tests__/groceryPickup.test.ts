@@ -41,7 +41,7 @@ function storeAtGroceryStep(): GameStore {
   // The real 's1' accept step earns the player $15 for this errand before they ever reach the
   // supermarket; a schoolPath store otherwise starts with $0, which would make every pickup an
   // affordability failure unrelated to what this file is testing.
-  store.earn(15, 'mission', 'On it');
+  store.earn(15, 'income', 'On it');
   return store;
 }
 
@@ -74,12 +74,12 @@ test('GroceryPickup 3: the checklist marks milk covered immediately after pickin
 
 test('GroceryPickup 4: the same physical item cannot be collected twice', () => {
   const store = storeAtGroceryStep();
-  const balanceAfterFirst = (() => { store.buyNearbyShopItem(); return store.state.finance.balance; })();
+  const balanceAfterFirst = (() => { store.buyNearbyShopItem(); return store.state.finance.accounts.cash; })();
   const second = store.buyNearbyShopItem();
   assert.equal(second.ok, false);
   assert.equal(second.reason, 'You already picked that up.');
   // Refused pickup must not charge a second time.
-  assert.equal(store.state.finance.balance, balanceAfterFirst);
+  assert.equal(store.state.finance.accounts.cash, balanceAfterFirst);
 });
 
 test('GroceryPickup 5: a different brand of an already-covered need is also blocked (need is per-prefix, not per-item-id)', () => {

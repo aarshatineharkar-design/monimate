@@ -12,7 +12,7 @@ import {
   PlayerProfile, hashPassword, verifyPassword, loadAccounts, saveAccounts,
   loadSession, saveSession, clearSession, loadGameSave, saveGame,
 } from '../../lib/auth';
-import { LIFE_PATHS, LifePath, LifePathConfig, getLifePath, makeInitialFinance } from '../../lib/gameData';
+import { LIFE_PATHS, LifePath, LifePathConfig, getLifePath, makeInitialFinance, makeInitialGoals } from '../../lib/gameData';
 import { createInitialState, GameStore, LevelSummary } from '../../lib/store';
 import { GameLoop } from '../../lib/loop';
 import { askMentorChat, askMentorWeeklyRecap } from '../../lib/mentor';
@@ -28,7 +28,7 @@ import { buildJournal, MissionChoice, MissionDef, trackedMission } from '../../l
 import { dayToSummaryView, weekToSummaryView } from '../../lib/summary';
 import type { GameState, NpcRuntime } from '../../lib/types';
 import { formatDay, formatTime, parts } from '../../lib/clock';
-import { executeAttendClass, executeHelpParents } from '../../game/integration/mondayAdapter';
+import { ATTEND_CLASS } from '../../game/content/school/mondayActivities';
 import { LIFE_EVENTS } from '../../lib/lifeEvents';
 import { ACHIEVEMENTS, isUnlocked } from '../../lib/achievements';
 
@@ -156,7 +156,7 @@ export default function MoniMateGame() {
     );
   }
   // profile exists but no life path confirmed yet (fresh registration) -> path select
-  if (authScreen === 'path_select' || !LIFE_PATHS.find(p => p.id === profile.lifePath)) {
+  if (authScreen === 'path_select' || !LIFE_PATHS.find(p => p.id === profile.lifePath)?.available) {
     return <PathSelect onChoose={choosePath} />;
   }
 
@@ -207,8 +207,11 @@ function PathSelect({ onChoose }: { onChoose: (p: LifePath) => void }) {
       <h1 style={{ marginBottom: 24 }}>Choose your life path</h1>
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: 16, width: '100%', maxWidth: 700 }}>
         {LIFE_PATHS.map(p => (
-          <div key={p.id} onClick={() => onChoose(p.id)}
-            style={{ cursor: 'pointer', border: `2px solid ${p.color}`, borderRadius: 10, padding: 16, background: '#161b22' }}>
+          <div key={p.id} onClick={() => p.available && onChoose(p.id)} aria-disabled={!p.available}
+            style={{ cursor: p.available ? 'pointer' : 'not-allowed', border: `2px solid ${p.color}`, borderRadius: 10, padding: 16, background: '#161b22', opacity: p.available ? 1 : 0.45, position: 'relative' }}>
+            {!p.available && (
+              <div style={{ position: 'absolute', top: 10, right: 10, fontSize: 10, padding: '2px 6px', borderRadius: 4, background: '#30363d', letterSpacing: 0.5 }}>COMING SOON</div>
+            )}
             <div style={{ fontSize: 28 }}>{p.emoji}</div>
             <div style={{ fontWeight: 700, margin: '6px 0' }}>{p.name}</div>
             <div style={{ fontSize: 13, opacity: 0.8 }}>{p.tagline}</div>
@@ -252,63 +255,22 @@ function GameCanvas({ profile, onLogout, onChangePath }: { profile: PlayerProfil
   const missionToastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const toastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [boardingAt, setBoardingAt] = useState<string | null>(null); // stopId whose destination picker is open
-  // Step 10: the Step 7B adapter-driven Monday transport choice (transportChoiceDay/transportFailure/
-  // chooseTransport/executeMorningTransport/the "How are you getting to school" DialoguePanel) has
-  // been REMOVED — it duplicated the live game's own pre-existing 'get_to_school' mission
-  // (src/lib/missions.ts), which already offers the identical walk/bus choice through the mission
-  // engine's own DialoguePanel (driven by `actionable`), complete with lateness tracking the adapter
-  // never had. Keeping both meant two independent systems could each move the player/spend
-  // money/advance time depending on which one happened to fire first — see the Step 9 audit. Per
-  // that audit's decision, 'get_to_school' (the stronger, already-integrated implementation) is now
-  // the SOLE owner of Monday transport; the adapter/UI duplicate is deleted, not left dormant.
-  //
-  // Step 8: Attend Class. `classCompletedDay` records the absolute in-game day class was last
-  // completed on — comparing against the CURRENT day is how "already attended today" is tracked,
-  // without a second clock/flag system. `classFailure` holds a message when executeAttendClass()
-  // reports failure (e.g. energy too low), so the player sees why nothing happened. Eligibility no
-  // longer cross-references the (now-removed) transport flag — see `classEligible` below: actually
-  // being at 'university' is itself the proof transport succeeded, whichever mechanism got the
-  // player there.
-  const [classCompletedDay, setClassCompletedDay] = useState<number | null>(null);
+  // Attend Class: a message when it can't happen (e.g. too tired), shown until dismissed.
   const [classFailure, setClassFailure] = useState<string | null>(null);
   const classResolvingRef = useRef(false);
-  // Step 15: Help Parents. HELP_PARENTS (src/game/content/schoolActivities.ts) has no
-  // `requirement.place` on the Core Simulation ActivityDef itself (confirmed by inspection), so
-  // "at home" and "once per day" are both live UI decisions, not Core Simulation rules. Chosen
-  // behavior: option A (once-per-day contextual activity), mirroring `classCompletedDay` exactly —
-  // this is the least invasive choice because (1) it matches the only other adapter-driven
-  // activity's own precedent in this file, (2) an unlimited-repeat chore would let the player farm
-  // unbounded income by standing at home and re-triggering it, which nothing else in the currently
-  // implemented Monday content allows (every other earn path — pocket_money, the grocery errand
-  // change, mission rewards — happens at most once per day/week), and (3) it needs no new
-  // persisted field, since the day-of-completion pattern already exists on this component.
-  const [helpParentsCompletedDay, setHelpParentsCompletedDay] = useState<number | null>(null);
+  // Help Mum: once a day, only when she's home (see helpParentsEligible). Done/declined is saved as a daily mark.
   const [helpParentsFailure, setHelpParentsFailure] = useState<string | null>(null);
   const helpParentsResolvingRef = useRef(false);
-  // Step 27 — first real-activity vertical slice for Help Parents. `helpParentsDeclinedDay` mirrors
-  // `helpParentsCompletedDay`'s day-tracking pattern exactly, so declining doesn't re-show the offer
-  // again the same day but does re-offer it the next day (declining is not permanent). `phase` drives
-  // the reusable activity sequence: 'ask' (the initial Accept/Decline prompt) -> 'seek' (accepted;
-  // player must find Mum and press E, reusing the existing npcNearPlayer() proximity system rather
-  // than inventing a new object/interaction system) -> 'working' (a short, reusable progress-bar
-  // sequence) -> back to idle once the adapter call resolves. This is deliberately the smallest
-  // reusable shape the Step 27 audit called for (Part 3/9's "Activity Sequence") — a phase plus a
-  // 0-100 progress value — rather than a new parallel mission/animation architecture.
-  const [helpParentsDeclinedDay, setHelpParentsDeclinedDay] = useState<number | null>(null);
+  // Help Mum sequence: 'seek' (find Mum, press E) -> 'working' (progress bar) -> done.
   const [helpParentsPhase, setHelpParentsPhase] = useState<'ask' | 'seek' | 'working' | null>(null);
-  // Mirrors helpParentsPhase for the keydown handler below, which (like the rest of this file's
-  // keyboard effect) is registered once with an empty dependency array — a plain state read in its
-  // closure would go stale the moment the phase changes. Every setHelpParentsPhase call keeps this
-  // ref in sync in the same statement (see setPhase() helper below), same pattern keysRef already
-  // uses to keep the animation-frame loop reading live input state.
+  // Ref copy for the keydown handler, which is registered once and would otherwise read stale state.
   const helpParentsPhaseRef = useRef<typeof helpParentsPhase>(null);
   const setHelpParentsPhaseBoth = useCallback((p: typeof helpParentsPhase) => {
     helpParentsPhaseRef.current = p;
     setHelpParentsPhase(p);
   }, []);
   const [helpParentsProgress, setHelpParentsProgress] = useState(0);
-  // Snapshot of balance/energy taken the instant the activity sequence starts, so the completion
-  // toast can report the REAL deltas the adapter actually applied, not a hardcoded guess.
+  // Balance/energy when the chore starts, so the toast reports the real change.
   const helpParentsSnapshotRef = useRef<{ balance: number; energy: number } | null>(null);
   // Generic, reusable "what just happened" feedback toast — not specific to Help Parents. Any future
   // activity can reuse this exact shape (icon + short lines) rather than inventing its own popup.
@@ -351,12 +313,12 @@ function GameCanvas({ profile, onLogout, onChangePath }: { profile: PlayerProfil
 
   // Create the store once, hydrating from a save if one exists.
   if (!storeRef.current) {
-    const saved = loadGameSave(profile.email, profile.lifePath);
     const config: LifePathConfig = getLifePath(profile.lifePath);
-    const state = saved && saved.lifePath === profile.lifePath
-      ? saved
-      : createInitialState(profile.lifePath, makeInitialFinance(config));
-    storeRef.current = saved ? (GameStore.hydrate(JSON.stringify(state)) ?? new GameStore(state)) : new GameStore(state);
+    const saved = loadGameSave(profile.email, profile.lifePath);
+    // Saves from older versions are upgraded by GameStore.hydrate (see lib/saveMigration.ts);
+    // anything unreadable starts a fresh game rather than crashing.
+    const restored = saved && saved.lifePath === profile.lifePath ? GameStore.hydrate(JSON.stringify(saved)) : null;
+    storeRef.current = restored ?? new GameStore(createInitialState(profile.lifePath, makeInitialFinance(config), makeInitialGoals(config)));
     loopRef.current = new GameLoop(storeRef.current);
     storeRef.current.subscribe(() => forceTick(t => t + 1));
   }
@@ -369,11 +331,8 @@ function GameCanvas({ profile, onLogout, onChangePath }: { profile: PlayerProfil
     return () => { clearInterval(id); saveGame(profile.email, profile.lifePath, store.state); };
   }, [profile.email, profile.lifePath, store]);
 
-  // Step 27 — the reusable "activity sequence" progress driver: while helpParentsPhase is 'working',
-  // fill a 0-100 progress bar over ~1.2 real seconds, then resolve it via the existing helpParents()
-  // adapter call. This is real-time, not game-time — the actual time/energy/money/relationship
-  // changes are still applied atomically and only once, by the existing, already-tested
-  // executeHelpParents() adapter, exactly as before Step 27. The progress bar is purely presentational.
+  // Help Mum progress bar: fills over ~1.2 real seconds, then store.helpParents() applies the real
+  // time/energy/money change once.
   useEffect(() => {
     if (helpParentsPhase !== 'working') return;
     const durationMs = 1200;
@@ -470,46 +429,41 @@ function GameCanvas({ profile, onLogout, onChangePath }: { profile: PlayerProfil
     if (helpParentsPhaseRef.current !== 'seek') return false;
     const npc = store.npcNearPlayer();
     if (!npc || npc.id !== 'mum') return false;
-    helpParentsSnapshotRef.current = { balance: store.state.finance.balance, energy: store.getEnergy().current };
+    helpParentsSnapshotRef.current = { balance: store.cash, energy: store.getEnergy().current };
     setHelpParentsProgress(0);
     setHelpParentsPhaseBoth('working');
     return true;
   }, [store, setHelpParentsPhaseBoth]);
 
-  // Step 8: Attend Class. The ONLY path to executing it — never touches store.state directly,
-  // only the adapter's return value and this component's own local UI state (same double-fire-guard
-  // pattern the removed Step 7B transport handler used).
+  // Attend Class: runs through store.attendClass() (ActivitySystem on the live game).
   const attendClass = useCallback(() => {
     if (classResolvingRef.current) return; // already handling a click for this prompt
     classResolvingRef.current = true;
     try {
-      const outcome = executeAttendClass(store);
-      const dayNow = parts(store.state.minutes).day;
-      if (!outcome.ok) {
-        // Never pretend a failed activity succeeded: not marked complete, so the player remains
-        // eligible to try again (e.g. after energy recovers).
-        setClassFailure(outcome.message ?? 'That didn\'t work.');
+      if (store.getEnergy().current < ATTEND_CLASS.energyCost) {
+        setClassFailure("You're too exhausted to focus. Get some rest first.");
         return;
       }
-      setClassCompletedDay(dayNow);
+      store.waitForBell(); // early? the clock runs to the 8:30 bell before the lesson starts
+      const before = store.state.minutes;
+      const outcome = store.attendClass(); // records attendance (a saved daily mark) on success
+      if (!outcome.ok) { setClassFailure(outcome.message ?? 'That didn\'t work.'); return; }
       setClassFailure(null);
+      setActivityToast({ icon: '📚', lines: ['Class done', `${formatTime(before)} → ${formatTime(store.state.minutes)} · -${outcome.energyConsumed} energy`] });
+      if (activityToastTimerRef.current) clearTimeout(activityToastTimerRef.current);
+      activityToastTimerRef.current = setTimeout(() => setActivityToast(null), 4000);
     } finally {
       classResolvingRef.current = false;
     }
   }, [store]);
 
-  // Step 15/27: Help Parents. Same never-touch-store-directly shape as attendClass() — this only
-  // ever reads the adapter's return value plus this component's own local UI state. Step 27 adds:
-  // called once the 'working' progress sequence finishes (not directly from a dialogue choice
-  // anymore), and builds the completion toast from the real before/after balance+energy snapshot
-  // rather than hardcoding the numbers shown to the player.
+  // Help Mum: called when the progress bar finishes; the toast shows the real before/after change.
   const helpParents = useCallback(() => {
     if (helpParentsResolvingRef.current) return; // already handling a click for this prompt
     helpParentsResolvingRef.current = true;
     try {
       const before = helpParentsSnapshotRef.current;
-      const outcome = executeHelpParents(store);
-      const dayNow = parts(store.state.minutes).day;
+      const outcome = store.helpParents();
       if (!outcome.ok) {
         // Never pretend a failed activity succeeded: not marked complete, so the player remains
         // eligible to try again (e.g. after energy recovers).
@@ -517,13 +471,10 @@ function GameCanvas({ profile, onLogout, onChangePath }: { profile: PlayerProfil
         setHelpParentsPhaseBoth(null);
         return;
       }
-      setHelpParentsCompletedDay(dayNow);
+      store.markDoneToday('helped_parents');
       setHelpParentsFailure(null);
       setHelpParentsPhaseBoth(null);
-      // Real deltas, read from the snapshot taken when the activity started vs. the store's
-      // current values — not the adapter's own numbers restated, so this can never drift from
-      // what actually happened even if the adapter's shape changes later.
-      const after = { balance: store.state.finance.balance, energy: store.getEnergy().current };
+      const after = { balance: store.cash, energy: store.getEnergy().current };
       const moneyDelta = before ? after.balance - before.balance : outcome.amountEarned;
       const energyDelta = before ? before.energy - after.energy : outcome.energyConsumed;
       setActivityToast({
@@ -546,9 +497,8 @@ function GameCanvas({ profile, onLogout, onChangePath }: { profile: PlayerProfil
   // immediate feedback for why. No money/time/energy change — declining a chore costs nothing
   // materially, only a little goodwill, which is the believable-consequence bar Step 27 set.
   const declineHelpParents = useCallback(() => {
-    const dayNow = parts(store.state.minutes).day;
     store.adjustRelationship('Mum', -1);
-    setHelpParentsDeclinedDay(dayNow);
+    store.markDoneToday('declined_parents');
     setHelpParentsPhaseBoth(null);
     setActivityToast({ icon: '🙁', lines: ["Mum looks a little disappointed, but doesn't push it.", 'Mum -1'] });
     if (activityToastTimerRef.current) clearTimeout(activityToastTimerRef.current);
@@ -579,6 +529,8 @@ function GameCanvas({ profile, onLogout, onChangePath }: { profile: PlayerProfil
       // Step 26: store.takeOffers() already existed (mirrors takeAchievementToasts()) but had no
       // consumer — it drains store.offerQueue and self-clears, so each call only ever returns
       // missions that became available since the last drain, never the same one twice.
+      const notices = store.takeNotices();
+      if (notices.length) setDialogueLines({ text: notices[notices.length - 1] });
       const newOffers = store.takeOffers();
       if (newOffers.length) {
         setMissionToast({ id: newOffers[0].id, name: newOffers[0].name, emoji: newOffers[0].emoji });
@@ -615,35 +567,18 @@ function GameCanvas({ profile, onLogout, onChangePath }: { profile: PlayerProfil
   const objectiveNpcName = objectiveNpcId ? getNpcDef(objectiveNpcId)?.name ?? objectiveNpcId : null;
   const groceryNeedIdx = shopping && nearbyItem ? shopping.need.findIndex(p => nearbyItem.id.startsWith(p)) : -1;
   const groceryAlreadyGot = groceryNeedIdx >= 0 && shopping!.covered[groceryNeedIdx];
-  // Step 10: Monday morning transport is now owned solely by the live 'get_to_school' mission
-  // (src/lib/missions.ts), reached through the normal `actionable` mission DialoguePanel — the
-  // Step 7B adapter-driven transport panel/eligibility that used to live here has been removed
-  // (see the Step 9 audit / Step 10 report for why).
   const clockParts = parts(s.minutes);
-  // Step 8: Attend Class eligibility — school life path, actually at the school building (the
-  // live, authoritative `store.state.player.place` check, not a second location system), Monday,
-  // class not already completed today. Deliberately does NOT cross-reference how the player got to
-  // 'university' (Step 10: that used to check a Step 7B transport flag which no longer exists) —
-  // actually being at 'university' already proves transport succeeded, whichever mechanism (now
-  // exclusively the 'get_to_school' mission) got them there. School-hours gating is NOT duplicated
-  // here either: getting to 'university' at all already went through store.enterPlace(), which
-  // itself checks store.isOpenNow() against world.ts's HOURS table.
-  const classEligible =
-    profile.lifePath === 'school' &&
-    s.player.place === 'university' &&
-    clockParts.dayOfWeek === 0 &&
-    classCompletedDay !== clockParts.day;
-  // Step 15: Help Parents eligibility — school life path (the same gate classEligible uses, since
-  // HELP_PARENTS is School-life content, same as ATTEND_CLASS), actually at 'home' (the live,
-  // authoritative store.state.player.place check, not a new location system), and not already
-  // completed today (option A — see the helpParentsCompletedDay state comment above). Deliberately
-  // does NOT check day-of-week or time-of-day: HELP_PARENTS itself has no such requirement, and
-  // inventing one here would be exactly the "silently add a requirement" the audit warned against.
+  // Attend Class: every weekday, in the classroom, from the gates opening until 11:30.
+  const classStatus = store.classStatus();
+  const classEligible = classStatus === 'ready';
+  // Help Mum: only when you're home AND Mum actually is (she's at work 8:00-17:30 on weekdays),
+  // once a day. Accepting/declining is remembered in the save, so a reload can't farm it.
   const helpParentsEligible =
     profile.lifePath === 'school' &&
     s.player.place === 'home' &&
-    helpParentsCompletedDay !== clockParts.day &&
-    helpParentsDeclinedDay !== clockParts.day; // Step 27: declining still lets tomorrow re-offer it
+    s.npcs.mum?.place === 'home' && !s.npcs.mum?.moving &&
+    !store.hasDoneToday('helped_parents') &&
+    !store.hasDoneToday('declined_parents');
   const busArrived = nearStopId ? busAtStop(nearStopId, s.minutes) : null;
   const nextBus = nearStopId && !busArrived ? nextBusAt(nearStopId, s.minutes) : null;
 
@@ -691,7 +626,7 @@ function GameCanvas({ profile, onLogout, onChangePath }: { profile: PlayerProfil
 
       {/* HUD */}
       <div style={hud.bar}>
-        <span style={{ color: '#7cfc00' }}>💰 ${s.finance.balance.toFixed(2)}</span>
+        <span style={{ color: '#7cfc00' }}>💰 ${store.cash.toFixed(2)}</span>
         <span style={{ color: '#ffe066' }}>⚡ {Math.round(s.energy.current)}</span>
         <span style={{ color: '#ffd700' }}>{day} {time}</span>
         <span style={{ color: '#aaffaa' }}>{profile.name} · Lv{profile.level}</span>
@@ -855,12 +790,12 @@ function GameCanvas({ profile, onLogout, onChangePath }: { profile: PlayerProfil
       {/* Step 8: Attend Class prompt — same priority pattern as the other contextual panels above. */}
       {classEligible && !actionable && !lifeEvent && !boardingAt && !classFailure && (
         <DialoguePanel
-          speaker="Teacher"
-          lines={['Take your seat — class is starting.']}
+          speaker="Ms Patel"
+          lines={[clockParts.minuteOfDay < 8 * 60 + 30 ? "You're early! Grab a seat — the bell goes at 8:30." : 'Take your seat — class is starting.']}
           choices={[
-            { id: 'attend', label: 'Attend class', sublabel: '4 hours · 15 energy', cost: 0, minutes: 0, consequence: '' },
+            { id: 'attend', label: '📚 Attend class', sublabel: `4 hours · ${ATTEND_CLASS.energyCost} energy`, cost: 0, minutes: 0, consequence: '' },
           ]}
-          balance={s.finance.balance}
+          balance={store.cash}
           voiceOn={voiceOn}
           onChoose={() => attendClass()}
         />
@@ -870,8 +805,17 @@ function GameCanvas({ profile, onLogout, onChangePath }: { profile: PlayerProfil
           to dismiss. Does NOT mark class complete or advance the day on its own. */}
       {classFailure && (
         <div style={hud.dialogue} onClick={() => setClassFailure(null)}>
-          <div style={{ fontWeight: 700, color: '#ffd700', marginBottom: 4 }}>Teacher</div>
+          <div style={{ fontWeight: 700, color: '#ffd700', marginBottom: 4 }}>Ms Patel</div>
           <div>{classFailure}</div>
+        </div>
+      )}
+
+      {/* Where's class? A single hint in the prompt slot while you're at school but not yet in class. */}
+      {!actionable && !nearbyItem && !lifeEvent && !boardingAt && (classStatus === 'go_to_classroom' || classStatus === 'too_late') && (
+        <div style={hud.buyPrompt}>
+          {classStatus === 'go_to_classroom'
+            ? '🔔 Class is in the Classroom — first door on the left of the hallway'
+            : "🔔 Too late for class today — you'll be marked absent"}
         </div>
       )}
 
@@ -888,7 +832,7 @@ function GameCanvas({ profile, onLogout, onChangePath }: { profile: PlayerProfil
             { id: 'help', label: 'Help Mum', sublabel: '~30 min · 5 energy · +$5', cost: 0, minutes: 0, consequence: '' },
             { id: 'decline', label: 'Not right now', sublabel: 'Mum will understand — probably', cost: 0, minutes: 0, consequence: '' },
           ]}
-          balance={s.finance.balance}
+          balance={store.cash}
           voiceOn={voiceOn}
           onChoose={(c) => { if (c.id === 'help') setHelpParentsPhaseBoth('seek'); else declineHelpParents(); }}
         />
@@ -936,9 +880,10 @@ function GameCanvas({ profile, onLogout, onChangePath }: { profile: PlayerProfil
       {/* Contextual dialogue / choice panel (life event takes priority if both somehow line up) */}
       {actionable && !lifeEvent && (
         <DialoguePanel
-          speaker={actionable.step.speaker} lines={actionable.step.lines}
+          speaker={actionable.step.remote && actionable.step.speaker ? `📱 ${actionable.step.speaker}` : actionable.step.speaker}
+          lines={actionable.step.lines}
           choices={actionable.step.choices}
-          balance={s.finance.balance}
+          balance={store.cash}
           voiceOn={voiceOn}
           skipSignal={skipSignal}
           onChoose={(c) => { store.applyChoice(actionable.def.id, c); setDialogueLines(null); }}
@@ -958,7 +903,7 @@ function GameCanvas({ profile, onLogout, onChangePath }: { profile: PlayerProfil
       {/* AI Mentor chat */}
       {showMentor && (
         <MentorPanel
-          context={{ lifePath: profile.lifePath, day, balance: s.finance.balance, activeMissions: journal.active.map(a => a.name) }}
+          context={{ lifePath: profile.lifePath, day, balance: store.cash, activeMissions: journal.active.map(a => a.name) }}
           onClose={() => setShowMentor(false)}
           voiceOn={voiceOn}
         />
@@ -1012,8 +957,9 @@ function GameCanvas({ profile, onLogout, onChangePath }: { profile: PlayerProfil
           choices={lifeEvent.choices.map(c => ({
             id: c.id, label: c.label,
             sublabel: c.amount !== 0 ? (c.amount > 0 ? `+$${c.amount.toFixed(2)}` : `-$${Math.abs(c.amount).toFixed(2)}`) : '',
-            cost: 0, minutes: 0, consequence: c.consequence,
+            cost: Math.min(0, c.amount), minutes: 0, consequence: c.consequence,
           }))}
+          balance={store.cash}
           onChoose={(c) => store.resolveLifeEvent(c.id)}
         />
       )}
@@ -1182,27 +1128,26 @@ function MentorPanel({ context, onClose, voiceOn }: {
   );
 }
 
-/** Phone/wallet dashboard (Rule: the player should be able to see their own finances without me
- *  narrating them) — reads straight off GameState.finance + the running ledger, nothing separately
- *  tracked. Balance/goals/bills are always current; the ledger/spending-breakdown cover the last 7
- *  days so a fresh save doesn't show an empty "spending" section on day one. */
+/** Phone/wallet dashboard — reads straight off the one FinancialState (accounts, recurring
+ *  expenses, transaction ledger) and GoalState. The spending breakdown covers the last 7 days. */
 function PhoneDashboard({ state, onClose }: { state: GameState; onClose: () => void }) {
   const f = state.finance;
+  const cash = f.accounts.cash;
   const weekCutoff = state.minutes - 7 * 24 * 60;
-  const recentLedger = state.ledger.filter(e => e.minutes >= weekCutoff);
+  const spending = f.transactions.recent.filter(t => t.timestamp >= weekCutoff && t.amount < 0 && t.type !== 'transfer');
 
   const byCategory = new Map<string, number>();
-  for (const e of recentLedger) {
-    if (e.amount >= 0) continue; // spending only
-    byCategory.set(e.category, (byCategory.get(e.category) ?? 0) + -e.amount);
-  }
+  for (const t of spending) byCategory.set(t.category, (byCategory.get(t.category) ?? 0) + -t.amount);
   const spendRows = Array.from(byCategory.entries()).sort((a, b) => b[1] - a[1]);
   const maxSpend = spendRows.length ? spendRows[0][1] : 1;
   const weekSpent = spendRows.reduce((sum, [, v]) => sum + v, 0);
 
-  const recent = [...state.ledger].slice(-12).reverse();
+  const recent = f.transactions.recent.slice(-12).reverse();
+  const owed = f.debt.loans.reduce((sum, l) => sum + l.principal, 0);
+  const daysUntil = (at: number) => Math.max(0, Math.ceil((at - state.minutes) / (24 * 60)));
   const CATEGORY_EMOJI: Record<string, string> = {
-    shop: '🛒', mission: '🎯', rent: '🏠', transport: '🚌', income: '💵', reward: '🎁',
+    food: '🍎', shopping: '🛒', transport: '🚌', housing: '🏠', entertainment: '🕹️', gift: '🎁',
+    income: '💵', mission_reward: '🎯', life_event: '🍀', transfer: '🐷', subscription: '📄',
   };
 
   return (
@@ -1212,39 +1157,39 @@ function PhoneDashboard({ state, onClose }: { state: GameState; onClose: () => v
         <h3 style={{ margin: '0 0 12px' }}>📱 Wallet</h3>
 
         <div style={hud.phoneBalance}>
-          <div style={{ fontSize: 26, fontWeight: 700, color: f.balance < 0 ? '#ff6060' : '#7cfc00' }}>
-            ${f.balance.toFixed(2)}
-          </div>
-          <div style={{ fontSize: 11, opacity: 0.7 }}>Available balance</div>
+          <div style={{ fontSize: 26, fontWeight: 700, color: '#7cfc00' }}>${cash.toFixed(2)}</div>
+          <div style={{ fontSize: 11, opacity: 0.7 }}>Cash</div>
         </div>
         <div style={{ display: 'flex', gap: 10, marginBottom: 14, fontSize: 12 }}>
-          <div style={hud.phoneStat}>Savings<br /><b>${f.savings.toFixed(2)}</b></div>
-          <div style={hud.phoneStat}>Emergency<br /><b>${f.emergencyFund.toFixed(2)}</b></div>
-          <div style={hud.phoneStat}>Debt<br /><b style={{ color: f.debt > 0 ? '#ff8080' : undefined }}>${f.debt.toFixed(2)}</b></div>
+          <div style={hud.phoneStat}>Savings<br /><b>${f.accounts.savings.toFixed(2)}</b></div>
+          <div style={hud.phoneStat}>Emergency<br /><b>${f.accounts.emergencyFund.toFixed(2)}</b></div>
+          <div style={hud.phoneStat}>Owed<br /><b style={{ color: owed > 0 ? '#ff8080' : undefined }}>${owed.toFixed(2)}</b></div>
         </div>
 
-        {/* Bills */}
-        <div style={hud.phoneSection}>
-          <div style={hud.phoneSectionTitle}>UPCOMING</div>
-          {f.rentAmount > 0 && (
-            <div style={hud.phoneLine}><span>🏠 Rent — ${f.rentAmount.toFixed(2)}</span><span>{f.rentDueInDays === 999 ? '—' : `in ${f.rentDueInDays}d`}</span></div>
-          )}
-          <div style={hud.phoneLine}><span>📄 {f.nextBillName} — ${f.nextBillAmount.toFixed(2)}</span><span>in {f.nextBillDueInDays}d</span></div>
-          {f.job && (
-            <div style={hud.phoneLine}><span>💼 {f.job.name} pay</span><span>${f.weeklyIncome.toFixed(2)}/wk</span></div>
-          )}
-        </div>
+        {/* Bills and pay */}
+        {(f.expenses.recurring.length > 0 || f.income.job) && (
+          <div style={hud.phoneSection}>
+            <div style={hud.phoneSectionTitle}>UPCOMING</div>
+            {f.expenses.recurring.map(b => (
+              <div key={b.id} style={hud.phoneLine}><span>{b.category === 'housing' ? '🏠' : '📄'} {b.name} — ${b.amount.toFixed(2)}</span><span>in {daysUntil(b.nextDueAt)}d</span></div>
+            ))}
+            {f.income.job && (
+              <div style={hud.phoneLine}><span>💼 {f.income.job.name} pay</span><span>${(f.income.job.payPerHour * f.income.job.hoursPerWeek).toFixed(2)}/wk</span></div>
+            )}
+          </div>
+        )}
 
         {/* Goals */}
-        {f.goals.length > 0 && (
+        {state.goals.active.length > 0 && (
           <div style={hud.phoneSection}>
-            <div style={hud.phoneSectionTitle}>SAVINGS GOALS</div>
-            {f.goals.map(g => {
-              const pct = Math.min(100, Math.round((g.saved / Math.max(1, g.target)) * 100));
+            <div style={hud.phoneSectionTitle}>GOALS</div>
+            {state.goals.active.map(g => {
+              const pct = g.kind === 'financial' ? Math.min(100, Math.round((g.saved / Math.max(1, g.target)) * 100)) : g.completed ? 100 : 0;
               return (
                 <div key={g.id} style={{ marginBottom: 8 }}>
                   <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 12 }}>
-                    <span>{g.name}</span><span>${g.saved.toFixed(0)} / ${g.target.toFixed(0)}</span>
+                    <span>{g.kind === 'financial' ? g.name : g.description}</span>
+                    {g.kind === 'financial' && <span>${g.saved.toFixed(0)} / ${g.target.toFixed(0)}</span>}
                   </div>
                   <div style={hud.phoneBarTrack}><div style={{ ...hud.phoneBarFill, width: `${pct}%` }} /></div>
                 </div>
@@ -1260,7 +1205,7 @@ function PhoneDashboard({ state, onClose }: { state: GameState; onClose: () => v
           {spendRows.map(([cat, amt]) => (
             <div key={cat} style={{ marginBottom: 6 }}>
               <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 12 }}>
-                <span>{CATEGORY_EMOJI[cat] ?? '💳'} {cat}</span><span>${amt.toFixed(2)}</span>
+                <span>{CATEGORY_EMOJI[cat] ?? '💳'} {cat.replace('_', ' ')}</span><span>${amt.toFixed(2)}</span>
               </div>
               <div style={hud.phoneBarTrack}><div style={{ ...hud.phoneBarFill, width: `${Math.round((amt / maxSpend) * 100)}%`, background: '#ffab40' }} /></div>
             </div>
@@ -1271,9 +1216,9 @@ function PhoneDashboard({ state, onClose }: { state: GameState; onClose: () => v
         <div style={hud.phoneSection}>
           <div style={hud.phoneSectionTitle}>RECENT</div>
           {recent.length === 0 && <div style={{ fontSize: 12, opacity: 0.6 }}>No transactions yet.</div>}
-          {recent.map((e, i) => (
-            <div key={i} style={hud.phoneLine}>
-              <span>{CATEGORY_EMOJI[e.category] ?? '💳'} {e.label}</span>
+          {recent.map(e => (
+            <div key={e.id} style={hud.phoneLine}>
+              <span>{CATEGORY_EMOJI[e.category] ?? '💳'} {e.description}</span>
               <span style={{ color: e.amount < 0 ? '#ff8080' : '#7cfc00' }}>
                 {e.amount < 0 ? '-' : '+'}${Math.abs(e.amount).toFixed(2)}
               </span>
@@ -1340,7 +1285,7 @@ function LevelSummaryModal({ summary: sm, onClose }: { summary: LevelSummary; on
   return (
     <div style={hud.modalBackdrop}>
       <div style={{ ...hud.modal, width: 'min(400px, 92vw)' }}>
-        <h2 style={{ marginBottom: 4 }}>📅 Made It to Friday</h2>
+        <h2 style={{ marginBottom: 4 }}>📅 Made It Through the Week</h2>
         <div style={{ opacity: 0.7, fontSize: 13, marginBottom: 16 }}>Here's how the week actually went.</div>
         <div style={{ display: 'flex', justifyContent: 'space-between', background: '#0d1117', borderRadius: 8, padding: '10px 14px', marginBottom: 14 }}>
           <div><div style={{ fontSize: 11, opacity: 0.6 }}>STARTED WITH</div><div style={{ fontSize: 18, fontWeight: 700 }}>${sm.startBalance.toFixed(2)}</div></div>
@@ -1352,6 +1297,11 @@ function LevelSummaryModal({ summary: sm, onClose }: { summary: LevelSummary; on
         <div style={{ marginBottom: 6 }}>{birthdayLine}</div>
         {unexpectedLine && <div style={{ marginBottom: 6 }}>{unexpectedLine}</div>}
         <div style={{ marginBottom: 6 }}>{sm.wentToArcade ? '🕹️ Made it to the arcade with friends' : '🕹️ Skipped the arcade this week'}</div>
+        <div style={{ marginBottom: 6 }}>
+          {sm.busRides > 0
+            ? `🚌 ${sm.busRides} bus ride${sm.busRides === 1 ? '' : 's'} — $${sm.busSpent.toFixed(2)} spent on the bus`
+            : '🚶 Walked everywhere — $0 on fares'}
+        </div>
         <div style={{ marginTop: 14, padding: '10px 12px', background: '#0d1117', borderRadius: 8, borderLeft: '3px solid #60b8ff' }}>
           <div style={{ fontSize: 11, opacity: 0.6, marginBottom: 4 }}>🧑‍🏫 KAI'S TAKE</div>
           <div style={{ fontSize: 13, lineHeight: 1.4 }}>{mentorTake ?? 'Thinking it over…'}</div>
@@ -1494,6 +1444,7 @@ function draw(ctx: CanvasRenderingContext2D, cw: number, ch: number, store: Game
   // not a debug-style highlight, per Part 2's "should not make the game look like a debug tool".
   const targetNpcId = trackedMission(s, store.defs)?.def.steps[trackedMission(s, store.defs)!.rt.stepIndex]?.npcId;
   const bob = Math.sin(performance.now() / 300) * 3;
+  const wantsToTalk = store.npcsWantingToTalk();
   for (const e of entities) {
     const dir = facingToDir(e.facing);
     const dirIdx = DIR_ORDER.indexOf(dir);
@@ -1505,10 +1456,19 @@ function draw(ctx: CanvasRenderingContext2D, cw: number, ch: number, store: Game
     } else {
       drawPersonFallback(ctx, e.x, e.y, TILE_PX, e.sheetName === 'adam' ? '#3a6aaa' : '#d68ac0');
     }
-    if (e.npcId && e.npcId === targetNpcId) {
+    if (e.npcId) {
+      // name tag, so the player can tell Jordan from Riley at a glance
+      ctx.font = `bold ${Math.round(TILE_PX * 0.17)}px monospace`;
+      ctx.textAlign = 'center';
+      ctx.fillStyle = '#fff'; ctx.strokeStyle = '#000'; ctx.lineWidth = 3;
+      const tag = getNpcDef(e.npcId)?.name ?? e.npcId;
+      ctx.strokeText(tag, e.x, e.y + TILE_PX * 0.38);
+      ctx.fillText(tag, e.x, e.y + TILE_PX * 0.38);
+    }
+    if (e.npcId && (e.npcId === targetNpcId || wantsToTalk.has(e.npcId))) {
       ctx.font = `${Math.round(TILE_PX * 0.4)}px sans-serif`;
       ctx.textAlign = 'center';
-      ctx.fillText('📍', e.x, e.y - drawH + TILE_PX * 0.15 - 6 + bob);
+      ctx.fillText(wantsToTalk.has(e.npcId) ? '💬' : '📍', e.x, e.y - drawH + TILE_PX * 0.15 - 6 + bob);
     }
   }
 
@@ -1612,14 +1572,11 @@ function drawInterior(ctx: CanvasRenderingContext2D, cw: number, ch: number, sto
   // previously nothing drew them indoors at all, so mission dialogue popped up with nobody on
   // screen to have it with. Anchored near the middle of the room, offset per NPC so two people in
   // the same room don't stack on the same tile.
-  const roomNpcs = (Object.values(s.npcs) as NpcRuntime[]).filter(n => n.place === s.player.place);
-  // Step 28 — Part 2: same target-NPC lookup as the outdoor draw() — indoors, "Find Mom" needs the
-  // same subtle marker once she's actually in view.
+  // NPCs in THIS room, at the positions the store also uses for "who's in talking range".
   const indoorTargetNpcId = trackedMission(s, store.defs)?.def.steps[trackedMission(s, store.defs)!.rt.stepIndex]?.npcId;
+  const indoorWantsToTalk = store.npcsWantingToTalk();
   const indoorBob = Math.sin(performance.now() / 300) * 3;
-  roomNpcs.forEach((npc, i) => {
-    const anchorX = (interior.widthTiles / 2 + (i - (roomNpcs.length - 1) / 2) * 1.4) * T;
-    const anchorY = Math.min(interior.heightTiles - 1.5, 1.4) * T;
+  for (const { npc, x: anchorX, y: anchorY } of store.interiorNpcs()) {
     drawables.push({
       y: anchorY,
       draw: () => {
@@ -1637,13 +1594,13 @@ function drawInterior(ctx: CanvasRenderingContext2D, cw: number, ch: number, sto
         const name = getNpcDef(npc.id)?.name ?? npc.id;
         ctx.strokeText(name, anchorX, anchorY + T * 0.3);
         ctx.fillText(name, anchorX, anchorY + T * 0.3);
-        if (npc.id === indoorTargetNpcId) {
+        if (npc.id === indoorTargetNpcId || indoorWantsToTalk.has(npc.id)) {
           ctx.font = `${Math.round(T * 0.4)}px sans-serif`;
-          ctx.fillText('📍', anchorX, anchorY - drawH + T * 0.15 - 6 + indoorBob);
+          ctx.fillText(indoorWantsToTalk.has(npc.id) ? '💬' : '📍', anchorX, anchorY - drawH + T * 0.15 - 6 + indoorBob);
         }
       },
     });
-  });
+  }
 
   drawables.push({
     y: s.player.y,

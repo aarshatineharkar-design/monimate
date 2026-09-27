@@ -13,8 +13,14 @@ function generateTransactionId() {
     return `tx_${Date.now()}_${fallbackCounter}`;
 }
 class FinanceSystem {
-    constructor(finance) {
+    /**
+     * @param onRecorded optional listener called after every successful transaction. The live
+     *   GameStore uses it to keep day totals, events and achievements in step with the ledger, so
+     *   every money change — shop, bus, mission, activity — flows through this one pipeline.
+     */
+    constructor(finance, onRecorded) {
         this.finance = finance;
+        this.onRecorded = onRecorded;
     }
     getFinancialState() {
         return this.finance;
@@ -73,6 +79,7 @@ class FinanceSystem {
         if (this.finance.transactions.recent.length > this.finance.transactions.recentCap) {
             this.finance.transactions.recent.shift();
         }
+        this.onRecorded?.(tx);
         return tx;
     }
     /** Moves money between two of the player's own accounts as a pair of linked transactions

@@ -16,7 +16,7 @@ export type AccountId = 'cash' | 'checking' | 'savings' | 'emergencyFund';
 export type TransactionCategory =
   | 'income' | 'food' | 'transport' | 'shopping' | 'housing' | 'entertainment'
   | 'subscription' | 'insurance' | 'tax' | 'mission_reward' | 'life_event'
-  | 'fee' | 'interest' | 'debt_payment' | 'investment' | 'transfer' | 'refund' | 'other';
+  | 'fee' | 'interest' | 'debt_payment' | 'investment' | 'transfer' | 'refund' | 'gift' | 'other';
 
 /** What KIND of financial event this is, independent of category. A transfer between two of the
  *  player's own accounts and a refund are structurally different from an ordinary income/expense,

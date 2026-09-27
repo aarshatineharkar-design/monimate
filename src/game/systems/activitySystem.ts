@@ -14,12 +14,24 @@
  * throw) — but see the ADVANCE-TIME-BEFORE-FINANCE-CHECK note below for the one ordering subtlety
  * this leaves.
  */
-import { ClockSystem } from './clockSystem';
-import { PlayerSystem } from './playerSystem';
 import { EnergySystem } from './energySystem';
 import { FinanceSystem } from './financeSystem';
 import type { ActivityDef, ActivityResult, ActivityFailureReason } from '../types/activity';
 import type { ActivityTag } from '../types/player';
+import type { PlaceId } from '../types/world';
+
+/** The clock an activity runs against. ClockSystem satisfies it; so does the live GameStore
+ *  (whose advance() also ticks missions, NPCs and events minute by minute). */
+export interface ActivityClock {
+  advance(minutes: number): void;
+  getTime(): { minutes: number };
+}
+/** The player an activity acts on. PlayerSystem satisfies it; so does the live GameStore. */
+export interface ActivityPlayer {
+  getLocation(): PlaceId | null;
+  changeLocation(placeId: PlaceId | null): void;
+  setCurrentActivity(activity: ActivityTag | null): void;
+}
 
 const CATEGORY_TO_ACTIVITY_TAG: Record<ActivityDef['category'], ActivityTag | null> = {
   travel: 'walking',
@@ -36,8 +48,8 @@ const CATEGORY_TO_ACTIVITY_TAG: Record<ActivityDef['category'], ActivityTag | nu
 
 export class ActivitySystem {
   constructor(
-    private readonly clock: ClockSystem,
-    private readonly player: PlayerSystem,
+    private readonly clock: ActivityClock,
+    private readonly player: ActivityPlayer,
     private readonly energy: EnergySystem,
     private readonly finance: FinanceSystem,
   ) {}

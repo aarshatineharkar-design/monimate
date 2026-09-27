@@ -8,6 +8,7 @@ exports.routeTiles = routeTiles;
 exports.routeLengthTiles = routeLengthTiles;
 exports.nextOpening = nextOpening;
 exports.closedReason = closedReason;
+exports.npcRoomAt = npcRoomAt;
 exports.npcPlaceAt = npcPlaceAt;
 exports.npcVisibleOutside = npcVisibleOutside;
 exports.busLoopStartsForDay = busLoopStartsForDay;
@@ -453,7 +454,7 @@ exports.OPENING_HOURS = {
     home: ALWAYS,
     park: ALWAYS,
     bus_stop: ALWAYS,
-    university: [{ open: (0, clock_1.hm)(8, 0), close: (0, clock_1.hm)(15, 30), days: WEEKDAYS }],
+    university: [{ open: (0, clock_1.hm)(7, 0), close: (0, clock_1.hm)(15, 30), days: WEEKDAYS }], // gates open 7:00 (first bus), bell at 8:30
     supermarket: [{ open: (0, clock_1.hm)(7), close: (0, clock_1.hm)(21) }],
     dairy: [{ open: (0, clock_1.hm)(6, 30), close: (0, clock_1.hm)(22) }],
     cafe: [{ open: (0, clock_1.hm)(7), close: (0, clock_1.hm)(17) }],
@@ -476,7 +477,8 @@ exports.isOpen = isOpen;
 function nextOpening(placeId, minutes) {
     if ((0, exports.isOpen)(placeId, minutes))
         return null;
-    for (let m = Math.floor(minutes) + 1; m < minutes + 8 * clock_1.MIN_PER_DAY; m += 5) {
+    // minute by minute, so "opens at 7:30" is exact (5-minute steps used to say 7:34)
+    for (let m = Math.floor(minutes) + 1; m < minutes + 8 * clock_1.MIN_PER_DAY; m += 1) {
         if ((0, exports.isOpen)(placeId, m))
             return m;
     }
@@ -501,43 +503,59 @@ exports.NPCS = [
             { from: (0, clock_1.hm)(17, 30), place: 'home' },
         ],
     },
+    // Everyone except Mum lives in the Apartments block, NOT at 'home' — 'home' is the player's house,
+    // so using it here used to put Jordan, Riley and Ms Patel in your bedroom every night.
     {
         id: 'jordan', name: 'Jordan', color: '#4f8fd0', speedTilesPerMin: 2.0, sheet: 'alex',
         schedule: [
-            { from: (0, clock_1.hm)(0), place: 'home' }, // (their own home, shown as "home" area)
+            { from: (0, clock_1.hm)(0), place: 'apartment' },
             { from: (0, clock_1.hm)(7, 55), place: 'university', days: WEEKDAYS },
-            { from: (0, clock_1.hm)(15, 35), place: 'university' }, // outside the school gate after bell
-            { from: (0, clock_1.hm)(16, 0), place: 'park', days: [0, 1, 3] },
-            { from: (0, clock_1.hm)(16, 0), place: 'mall', days: [4] }, // Fridays: arcade
-            { from: (0, clock_1.hm)(18, 0), place: 'home' },
+            { from: (0, clock_1.hm)(15, 35), place: 'university' }, // outside the school gate after the bell
+            { from: (0, clock_1.hm)(16, 0), place: 'park', days: [0, 1, 2, 4] },
+            { from: (0, clock_1.hm)(15, 45), place: 'mall', days: [3] }, // Thursday: arcade (matches arcade_invite)
+            { from: (0, clock_1.hm)(18, 0), place: 'apartment' },
         ],
     },
     {
         id: 'riley', name: 'Riley', color: '#d0a040', speedTilesPerMin: 2.0, sheet: 'bob',
         schedule: [
-            { from: (0, clock_1.hm)(0), place: 'home' },
+            { from: (0, clock_1.hm)(0), place: 'apartment' },
             { from: (0, clock_1.hm)(8, 0), place: 'university', days: WEEKDAYS },
-            { from: (0, clock_1.hm)(15, 40), place: 'market' },
-            { from: (0, clock_1.hm)(17, 0), place: 'home' },
+            { from: (0, clock_1.hm)(15, 40), place: 'park', days: WEEKDAYS }, // the after-school food truck
+            { from: (0, clock_1.hm)(10, 0), place: 'market', days: [5, 6] }, // weekend market
+            { from: (0, clock_1.hm)(17, 0), place: 'apartment' },
         ],
     },
     {
         id: 'teacher', name: 'Ms Patel', color: '#7050a0', speedTilesPerMin: 2.0, sheet: 'amelia',
         schedule: [
-            { from: (0, clock_1.hm)(0), place: 'home' },
+            { from: (0, clock_1.hm)(0), place: 'apartment' },
             { from: (0, clock_1.hm)(7, 30), place: 'university', days: WEEKDAYS },
-            { from: (0, clock_1.hm)(16, 30), place: 'home' },
+            { from: (0, clock_1.hm)(16, 30), place: 'apartment' },
         ],
     },
     {
         id: 'shopkeeper', name: 'Mr Lee', color: '#409070', speedTilesPerMin: 2.0, sheet: 'bob',
         schedule: [
-            { from: (0, clock_1.hm)(0), place: 'home' },
+            { from: (0, clock_1.hm)(0), place: 'apartment' },
             { from: (0, clock_1.hm)(6, 30), place: 'dairy' },
-            { from: (0, clock_1.hm)(22), place: 'home' },
+            { from: (0, clock_1.hm)(22), place: 'apartment' },
         ],
     },
 ];
+/**
+ * Which room of a multi-room building an NPC is standing in right now. Only the school has
+ * separate rooms: Ms Patel teaches in the classroom; students are in the cafeteria over lunch and
+ * the hallway otherwise. `undefined` = the building's only room.
+ */
+function npcRoomAt(npcId, placeId, minutes) {
+    if (placeId !== 'university')
+        return undefined;
+    if (npcId === 'teacher')
+        return 'interior_school_classroom';
+    const m = (0, clock_1.parts)(minutes).minuteOfDay;
+    return m >= (0, clock_1.hm)(12, 30) && m < (0, clock_1.hm)(13, 30) ? 'interior_school_cafeteria' : 'interior_school_hall';
+}
 const npcDefById = new Map(exports.NPCS.map(n => [n.id, n]));
 const getNpcDef = (id) => npcDefById.get(id);
 exports.getNpcDef = getNpcDef;

@@ -41,7 +41,15 @@ export interface RecordTransactionInput {
 }
 
 export class FinanceSystem {
-  constructor(private readonly finance: FinancialState) {}
+  /**
+   * @param onRecorded optional listener called after every successful transaction. The live
+   *   GameStore uses it to keep day totals, events and achievements in step with the ledger, so
+   *   every money change — shop, bus, mission, activity — flows through this one pipeline.
+   */
+  constructor(
+    private readonly finance: FinancialState,
+    private readonly onRecorded?: (tx: Transaction) => void,
+  ) {}
 
   getFinancialState(): FinancialState {
     return this.finance;
@@ -107,6 +115,7 @@ export class FinanceSystem {
     if (this.finance.transactions.recent.length > this.finance.transactions.recentCap) {
       this.finance.transactions.recent.shift();
     }
+    this.onRecorded?.(tx);
     return tx;
   }
 

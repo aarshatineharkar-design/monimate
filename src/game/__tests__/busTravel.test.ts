@@ -32,7 +32,7 @@ function storeWithBusAtHomeStop(): GameStore {
   const store = freshDefaultStore();
   const arrival = nextBusAt(HOME_STOP, store.state.minutes)!;
   store.advance(arrival.arrivesAt - store.state.minutes);
-  store.earn(20, 'test', 'seed fare money for test');
+  store.earn(20, 'other', 'seed fare money for test');
   // Sanity check the fixture itself before any test relies on it.
   if (!busAtStop(HOME_STOP, store.state.minutes)) {
     throw new Error('test fixture: expected a bus to be standing at stop_home at this minute');
@@ -42,10 +42,10 @@ function storeWithBusAtHomeStop(): GameStore {
 
 test('Bus 1: successful boarding charges exactly the existing bus fare (BUS_ROUTE.fare)', () => {
   const store = storeWithBusAtHomeStop();
-  const balanceBefore = store.state.finance.balance;
+  const balanceBefore = store.state.finance.accounts.cash;
   const outcome = store.boardBus(HOME_STOP, SCHOOL_STOP);
   assert.equal(outcome.ok, true);
-  assert.equal(store.state.finance.balance, balanceBefore - 2.0); // BUS_ROUTE.fare
+  assert.equal(store.state.finance.accounts.cash, balanceBefore - 2.0); // BUS_ROUTE.fare
 });
 
 test('Bus 2: successful boarding consumes exactly the selected Energy cost (1)', () => {
@@ -85,45 +85,45 @@ test('Bus 5: insufficient money rejects boarding with zero mutation', () => {
   const arrival = nextBusAt(HOME_STOP, store.state.minutes)!;
   store.advance(arrival.arrivesAt - store.state.minutes);
   assert.ok(busAtStop(HOME_STOP, store.state.minutes));
-  assert.equal(store.state.finance.balance < 2.0, true); // genuinely can't afford the fare
+  assert.equal(store.state.finance.accounts.cash < 2.0, true); // genuinely can't afford the fare
 
-  const balanceBefore = store.state.finance.balance;
+  const balanceBefore = store.state.finance.accounts.cash;
   const energyBefore = store.getEnergy().current;
   const minutesBefore = store.state.minutes;
   const rideBefore = store.state.ride;
   const placeBefore = store.state.player.place;
-  const ledgerLengthBefore = store.state.ledger.length;
+  const ledgerLengthBefore = store.state.finance.transactions.recent.length;
 
   const outcome = store.boardBus(HOME_STOP, SCHOOL_STOP);
 
   assert.equal(outcome.ok, false);
-  assert.equal(store.state.finance.balance, balanceBefore);
+  assert.equal(store.state.finance.accounts.cash, balanceBefore);
   assert.equal(store.getEnergy().current, energyBefore);
   assert.equal(store.state.minutes, minutesBefore);
   assert.equal(store.state.ride, rideBefore);
   assert.equal(store.state.player.place, placeBefore);
-  assert.equal(store.state.ledger.length, ledgerLengthBefore);
+  assert.equal(store.state.finance.transactions.recent.length, ledgerLengthBefore);
 });
 
 test('Bus 6: insufficient energy rejects boarding with zero mutation', () => {
   const store = storeWithBusAtHomeStop();
   store.consumeEnergy(store.getEnergy().current); // drain to 0 — less than the 1 energy a ride needs
-  const balanceBefore = store.state.finance.balance;
+  const balanceBefore = store.state.finance.accounts.cash;
   const energyBefore = store.getEnergy().current;
   const minutesBefore = store.state.minutes;
   const rideBefore = store.state.ride;
   const placeBefore = store.state.player.place;
-  const ledgerLengthBefore = store.state.ledger.length;
+  const ledgerLengthBefore = store.state.finance.transactions.recent.length;
 
   const outcome = store.boardBus(HOME_STOP, SCHOOL_STOP);
 
   assert.equal(outcome.ok, false);
-  assert.equal(store.state.finance.balance, balanceBefore); // fare NOT charged even though affordable
+  assert.equal(store.state.finance.accounts.cash, balanceBefore); // fare NOT charged even though affordable
   assert.equal(store.getEnergy().current, energyBefore);
   assert.equal(store.state.minutes, minutesBefore);
   assert.equal(store.state.ride, rideBefore);
   assert.equal(store.state.player.place, placeBefore);
-  assert.equal(store.state.ledger.length, ledgerLengthBefore);
+  assert.equal(store.state.finance.transactions.recent.length, ledgerLengthBefore);
 });
 
 test('Bus 7: failure does not create or modify s.ride', () => {
@@ -163,12 +163,12 @@ test('Bus 9: successful finishRide() still places the player at the expected des
 
 test('Bus 10: existing finance ledger behavior remains correct — one new entry for the fare, no separate energy entry', () => {
   const store = storeWithBusAtHomeStop();
-  const ledgerLengthBefore = store.state.ledger.length;
+  const ledgerLengthBefore = store.state.finance.transactions.recent.length;
   const outcome = store.boardBus(HOME_STOP, SCHOOL_STOP);
   assert.equal(outcome.ok, true);
-  assert.equal(store.state.ledger.length, ledgerLengthBefore + 1); // exactly one new ledger entry
-  const entry = store.state.ledger[store.state.ledger.length - 1];
+  assert.equal(store.state.finance.transactions.recent.length, ledgerLengthBefore + 1); // exactly one new ledger entry
+  const entry = store.state.finance.transactions.recent[store.state.finance.transactions.recent.length - 1];
   assert.equal(entry.amount, -2.0);
   assert.equal(entry.category, 'transport');
-  assert.equal(entry.label, 'Bus fare');
+  assert.equal(entry.description, 'Bus fare');
 });

@@ -18,7 +18,6 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { GameStore, createInitialState } from '../../lib/store';
 import { makeInitialFinance, LIFE_PATHS } from '../../lib/gameData';
-import { executeAttendClass } from '../integration/mondayAdapter';
 
 const SCHOOL_CONFIG = LIFE_PATHS.find((p) => p.id === 'school')!;
 
@@ -28,24 +27,24 @@ function freshDefaultStore(): GameStore {
   return new GameStore(state);
 }
 
-test('MissionAutoStart 1: pocket_money becomes available the moment the player talks to Mum on Monday morning', () => {
-  const store = freshDefaultStore(); // Monday, 7:00 AM, at home — pocket_money's own window
-  store.talkTo('mum');
+test('MissionAutoStart 1: pocket_money arrives as a phone message the moment Monday starts — no need to find Mum first', () => {
+  const store = freshDefaultStore(); // Monday, 7:00 AM
   const rt = store.state.missions.find(m => m.id === 'pocket_money')!;
   assert.equal(rt.state, 'available');
 });
 
-test('MissionAutoStart 2: actionableStep() surfaces that available mission immediately, without a separate startMission() call from the caller', () => {
+test('MissionAutoStart 2: actionableStep() surfaces that available mission immediately, wherever the player is', () => {
   const store = freshDefaultStore();
-  store.talkTo('mum');
+  store.state.player.place = null; // walked straight outside — the old soft-lock case
+  store.state.player.scene = 'outdoor';
   const actionable = store.actionableStep();
-  assert.ok(actionable, 'expected pocket_money to be actionable right after the triggering interaction');
+  assert.ok(actionable, 'expected pocket_money to be actionable as a remote phone message');
   assert.equal(actionable!.def.id, 'pocket_money');
+  assert.equal(actionable!.step.remote, true);
 });
 
-test('MissionAutoStart 3: reading actionableStep() actually flips the runtime state to active (this is the fix — the state used to be stuck on \'available\' forever)', () => {
+test("MissionAutoStart 3: reading actionableStep() flips the runtime state to active", () => {
   const store = freshDefaultStore();
-  store.talkTo('mum');
   assert.equal(store.state.missions.find(m => m.id === 'pocket_money')!.state, 'available');
   store.actionableStep();
   assert.equal(store.state.missions.find(m => m.id === 'pocket_money')!.state, 'active');
@@ -53,17 +52,15 @@ test('MissionAutoStart 3: reading actionableStep() actually flips the runtime st
 
 test('MissionAutoStart 4: the auto-started mission plays out normally end to end through applyChoice()', () => {
   const store = freshDefaultStore();
-  store.talkTo('mum');
   const actionable = store.actionableStep()!;
-  const balanceBefore = store.state.finance.balance;
+  const balanceBefore = store.state.finance.accounts.cash;
   store.applyChoice('pocket_money', actionable.step.choices![0]);
-  assert.equal(store.state.finance.balance, balanceBefore + 35);
+  assert.equal(store.state.finance.accounts.cash, balanceBefore + 35);
   assert.equal(store.state.missions.find(m => m.id === 'pocket_money')!.state, 'completed');
 });
 
 test('MissionAutoStart 5: calling actionableStep() repeatedly does not re-trigger startMission or reset progress (idempotent once active)', () => {
   const store = freshDefaultStore();
-  store.talkTo('mum');
   store.actionableStep();
   const rt = store.state.missions.find(m => m.id === 'pocket_money')!;
   const startedAt = rt.startedAt;
@@ -73,43 +70,40 @@ test('MissionAutoStart 5: calling actionableStep() repeatedly does not re-trigge
   assert.equal(rt.stepIndex, 0);
 });
 
-test('MissionAutoStart 6: a mission stays untouched (locked) if its trigger has not fired — actionableStep() does not force-start unrelated missions', () => {
-  const store = freshDefaultStore(); // never talked to anyone
+test('MissionAutoStart 6: an interaction-triggered mission stays locked until the player actually talks to that NPC', () => {
+  const store = freshDefaultStore();
+  store.advance((2 * 24 + 2) * 60); // -> Wednesday 9:00 AM, inside Riley's birthday window
   store.actionableStep();
-  const rt = store.state.missions.find(m => m.id === 'pocket_money')!;
-  assert.equal(rt.state, 'locked');
+  assert.equal(store.state.missions.find(m => m.id === 'friend_birthday')!.state, 'locked');
+  assert.ok(store.npcsWantingToTalk().has('riley'), 'Riley should show a speech bubble while she wants to talk');
 });
 
-test('MissionAutoStart 7: an available mission whose step is NOT remote and the player is NOT at its place stays available (auto-start only fires when the step is actually reachable)', () => {
+test('MissionAutoStart 7: an available mission whose step is at a place the player is NOT at stays available (not force-started)', () => {
   const store = freshDefaultStore();
-  store.talkTo('mum'); // fires the trigger, home
-  const rt = store.state.missions.find(m => m.id === 'pocket_money')!;
+  const rt = store.state.missions.find(m => m.id === 'arcade_invite')!;
+  rt.state = 'available'; // Jordan's text arrived; the arcade itself is at the Mall
+  store.state.missions.find(m => m.id === 'pocket_money')!.state = 'completed';
+  store.state.player.place = 'home';
+  const actionable = store.actionableStep();
+  assert.notEqual(actionable?.def.id, 'arcade_invite');
   assert.equal(rt.state, 'available');
-  // Walk away before ever reading actionableStep() — simulates the mission becoming available while
-  // the player is elsewhere (can't happen for an interaction trigger in practice, but exercises the
-  // guard directly rather than assuming it).
-  store.state.player.place = 'university';
-  const actionable = store.actionableStep();
-  assert.equal(actionable, null);
-  assert.equal(rt.state, 'available'); // untouched — not force-started away from its own place
 });
 
-test('MissionAutoStart 8: end-to-end through the REAL trigger chain (no forced runtime state) — pickup_groceries reaches its DialoguePanel-ready moment the instant the player walks in the door, exactly the "Mom needs groceries" moment this step is about', () => {
+test('MissionAutoStart 8: end-to-end through the REAL trigger chain — pickup_groceries is actionable the instant the player is home in its window', () => {
   const store = freshDefaultStore();
-  store.advance(65); // 7:00 -> 8:05 AM
+  const pm = store.actionableStep()!;
+  store.applyChoice(pm.def.id, pm.step.choices![0]); // accept Mum's pocket money
+  store.advance(64); // -> 8:05 AM
   store.enterPlace('university');
-  // Attend Class is what markSchoolAttended() (attendedToday's own read) requires — go through the
-  // real adapter rather than poking dailyMarks directly.
-  const outcome = executeAttendClass(store);
+  const outcome = store.attendClass();
   assert.equal(outcome.ok, true); // now ~12:05, attended
-  store.enterPlace('home'); // still well before the 15:30 window — trigger can't fire yet
+  store.enterPlace('home');
   assert.equal(store.state.missions.find(m => m.id === 'pickup_groceries')!.state, 'locked');
-  store.advance(3 * 60 + 30); // -> 15:35, staying at home — the mission's own location trigger opens
+  store.advance(3 * 60 + 30); // -> 15:35 at home
   assert.equal(store.state.missions.find(m => m.id === 'pickup_groceries')!.state, 'available');
-  // The moment page.tsx's render loop would call actionableStep() (no separate accept UI exists,
-  // and none should be needed for a remote "read Mum's message" step):
   const actionable = store.actionableStep();
-  assert.ok(actionable, 'expected the grocery errand to be immediately actionable — this is the bug this step fixes');
+  assert.ok(actionable);
   assert.equal(actionable!.def.id, 'pickup_groceries');
   assert.equal(store.state.missions.find(m => m.id === 'pickup_groceries')!.state, 'active');
 });
+

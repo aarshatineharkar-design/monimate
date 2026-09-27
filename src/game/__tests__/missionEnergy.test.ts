@@ -24,28 +24,13 @@ function freshDefaultStore(): GameStore {
   return new GameStore(state);
 }
 
-/** Drives pocket_money to completion (its 'interaction' trigger with Mum fires as soon as its
- *  window is open, since missionsOnMinute() falls through to `rt.triggered` once a time-triggered
- *  mission's window has opened — see get_to_school below for the plain 'time'-triggered case), then
- *  starts and returns get_to_school's real, active, actionable step. Mirrors the accept-then-act
- *  pattern missionScheduling.test.ts uses for pickup_groceries. Used both for the one real
- *  end-to-end School-mission-choice test (Test 6) and, via applyChoice() with a synthetic choice, to
- *  isolate the Energy mechanic itself (Tests 1-5, 7) against a real actionable step. */
+/** A store with a real, active, actionable dialogue step: Monday 7:00, Mum's pocket-money message.
+ *  Used to apply synthetic choices so the Energy mechanic is tested in isolation. */
 function storeWithGetToSchoolActionable(): GameStore {
   const store = freshDefaultStore();
-  store.advance(5); // 7:00 -> 7:05 AM, inside pocket_money's window
-  store.talkTo('mum'); // pocket_money's trigger is `{ type: 'interaction', npcId: 'mum' }`
-  store.advance(1); // let missionsOnMinute() notice `rt.triggered` and make it available
-  store.startMission('pocket_money');
-  const pocketMoney = store.actionableStep();
-  assert.ok(pocketMoney, 'expected pocket_money to be actionable at 7:05 AM Monday');
-  assert.equal(pocketMoney!.def.id, 'pocket_money');
-  store.applyChoice('pocket_money', pocketMoney!.step.choices![0]); // 'take' — finishes the mission
-  store.advance(1); // let missionsOnMinute() notice pocket_money is done and open get_to_school
-  store.startMission('get_to_school');
-  const getToSchool = store.actionableStep();
-  assert.ok(getToSchool, 'expected get_to_school to be actionable right after pocket_money');
-  assert.equal(getToSchool!.def.id, 'get_to_school');
+  const actionable = store.actionableStep();
+  assert.ok(actionable, 'expected pocket_money to be actionable at 7:00 AM Monday');
+  assert.equal(actionable!.def.id, 'pocket_money');
   return store;
 }
 
@@ -85,12 +70,13 @@ test('MissionEnergy 3: a choice with energyCost 0 does not change Energy', () =>
 
 test('MissionEnergy 4: insufficient Energy does not reject the choice — it still applies fully', () => {
   const store = storeWithGetToSchoolActionable();
+  store.earn(10, 'other', 'test cash'); // money can't go negative, so give the $3 choice something to spend
   // Drain Energy down to 2, less than the energyCost of 5 we're about to apply.
   store.consumeEnergy(store.getEnergy().current - 2);
   assert.equal(store.getEnergy().current, 2);
 
   const actionable = store.actionableStep()!;
-  const balanceBefore = store.state.finance.balance;
+  const balanceBefore = store.state.finance.accounts.cash;
   const minutesBefore = store.state.minutes;
   const relBefore = store.state.world.relationships['Mum'] ?? 0;
 
@@ -102,7 +88,7 @@ test('MissionEnergy 4: insufficient Energy does not reject the choice — it sti
   // Energy clamps at 0 (existing consumeEnergy() semantics) rather than blocking anything.
   assert.equal(store.getEnergy().current, 0);
   // Every other normal effect of the choice still applied.
-  assert.equal(store.state.finance.balance, balanceBefore - 3);
+  assert.equal(store.state.finance.accounts.cash, balanceBefore - 3);
   assert.equal(store.state.minutes, minutesBefore + 10);
   if (actionable.step.speaker === 'Mum') {
     assert.equal(store.state.world.relationships['Mum'], relBefore + 1);
@@ -122,25 +108,28 @@ test('MissionEnergy 5: an Energy cost does not alter income, expenses, balance o
   withEnergy.applyChoice(actionableA.def.id, syntheticChoice({ ...shared, energyCost: 8 }));
   withoutEnergy.applyChoice(actionableB.def.id, syntheticChoice({ ...shared }));
 
-  assert.equal(withEnergy.state.finance.balance, withoutEnergy.state.finance.balance);
-  assert.equal(withEnergy.state.finance.totalSpent, withoutEnergy.state.finance.totalSpent);
-  assert.equal(withEnergy.state.finance.totalEarned, withoutEnergy.state.finance.totalEarned);
-  assert.deepEqual(withEnergy.state.ledger, withoutEnergy.state.ledger);
+  assert.equal(withEnergy.state.finance.accounts.cash, withoutEnergy.state.finance.accounts.cash);
+  assert.equal(withEnergy.state.finance.totals.totalSpent, withoutEnergy.state.finance.totals.totalSpent);
+  assert.equal(withEnergy.state.finance.totals.totalEarned, withoutEnergy.state.finance.totals.totalEarned);
+  assert.deepEqual(withEnergy.state.finance.transactions.recent, withoutEnergy.state.finance.transactions.recent);
 });
 
-test('MissionEnergy 6: a real School mission choice (get_to_school / walk) applies Energy end-to-end', () => {
-  const store = storeWithGetToSchoolActionable();
-  const def = getDef(SCHOOL_MISSIONS, 'get_to_school')!;
+test('MissionEnergy 6: a real School mission choice (unexpected_event / walk) applies Energy end-to-end', () => {
+  const store = freshDefaultStore();
+  const rt = store.runtime('unexpected_event')!;
+  rt.state = 'active'; rt.stepIndex = 0;
+  const def = getDef(SCHOOL_MISSIONS, 'unexpected_event')!;
   const walkChoice = def.steps[0].choices!.find(c => c.id === 'walk')!;
   assert.equal(walkChoice.energyCost, 5);
 
   const energyBefore = store.getEnergy().current;
   const minutesBefore = store.state.minutes;
-  store.applyChoice('get_to_school', walkChoice);
+  store.applyChoice('unexpected_event', walkChoice);
 
   assert.equal(store.getEnergy().current, energyBefore - 5);
-  assert.equal(store.state.minutes, minutesBefore + 20); // walk's own `minutes: 20` is unaffected
-  assert.equal(store.state.world.flags.includes('walked_to_school'), true);
+  assert.equal(store.state.minutes, minutesBefore + 25);
+  assert.equal(store.state.world.flags.includes('unexpected_walked'), true);
+  assert.equal(rt.state, 'completed', 'the choice resolves the mission (it used to leave it stuck active)');
 });
 
 test('MissionEnergy 7: an ordinary conversational/passive choice remains free of Energy cost', () => {
@@ -156,11 +145,11 @@ test('MissionEnergy 7: an ordinary conversational/passive choice remains free of
 });
 
 test('MissionEnergy 8: selected physical choices carry their intended authored values', () => {
+  // The trip to school is no longer a menu: real walking and the real bus are the choice.
   const getToSchool = getDef(SCHOOL_MISSIONS, 'get_to_school')!;
-  const walk = getToSchool.steps[0].choices!.find(c => c.id === 'walk')!;
-  const bus = getToSchool.steps[0].choices!.find(c => c.id === 'bus')!;
-  assert.equal(walk.energyCost, 5);
-  assert.equal(bus.energyCost, undefined);
+  assert.equal(getToSchool.steps.length, 1);
+  assert.equal(getToSchool.steps[0].choices, undefined);
+  assert.equal(getToSchool.steps[0].completeOnArrival, true);
 
   const unexpected = getDef(SCHOOL_MISSIONS, 'unexpected_event')!;
   const uWalk = unexpected.steps[0].choices!.find(c => c.id === 'walk')!;
