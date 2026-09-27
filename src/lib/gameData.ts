@@ -1,97 +1,95 @@
-import { ShopItem, Location, NPC, Mission } from './types';
+/**
+ * MoniMate — life-path configs (starting money, goals, jobs) used to seed a new GameStore.
+ * Moved out of page.tsx; content unchanged.
+ */
+import type { FinancialState, FinancialGoal, Job } from './financeTypes';
 
-export const LOCATIONS: Location[] = [
-  { id: 'home', label: 'Home', emoji: '🏠', x: 15, y: 62, description: 'Your room & piggy bank' },
-  { id: 'school', label: 'School', emoji: '🏫', x: 50, y: 20, description: 'Tuck shop & vending' },
-  { id: 'dairy', label: 'Dairy', emoji: '🏪', x: 82, y: 55, description: 'After-school snacks' },
-  { id: 'mall', label: 'Mall', emoji: '🛍️', x: 50, y: 78, description: 'Games, clothes & gifts' },
-];
+export type LifePath = 'school' | 'university' | 'international' | 'working';
 
-export const TUCKSHOP_ITEMS: ShopItem[] = [
-  { name: 'Mince Pie', price: 5.50, emoji: '🥧', category: 'school' },
-  { name: 'Sushi Pack', price: 5.00, emoji: '🍣', category: 'school' },
-  { name: 'Cheese Roll', price: 2.50, emoji: '🧀', category: 'school' },
-  { name: 'Cup Noodles', price: 4.00, emoji: '🍜', category: 'school' },
-  { name: 'Juice Box', price: 3.00, emoji: '🧃', category: 'school' },
-  { name: 'Cookie', price: 2.00, emoji: '🍪', category: 'school' },
-];
-
-export const DAIRY_ITEMS: ShopItem[] = [
-  { name: 'Chips', price: 2.50, emoji: '🍟', category: 'dairy' },
-  { name: 'Ice Block', price: 2.00, emoji: '🧊', category: 'dairy' },
-  { name: 'Lollies', price: 3.00, emoji: '🍬', category: 'dairy' },
-  { name: 'Drink Bottle', price: 4.00, emoji: '🥤', category: 'dairy' },
-  { name: 'Chocolate Bar', price: 3.50, emoji: '🍫', category: 'dairy' },
-];
-
-export const MALL_ITEMS: ShopItem[] = [
-  { name: 'Phone Case', price: 25.00, emoji: '📱', category: 'mall' },
-  { name: 'Video Game', price: 40.00, emoji: '🎮', category: 'mall' },
-  { name: 'T-Shirt', price: 30.00, emoji: '👕', category: 'mall' },
-  { name: 'Movie Ticket', price: 18.00, emoji: '🎬', category: 'mall' },
-  { name: 'Birthday Gift', price: 15.00, emoji: '🎁', category: 'mall' },
-];
-
-export const NPCS: NPC[] = [
-  { id: 'rich-kid', name: 'Jake', emoji: '😎', personality: 'Always has money, buys the expensive option every time' },
-  { id: 'saver', name: 'Mia', emoji: '🤓', personality: 'Brings lunch from home, always has money when it matters' },
-  { id: 'borrower', name: 'Liam', emoji: '😅', personality: 'Always asking to borrow money, rarely pays it back' },
-  { id: 'mentor', name: 'Mentor', emoji: '🧑‍💼', personality: 'Your financial guide — pops up with contextual advice' },
-];
-
-export const MISSIONS: Mission[] = [
-  {
-    id: 1, level: 1, title: "Your First Week's Money",
-    description: "Mum hands you $15 for the week. \"Make it last — that's all till next Monday.\"",
-    triggerWeek: 1, triggerLocation: 'home', skillTaught: 'budgeting basics', xpReward: 10,
-  },
-  {
-    id: 2, level: 1, title: 'The Dairy Run',
-    description: "Your mates are all grabbing chips and drinks after school. Jake's buying a drink and chips — \"Come on, just get something!\"",
-    triggerWeek: 2, triggerLocation: 'dairy', skillTaught: 'social pressure', xpReward: 15,
-  },
-  {
-    id: 3, level: 1, title: 'Saving For Something',
-    description: "You REALLY want that $40 game everyone's playing. At $15/week, that's almost 3 full weeks of saving — if you don't spend anything.",
-    triggerWeek: 3, triggerLocation: 'home', skillTaught: 'delayed gratification', xpReward: 20,
-  },
-  {
-    id: 4, level: 1, title: 'The Birthday Present',
-    description: "Your best mate's birthday is Saturday. A decent present is $10-15. This wasn't in the plan.",
-    triggerWeek: 5, triggerLocation: null, skillTaught: 'unexpected expenses', xpReward: 15,
-  },
-  {
-    id: 5, level: 1, title: 'The School Trip',
-    description: "School trip coming up in 3 weeks. You need $30 spending money. Can you save enough while still eating at school?",
-    triggerWeek: 3, triggerLocation: null, skillTaught: 'goal-based saving', xpReward: 25,
-  },
-  {
-    id: 6, level: 1, title: 'Your First Bank Account',
-    description: "The Mentor thinks you're ready. Time to learn what a savings account actually does — and what interest means.",
-    triggerWeek: 6, triggerLocation: 'home', skillTaught: 'savings accounts', xpReward: 30,
-  },
-];
-
-export const DAYS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri'];
-
-export const WEEKLY_POCKET_MONEY = 15;
-export const TOTAL_WEEKS = 6;
-
-export function getItemsForLocation(locationId: string): ShopItem[] {
-  switch (locationId) {
-    case 'school': return TUCKSHOP_ITEMS;
-    case 'dairy': return DAIRY_ITEMS;
-    case 'mall': return MALL_ITEMS;
-    default: return [];
-  }
+export interface LifePathConfig {
+  id: LifePath;
+  name: string;
+  emoji: string;
+  tagline: string;
+  description: string;
+  startingBalance: number;
+  weeklyIncome: number;
+  rentAmount: number;
+  debt: number;
+  goals: FinancialGoal[];
+  startingJob: Job | null;
+  levelNames: string[];
+  color: string;
 }
 
-export function getLocationName(locationId: string): string {
-  switch (locationId) {
-    case 'school': return '🏫 Tuck Shop';
-    case 'dairy': return '🏪 The Dairy';
-    case 'mall': return '🛍️ The Mall';
-    case 'home': return '🏠 Your Room';
-    default: return '';
-  }
+export const LIFE_PATHS: LifePathConfig[] = [
+  {
+    id: 'school', name: 'School Student', emoji: '🧑‍🎓',
+    tagline: 'Learn the basics — every dollar counts',
+    description: 'You get a weekly allowance and have to manage your spending. Simple goals, big lessons.',
+    // $0 on purpose: the "Make It to Friday" mission chain hands you $35 Monday morning, and that
+    // IS your week's budget (Rule: the player should not have unlimited money). No passive income
+    // tops it up mid-week either — the 'allowance' job id is explicitly excluded from Thursday payday.
+    startingBalance: 0, weeklyIncome: 35, rentAmount: 0, debt: 0,
+    startingJob: { id: 'allowance', name: 'Weekly Allowance', location: 'home', payPerHour: 0, hoursPerWeek: 0, daysAvailable: [4] },
+    goals: [
+      { id: 'save500', name: 'Save $500', target: 500, saved: 0 },
+      { id: 'school_supplies', name: 'School Supplies', target: 80, saved: 0 },
+    ],
+    levelNames: ['Money Basics', 'Saving Up', 'Budgeting', 'Bigger Goals'],
+    color: '#60b8ff',
+  },
+  {
+    id: 'university', name: 'University Student', emoji: '🎓',
+    tagline: 'Rent, study, survive — no job yet',
+    description: 'You have a student loan and rent to pay. Find work fast, manage your budget, build independence.',
+    startingBalance: 1200, weeklyIncome: 0, rentAmount: 200, debt: 15000,
+    startingJob: null,
+    goals: [
+      { id: 'emergency', name: 'Emergency Fund $1,000', target: 1000, saved: 0 },
+      { id: 'laptop', name: 'New Laptop $1,200', target: 1200, saved: 0 },
+    ],
+    levelNames: ['Money Basics', 'Student Budget', 'Independence', 'Financial Challenges'],
+    color: '#ffd700',
+  },
+  {
+    id: 'international', name: 'International Student', emoji: '🌎',
+    tagline: 'New country, new costs, new challenges',
+    description: 'You arrived with savings but face high setup costs, limited work rights, and currency conversions.',
+    startingBalance: 3000, weeklyIncome: 0, rentAmount: 280, debt: 0,
+    startingJob: null,
+    goals: [
+      { id: 'setup', name: 'Setup Costs $500', target: 500, saved: 0 },
+      { id: 'emergency_int', name: 'Emergency Fund $2,000', target: 2000, saved: 0 },
+    ],
+    levelNames: ['Setup & Arrival', 'Living Costs', 'Work & Study', 'Advanced Challenges'],
+    color: '#ffa657',
+  },
+  {
+    id: 'working', name: 'Working Person', emoji: '💼',
+    tagline: 'Good income, bigger responsibilities',
+    description: 'You earn a salary but have a car loan and rent. Build wealth, manage debt, plan your future.',
+    startingBalance: 2500, weeklyIncome: 800, rentAmount: 350, debt: 25000,
+    startingJob: { id: 'office_job', name: 'Office Manager', location: 'office', payPerHour: 28, hoursPerWeek: 40, daysAvailable: [0, 1, 2, 3, 4] },
+    goals: [
+      { id: 'car_loan', name: 'Pay Car Loan', target: 25000, saved: 0 },
+      { id: 'invest', name: 'Investment Fund $10,000', target: 10000, saved: 0 },
+    ],
+    levelNames: ['Income Management', 'Budgeting Pro', 'Debt & Major Purchases', 'Long-Term Planning'],
+    color: '#3fb950',
+  },
+];
+
+export function makeInitialFinance(path: LifePathConfig): FinancialState {
+  return {
+    balance: path.startingBalance, savings: 0, emergencyFund: 0, debt: path.debt,
+    weeklyIncome: path.weeklyIncome, job: path.startingJob,
+    weeklyExpenses: [], monthlyExpenses: [],
+    rentDueInDays: path.rentAmount > 0 ? 7 : 999, rentAmount: path.rentAmount,
+    nextBillAmount: 40, nextBillName: 'Phone bill', nextBillDueInDays: 5,
+    goals: path.goals.map(g => ({ ...g })),
+    totalEarned: 0, totalSpent: 0,
+  };
 }
+
+export const getLifePath = (id: LifePath) => LIFE_PATHS.find(p => p.id === id)!;

@@ -40,6 +40,12 @@ export default function GameWorld({ currentLocation, onLocationChange, weather, 
     if (!canvas) return;
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
+    // `canvas` is `HTMLCanvasElement | null` to TypeScript once captured by the closures below
+    // (handleClick/handleMove) — narrowing from the `if (!canvas) return;` above doesn't cross a
+    // function boundary. `canvasEl` is the same element, just bound to a type TS can carry into
+    // those closures; it's non-null for the lifetime of this effect (canvasRef.current only
+    // changes on remount, at which point this whole effect re-runs).
+    const canvasEl = canvas;
 
     const W = 700;
     const H = 480;
@@ -311,7 +317,7 @@ export default function GameWorld({ currentLocation, onLocationChange, weather, 
 
     // Click handler
     function handleClick(e: MouseEvent) {
-      const rect = canvas.getBoundingClientRect();
+      const rect = canvasEl.getBoundingClientRect();
       const scaleX = W / rect.width;
       const scaleY = H / rect.height;
       const mx = (e.clientX - rect.left) * scaleX;
@@ -338,7 +344,7 @@ export default function GameWorld({ currentLocation, onLocationChange, weather, 
 
     // Hover handler
     function handleMove(e: MouseEvent) {
-      const rect = canvas.getBoundingClientRect();
+      const rect = canvasEl.getBoundingClientRect();
       const scaleX = W / rect.width;
       const scaleY = H / rect.height;
       const mx = (e.clientX - rect.left) * scaleX;
@@ -349,14 +355,14 @@ export default function GameWorld({ currentLocation, onLocationChange, weather, 
         if (mx >= b.x - 5 && mx <= b.x + b.width + 5 &&
             my >= b.y - 15 && my <= b.y + b.height + 5) {
           setHoveredBuilding(b.id);
-          canvas.style.cursor = 'pointer';
+          canvasEl.style.cursor = 'pointer';
           found = true;
           break;
         }
       }
       if (!found) {
         setHoveredBuilding(null);
-        canvas.style.cursor = 'default';
+        canvasEl.style.cursor = 'default';
       }
     }
 

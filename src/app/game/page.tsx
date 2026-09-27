@@ -1,857 +1,1864 @@
 'use client';
 
-import { useState, useEffect, useRef } from 'react';
-import { getDayData, formatTime, getTimeOfDay, CAMP_GOAL } from '@/lib/dayTimeline';
-import type { TimeChoice } from '@/lib/dayTimeline';
+/**
+ * MoniMate — Financial Life Simulator (slim page.tsx).
+ *
+ * All simulation logic lives in src/lib (clock/world/missions/store/render/loop). This component
+ * only: (1) handles auth/path-select screens, (2) owns one GameStore + GameLoop per session,
+ * (3) runs the canvas + input loop, (4) renders HUD/journal/dialogue/minimap from current state.
+ */
+import { useCallback, useEffect, useRef, useState } from 'react';
+import {
+  PlayerProfile, hashPassword, verifyPassword, loadAccounts, saveAccounts,
+  loadSession, saveSession, clearSession, loadGameSave, saveGame,
+} from '../../lib/auth';
+import { LIFE_PATHS, LifePath, LifePathConfig, getLifePath, makeInitialFinance } from '../../lib/gameData';
+import { createInitialState, GameStore, LevelSummary } from '../../lib/store';
+import { GameLoop } from '../../lib/loop';
+import { askMentorChat, askMentorWeeklyRecap } from '../../lib/mentor';
+import { speakLine, stopSpeaking } from '../../lib/tts';
+import { MoveInput, drawDayNightOverlay, drawMinimap, hudTime, waypointReadout } from '../../lib/render';
+import {
+  PLACES, TILE_PX, isOpen as placeIsOpen, groundSprite,
+  CHAR_FRAME_W, CHAR_FRAME_H, CHAR_RUN_FRAMES, DIR_ORDER, facingToDir, characterSheet,
+  getInterior, INTERIOR_TILE_PX, DECOR_PROPS, getNpcDef,
+  BUS_STOPS, BUS_ROUTE, busAtStop, nextBusAt, stopById, rideMinutes, getPlace,
+} from '../../lib/world';
+import { buildJournal, MissionChoice, MissionDef, trackedMission } from '../../lib/missions';
+import { dayToSummaryView, weekToSummaryView } from '../../lib/summary';
+import type { GameState, NpcRuntime } from '../../lib/types';
+import { formatDay, formatTime, parts } from '../../lib/clock';
+import { executeAttendClass, executeHelpParents } from '../../game/integration/mondayAdapter';
+import { LIFE_EVENTS } from '../../lib/lifeEvents';
+import { ACHIEVEMENTS, isUnlocked } from '../../lib/achievements';
 
-interface PlayerState {
-  wallet: number; piggyBank: number; totalSpent: number; totalEarned: number;
-  financialHealth: number; currentTime: number; currentLocation: string;
-  flags: Record<string, boolean>; streak: number; bestStreak: number;
-  daySpending: number; achievements: string[];
-}
+const MAP_W = 60, MAP_H = 44;
 
-interface BDef {
-  id: string; xPct: number; yPct: number; wPct: number; hPct: number;
-  label: string; roof: string; wall: string; door: string;
-}
-
-// Positions as percentages of canvas — scales to any screen size
-const BUILDINGS: BDef[] = [
-  { id: 'home', xPct: 0.06, yPct: 0.35, wPct: 0.12, hPct: 0.18, label: '🏠 Home', roof: '#5a3a1e', wall: '#4a7a5a', door: '#3a5a3a' },
-  { id: 'school', xPct: 0.35, yPct: 0.12, wPct: 0.16, hPct: 0.2, label: '🏫 School', roof: '#6b4914', wall: '#8b7914', door: '#5b5914' },
-  { id: 'dairy', xPct: 0.78, yPct: 0.3, wPct: 0.11, hPct: 0.15, label: '🏪 Dairy', roof: '#3a5a7a', wall: '#6b8cae', door: '#4a6c8e' },
-  { id: 'mall', xPct: 0.55, yPct: 0.4, wPct: 0.13, hPct: 0.17, label: '🛍️ Mall', roof: '#6b3a5c', wall: '#9b6b8c', door: '#7b4b6c' },
-  { id: 'library', xPct: 0.2, yPct: 0.18, wPct: 0.1, hPct: 0.14, label: '📚 Library', roof: '#4a3a2a', wall: '#7a6b5a', door: '#5a4b3a' },
-  { id: 'cafe', xPct: 0.68, yPct: 0.14, wPct: 0.09, hPct: 0.13, label: '☕ Café', roof: '#5b3e1c', wall: '#8b5e3c', door: '#6b3e1c' },
-];
-
-const INTERIOR_THEME: Record<string, { wall: string; floor: string; trim: string; label: string }> = {
-  home:    { wall: '#f3e6c8', floor: '#8a5a3a', trim: '#5a3a1e', label: '🏠 HOME' },
-  school:  { wall: '#dce8f0', floor: '#c9a876', trim: '#8b7914', label: '🏫 SCHOOL' },
-  dairy:   { wall: '#eef2f5', floor: '#cfd8dc', trim: '#6b8cae', label: '🏪 DAIRY' },
-  mall:    { wall: '#f5e8f0', floor: '#e8c8d8', trim: '#9b6b8c', label: '🛍️ MALL' },
-  library: { wall: '#3a2a1e', floor: '#5a2a2a', trim: '#7a6b5a', label: '📚 LIBRARY' },
-  cafe:    { wall: '#6b4a2e', floor: '#3a2818', trim: '#8b5e3c', label: '☕ CAFÉ' },
+/** Casual, non-mission chat lines — what an NPC says if you walk up and press E/ACT when they
+ *  have no active mission step for you. Picked at random so talking to the same person twice in
+ *  a row doesn't feel scripted-empty. */
+const NPC_IDLE_LINES: Record<string, string[]> = {
+  mum: [
+    "Don't forget — the $35 has to last till Friday.",
+    "How's the budget looking so far this week?",
+    "Love you, kiddo. Don't spend it all on snacks.",
+    "Let me know if you need to talk about money — no judgment.",
+  ],
+  jordan: [
+    "Hey! You coming to the arcade this week?",
+    "I heard the cafeteria's doing something new for lunch.",
+    "You seen Riley today? She's been stressed about her birthday thing.",
+    "I'm saving up for new headphones — slow going.",
+  ],
+  riley: [
+    "Hey! Thanks again for being a good friend.",
+    "This market stall smells incredible, you have to try it sometime.",
+    "I'm turning a year older soon, you know...",
+    "School's been a lot lately, honestly.",
+  ],
+  teacher: [
+    "Make sure that project gets handed in on time.",
+    "Attendance matters more than people think.",
+    "Let me know if you're stuck on anything.",
+  ],
+  shopkeeper: [
+    "Fresh stock just came in this morning.",
+    "Let me know if you can't find something.",
+  ],
 };
-
-const CHARACTERS: Record<string, { hair: string; outfit: string; skin: string }> = {
-  'Mum':           { hair: '#5a3a2a', outfit: '#c94f4f', skin: '#e8b088' },
-  'Dad':           { hair: '#3a2a1e', outfit: '#3a5a7a', skin: '#d8a878' },
-  'Mr. Thompson':  { hair: '#999999', outfit: '#2a3a5a', skin: '#e0b090' },
-  'Jake':          { hair: '#2a1e14', outfit: '#e94560', skin: '#e8b088' },
-  'Mia':           { hair: '#4a2a1e', outfit: '#4ecca3', skin: '#f0c8a0' },
-  'Liam':          { hair: '#8a5a2a', outfit: '#f0c038', skin: '#e0b090' },
-  'Amy':           { hair: '#5a2a4a', outfit: '#e97fa0', skin: '#f0c8a0' },
-};
-
-function drawCharacter(
-  ctx: CanvasRenderingContext2D, x: number, y: number, s: number, t: number,
-  c: { hair: string; outfit: string; skin: string }, name: string
-) {
-  const bob = Math.sin(t * 0.06) * 1.5;
-  const blink = Math.sin(t * 0.05) > 0.96;
-
-  ctx.fillStyle = 'rgba(0,0,0,0.2)';
-  ctx.beginPath(); ctx.ellipse(x, y + 8 * s, 5 * s, 2 * s, 0, 0, Math.PI * 2); ctx.fill();
-
-  ctx.fillStyle = '#334466';
-  ctx.fillRect(x - 3 * s, y + 2, 2.5 * s, 5 * s);
-  ctx.fillRect(x + 0.5 * s, y + 2, 2.5 * s, 5 * s);
-
-  ctx.fillStyle = c.outfit;
-  ctx.fillRect(x - 4 * s, y - 9 * s + bob, 8 * s, 11 * s);
-
-  ctx.fillStyle = c.skin;
-  ctx.fillRect(x - 3 * s, y - 15 * s + bob, 6 * s, 6 * s);
-
-  ctx.fillStyle = c.hair;
-  ctx.fillRect(x - 3 * s, y - 16 * s + bob, 6 * s, 2.5 * s);
-
-  ctx.fillStyle = '#000';
-  if (!blink) {
-    ctx.fillRect(x - 2 * s, y - 13.5 * s + bob, 1.2 * s, 1.2 * s);
-    ctx.fillRect(x + 0.5 * s, y - 13.5 * s + bob, 1.2 * s, 1.2 * s);
-  } else {
-    ctx.fillRect(x - 2 * s, y - 13 * s + bob, 1.2 * s, 0.3 * s);
-    ctx.fillRect(x + 0.5 * s, y - 13 * s + bob, 1.2 * s, 0.3 * s);
-  }
-
-  ctx.font = `bold ${Math.max(9, s * 4)}px monospace`;
-  ctx.textAlign = 'center';
-  ctx.fillStyle = '#f0c038';
-  ctx.strokeStyle = 'rgba(0,0,0,0.7)'; ctx.lineWidth = 3;
-  ctx.strokeText(name, x, y - 19 * s + bob);
-  ctx.fillText(name, x, y - 19 * s + bob);
+function idleLineFor(npcId: string): string {
+  const pool = NPC_IDLE_LINES[npcId] ?? ["Hey."];
+  return pool[Math.floor(Math.random() * pool.length)];
 }
 
-function drawInterior(ctx: CanvasRenderingContext2D, W: number, H: number, id: string, t: number, speaker?: string) {
-  const theme = INTERIOR_THEME[id] || INTERIOR_THEME.home;
-  const floorY = H * 0.58;
-
-  ctx.fillStyle = theme.wall;
-  ctx.fillRect(0, 0, W, floorY);
-  ctx.fillStyle = theme.floor;
-  ctx.fillRect(0, floorY, W, H - floorY);
-  ctx.fillStyle = theme.trim;
-  ctx.fillRect(0, floorY - 6, W, 6);
-
-  if (id === 'dairy' || id === 'mall') {
-    ctx.strokeStyle = 'rgba(0,0,0,0.08)'; ctx.lineWidth = 2;
-    const tile = W / 10;
-    for (let x = 0; x <= W; x += tile) { ctx.beginPath(); ctx.moveTo(x, floorY); ctx.lineTo(x, H); ctx.stroke(); }
-    for (let y = floorY; y <= H; y += tile) { ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(W, y); ctx.stroke(); }
-  } else {
-    ctx.strokeStyle = 'rgba(0,0,0,0.1)'; ctx.lineWidth = 2;
-    for (let x = 0; x <= W; x += 40) { ctx.beginPath(); ctx.moveTo(x, floorY); ctx.lineTo(x, H); ctx.stroke(); }
-  }
-
-  switch (id) {
-    case 'home': {
-      ctx.fillStyle = '#aaddee'; ctx.fillRect(W*0.06, H*0.08, W*0.16, H*0.18);
-      ctx.strokeStyle = '#5a3a1e'; ctx.lineWidth = 6; ctx.strokeRect(W*0.06, H*0.08, W*0.16, H*0.18);
-      ctx.fillStyle = '#c94f4f';
-      ctx.fillRect(W*0.05, H*0.06, W*0.02, H*0.2);
-      ctx.fillRect(W*0.06+W*0.16, H*0.06, W*0.02, H*0.2);
-      ctx.fillStyle = '#5a3a1e'; ctx.fillRect(W*0.4, H*0.12, W*0.08, H*0.1);
-      ctx.fillStyle = '#7aa8d8'; ctx.fillRect(W*0.4+4, H*0.12+4, W*0.08-8, H*0.1-8);
-      ctx.fillStyle = '#c94f4f';
-      ctx.beginPath(); ctx.ellipse(W*0.5, H*0.82, W*0.22, H*0.08, 0, 0, Math.PI*2); ctx.fill();
-      ctx.fillStyle = '#e8e0d0';
-      ctx.beginPath(); ctx.ellipse(W*0.5, H*0.82, W*0.16, H*0.05, 0, 0, Math.PI*2); ctx.fill();
-      ctx.fillStyle = '#5a3a1e'; ctx.fillRect(W*0.7, H*0.55, W*0.24, H*0.32);
-      ctx.fillStyle = '#eef0f5'; ctx.fillRect(W*0.71, H*0.57, W*0.22, H*0.14);
-      ctx.fillStyle = '#4a7a5a'; ctx.fillRect(W*0.71, H*0.68, W*0.22, H*0.16);
-      ctx.fillStyle = '#fff'; ctx.fillRect(W*0.72, H*0.58, W*0.06, H*0.06);
-      ctx.fillStyle = '#5a3a1e'; ctx.fillRect(W*0.15, H*0.68, W*0.1, H*0.05);
-      ctx.fillRect(W*0.16, H*0.73, W*0.015, H*0.1);
-      ctx.fillRect(W*0.23, H*0.73, W*0.015, H*0.1);
-      ctx.fillStyle = '#f0c038';
-      ctx.beginPath(); ctx.arc(W*0.2, H*0.63, W*0.02, 0, Math.PI*2); ctx.fill();
-      break;
-    }
-    case 'school': {
-      ctx.fillStyle = '#1e3a2a'; ctx.fillRect(W*0.3, H*0.1, W*0.4, H*0.22);
-      ctx.strokeStyle = '#6b4914'; ctx.lineWidth = 8; ctx.strokeRect(W*0.3, H*0.1, W*0.4, H*0.22);
-      ctx.strokeStyle = 'rgba(255,255,255,0.5)'; ctx.lineWidth = 2;
-      ctx.beginPath(); ctx.moveTo(W*0.34, H*0.17); ctx.lineTo(W*0.6, H*0.17); ctx.stroke();
-      ctx.beginPath(); ctx.moveTo(W*0.34, H*0.23); ctx.lineTo(W*0.52, H*0.23); ctx.stroke();
-      ctx.fillStyle = '#fff'; ctx.beginPath(); ctx.arc(W*0.85, H*0.15, W*0.025, 0, Math.PI*2); ctx.fill();
-      ctx.strokeStyle = '#333'; ctx.lineWidth = 2; ctx.stroke();
-      for (let row = 0; row < 2; row++) {
-        for (let col = 0; col < 3; col++) {
-          const dx = W*0.28 + col * W*0.16, dy = H*0.6 + row * H*0.16;
-          ctx.fillStyle = '#a87a4a'; ctx.fillRect(dx, dy, W*0.11, H*0.07);
-          ctx.fillStyle = '#5a3a1e'; ctx.fillRect(dx, dy+H*0.07, W*0.015, H*0.05);
-          ctx.fillRect(dx+W*0.095, dy+H*0.07, W*0.015, H*0.05);
-        }
-      }
-      ctx.fillStyle = '#aaddee'; ctx.fillRect(W*0.03, H*0.15, W*0.1, H*0.16);
-      ctx.fillRect(W*0.87, H*0.15, W*0.1, H*0.16);
-      break;
-    }
-    case 'dairy': {
-      const shelfColors = ['#e94560','#4ecca3','#f0c038','#6b8cae','#c94f4f','#8b7914'];
-      for (let col = 0; col < 5; col++) {
-        const sx = W*0.08 + col * W*0.17;
-        ctx.fillStyle = '#cfd8dc'; ctx.fillRect(sx, H*0.1, W*0.13, H*0.32);
-        for (let r = 0; r < 3; r++) {
-          ctx.fillStyle = shelfColors[(col+r)%shelfColors.length];
-          ctx.fillRect(sx+6, H*0.12 + r*H*0.1, W*0.13-12, H*0.06);
-        }
-      }
-      ctx.fillStyle = '#3a5a7a'; ctx.fillRect(W*0.35, H*0.6, W*0.3, H*0.14);
-      ctx.fillStyle = '#6b8cae'; ctx.fillRect(W*0.35, H*0.6, W*0.3, H*0.03);
-      ctx.fillStyle = '#333'; ctx.fillRect(W*0.42, H*0.53, W*0.08, H*0.07);
-      ctx.fillStyle = '#f0c038'; ctx.fillRect(W*0.43, H*0.54, W*0.06, H*0.02);
-      ctx.fillStyle = '#b8d8e8'; ctx.fillRect(W*0.78, H*0.4, W*0.16, H*0.32);
-      ctx.strokeStyle = '#6b8cae'; ctx.lineWidth = 3; ctx.strokeRect(W*0.78, H*0.4, W*0.16, H*0.32);
-      break;
-    }
-    case 'mall': {
-      const stallColors = ['#e94560','#4ecca3','#f0c038'];
-      for (let i = 0; i < 3; i++) {
-        const sx = W*(0.06 + i*0.31);
-        ctx.fillStyle = stallColors[i]; ctx.fillRect(sx, H*0.12, W*0.26, H*0.28);
-        ctx.fillStyle = '#fff'; ctx.fillRect(sx+8, H*0.18, W*0.26-16, H*0.16);
-        ctx.beginPath();
-        ctx.moveTo(sx-6, H*0.12); ctx.lineTo(sx+W*0.13, H*0.04); ctx.lineTo(sx+W*0.26+6, H*0.12);
-        ctx.closePath(); ctx.fillStyle = stallColors[i]; ctx.fill();
-      }
-      ctx.fillStyle = '#8b5e3c'; ctx.fillRect(W*0.46, H*0.68, W*0.06, H*0.08);
-      ctx.fillStyle = '#2d7a1e'; ctx.beginPath(); ctx.arc(W*0.49, H*0.65, W*0.04, 0, Math.PI*2); ctx.fill();
-      ctx.fillStyle = '#6b3a5c'; ctx.fillRect(W*0.1, H*0.76, W*0.14, H*0.03);
-      ctx.fillRect(W*0.12, H*0.79, W*0.015, H*0.05);
-      ctx.fillRect(W*0.22, H*0.79, W*0.015, H*0.05);
-      break;
-    }
-    case 'library': {
-      const spineColors = ['#e94560','#4ecca3','#f0c038','#6b8cae','#c94f4f'];
-      for (let col = 0; col < 4; col++) {
-        const sx = W*0.06 + col * W*0.15;
-        ctx.fillStyle = '#2a1e14'; ctx.fillRect(sx, H*0.06, W*0.12, H*0.4);
-        for (let r = 0; r < 4; r++) {
-          for (let b = 0; b < 4; b++) {
-            ctx.fillStyle = spineColors[(col+r+b)%spineColors.length];
-            ctx.fillRect(sx+4+b*(W*0.12-8)/4, H*0.08+r*H*0.09, (W*0.12-8)/4-2, H*0.08);
-          }
-        }
-      }
-      ctx.fillStyle = '#4a3a2a'; ctx.fillRect(W*0.38, H*0.62, W*0.24, H*0.06);
-      ctx.fillRect(W*0.4, H*0.68, W*0.015, H*0.08);
-      ctx.fillRect(W*0.6, H*0.68, W*0.015, H*0.08);
-      const glow = ctx.createRadialGradient(W*0.5, H*0.55, 0, W*0.5, H*0.55, W*0.1);
-      glow.addColorStop(0, 'rgba(240,192,56,0.4)'); glow.addColorStop(1, 'rgba(240,192,56,0)');
-      ctx.fillStyle = glow; ctx.fillRect(W*0.4, H*0.45, W*0.2, H*0.2);
-      ctx.fillStyle = '#f0c038'; ctx.beginPath(); ctx.arc(W*0.5, H*0.58, W*0.012, 0, Math.PI*2); ctx.fill();
-      break;
-    }
-    case 'cafe': {
-      ctx.fillStyle = '#5b3e1c'; ctx.fillRect(W*0.05, H*0.42, W*0.28, H*0.2);
-      ctx.fillStyle = '#8b5e3c'; ctx.fillRect(W*0.05, H*0.42, W*0.28, H*0.03);
-      ctx.fillStyle = '#333'; ctx.fillRect(W*0.08, H*0.3, W*0.1, H*0.14);
-      ctx.fillStyle = '#c94f4f'; ctx.fillRect(W*0.1, H*0.33, W*0.02, H*0.05);
-      ctx.fillStyle = '#1e1410'; ctx.fillRect(W*0.42, H*0.1, W*0.24, H*0.2);
-      ctx.strokeStyle = 'rgba(255,255,255,0.4)'; ctx.lineWidth = 2;
-      for (let i=0;i<3;i++){ ctx.beginPath(); ctx.moveTo(W*0.45, H*(0.15+i*0.05)); ctx.lineTo(W*0.62, H*(0.15+i*0.05)); ctx.stroke(); }
-      [[0.55,0.65],[0.78,0.65]].forEach(([tx,ty])=>{
-        ctx.fillStyle = '#3a2818'; ctx.beginPath(); ctx.ellipse(W*tx, H*ty, W*0.05, H*0.025, 0, 0, Math.PI*2); ctx.fill();
-        ctx.fillStyle = '#5b3e1c'; ctx.fillRect(W*tx-2, H*ty, 4, H*0.06);
-      });
-      [0.3,0.6,0.9].forEach(px=>{
-        ctx.strokeStyle = '#333'; ctx.lineWidth = 2;
-        ctx.beginPath(); ctx.moveTo(W*px, 0); ctx.lineTo(W*px, H*0.08); ctx.stroke();
-        ctx.fillStyle = '#f0c038'; ctx.beginPath(); ctx.arc(W*px, H*0.08, W*0.015, 0, Math.PI*2); ctx.fill();
-      });
-      break;
-    }
-  }
-  // Speaking character (if any)
-  if (speaker && CHARACTERS[speaker]) {
-    const cx = W * 0.3, cy = H * 0.88;
-    const cs = Math.max(2.5, W * 0.0042);
-    drawCharacter(ctx, cx, cy, cs, t, CHARACTERS[speaker], speaker);
-  }
-
-  // Idle player, off to the side so they don't overlap the speaker
-  const px = W * 0.65, py = H * 0.9;
-  const s = Math.max(2.5, W * 0.004);
-  const bob = Math.sin(t * 0.08) * 1.5;
-  ctx.fillStyle = 'rgba(0,0,0,0.2)';
-  ctx.beginPath(); ctx.ellipse(px, py + 8*s, 5*s, 2*s, 0, 0, Math.PI*2); ctx.fill();
-  ctx.fillStyle = '#334466';
-  ctx.fillRect(px-3*s, py+2, 2.5*s, 5*s);
-  ctx.fillRect(px+0.5*s, py+2, 2.5*s, 5*s);
-  ctx.fillStyle = '#3366cc';
-  ctx.fillRect(px-4*s, py-9*s+bob, 8*s, 11*s);
-  ctx.fillStyle = '#ffcc99';
-  ctx.fillRect(px-3*s, py-15*s+bob, 6*s, 6*s);
-  ctx.fillStyle = '#442211';
-  ctx.fillRect(px-3*s, py-16*s+bob, 6*s, 2.5*s);
-  ctx.fillStyle = '#000';
-  ctx.fillRect(px-2*s, py-13.5*s+bob, 1.2*s, 1.2*s);
-  ctx.fillRect(px+0.5*s, py-13.5*s+bob, 1.2*s, 1.2*s);
-
-  ctx.font = `bold ${Math.max(12, W*0.016)}px monospace`;
-  ctx.textAlign = 'center';
-  ctx.fillStyle = '#fff';
-  ctx.strokeStyle = 'rgba(0,0,0,0.7)'; ctx.lineWidth = 4;
-  ctx.strokeText(theme.label, W*0.5, H*0.06);
-  ctx.fillText(theme.label, W*0.5, H*0.06);
+// ── Sprite cache: loads each image once, draw() just reads whatever is ready this frame. ─────
+const imgCache = new Map<string, HTMLImageElement>();
+/** Unmistakable placeholder marker (dark outline, ground shadow, bright body) — used only when the
+ *  real character sheet hasn't loaded yet, so a missing/slow sprite never reads as "nothing there". */
+function drawPersonFallback(ctx: CanvasRenderingContext2D, x: number, y: number, T: number, color: string) {
+  ctx.save();
+  ctx.fillStyle = 'rgba(0,0,0,0.35)';
+  ctx.beginPath(); ctx.ellipse(x, y + 2, T * 0.26, T * 0.1, 0, 0, Math.PI * 2); ctx.fill();
+  ctx.fillStyle = color;
+  ctx.strokeStyle = '#000'; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.roundRect(x - T * 0.18, y - T * 0.55, T * 0.36, T * 0.45, 4); ctx.fill(); ctx.stroke();
+  ctx.fillStyle = '#e8c090';
+  ctx.beginPath(); ctx.arc(x, y - T * 0.62, T * 0.2, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+  ctx.restore();
 }
 
-const ACHVS = [
-  { id: 'first-save', title: 'Piggy Bank Pioneer', emoji: '🐷', check: (s: PlayerState) => s.piggyBank > 0 },
-  { id: 'save-10', title: 'Double Digits', emoji: '💰', check: (s: PlayerState) => s.piggyBank >= 10 },
-  { id: 'no-spend', title: 'Iron Will', emoji: '💪', check: (s: PlayerState) => s.flags['no_spend_day'] === true },
-  { id: 'helper', title: 'Good Kid', emoji: '⭐', check: (s: PlayerState) => s.flags['bought_milk_d1'] === true || s.flags['got_tape_d2'] === true },
-];
-
-function init(): PlayerState {
-  return { wallet: 15, piggyBank: 0, totalSpent: 0, totalEarned: 15, financialHealth: 100, currentTime: 0, currentLocation: 'home', flags: {}, streak: 0, bestStreak: 0, daySpending: 0, achievements: [] };
+function getImg(src: string): HTMLImageElement | null {
+  let img = imgCache.get(src);
+  if (!img) {
+    img = new Image();
+    img.src = src;
+    imgCache.set(src, img);
+  }
+  return img.complete && img.naturalWidth > 0 ? img : null;
 }
 
-export default function GamePage() {
-  const [screen, setScreen] = useState<'intro' | 'play' | 'summary' | 'complete'>('intro');
-  const [state, setState] = useState(init());
-  const [week] = useState(1);
-  const [day, setDay] = useState(1);
-  const [evtIdx, setEvtIdx] = useState(0);
-  const [response, setResponse] = useState<string | null>(null);
-  const [achPopup, setAchPopup] = useState<string | null>(null);
-  const [hovered, setHovered] = useState<string | null>(null);
-  const [typedText, setTypedText] = useState('');
-  const [isTyping, setIsTyping] = useState(false);
-  const [view, setView] = useState<'map' | 'interior'>('map');
+type AuthScreen = 'login' | 'register' | 'path_select';
 
-  const canvasRef = useRef<HTMLCanvasElement>(null);
-  const player = useRef({ x: 0.12, y: 0.58, tx: 0.12, ty: 0.58 }); // percentage positions
-  const tickRef = useRef(0);
-  const dimRef = useRef({ w: 800, h: 600 });
+export default function MoniMateGame() {
+  const [authScreen, setAuthScreen] = useState<AuthScreen>('login');
+  const [profile, setProfile] = useState<PlayerProfile | null>(null);
+  const [authEmail, setAuthEmail] = useState('');
+  const [authPassword, setAuthPassword] = useState('');
+  const [authName, setAuthName] = useState('');
+  const [authError, setAuthError] = useState('');
 
-  const dayData = getDayData(week, day);
-  const events = dayData?.events || [];
-  const currentEvent = events[evtIdx];
-
-  // Typewriter effect
   useEffect(() => {
-    if (!currentEvent || screen !== 'play') return;
-    const fullText = currentEvent.speaker
-      ? `"${currentEvent.text}"`
-      : currentEvent.text;
-
-    if (response) return; // don't retype when showing response
-
-    setTypedText('');
-    setIsTyping(true);
-    let i = 0;
-    const interval = setInterval(() => {
-      i++;
-      setTypedText(fullText.slice(0, i));
-      if (i >= fullText.length) {
-        clearInterval(interval);
-        setIsTyping(false);
-      }
-    }, 18);
-    return () => clearInterval(interval);
-  }, [evtIdx, screen, day]);
-
-  // Skip typing on click
-  function skipTyping() {
-    if (!currentEvent) return;
-    const fullText = currentEvent.speaker ? `"${currentEvent.text}"` : currentEvent.text;
-    setTypedText(fullText);
-    setIsTyping(false);
-  }
-
-  // Achievements
-  useEffect(() => {
-    if (screen !== 'play') return;
-    for (const a of ACHVS) {
-      if (!state.achievements.includes(a.id) && a.check(state)) {
-        setState(p => ({ ...p, achievements: [...p.achievements, a.id] }));
-        setAchPopup(`${a.emoji} ${a.title}`);
-        setTimeout(() => setAchPopup(null), 2500);
-        break;
-      }
-    }
-  }, [state.piggyBank, state.flags, screen]);
-
-  // ===== CANVAS RENDERING =====
-  useEffect(() => {
-    const canvas = canvasRef.current;
-    if (!canvas || screen !== 'play') return;
-    const ctx = canvas.getContext('2d');
-    if (!ctx) return;
-
-    function resize() {
-      if (!canvas) return;
-      canvas.width = window.innerWidth;
-      canvas.height = window.innerHeight;
-      dimRef.current = { w: canvas.width, h: canvas.height };
-    }
-    resize();
-    window.addEventListener('resize', resize);
-
-    let af = 0;
-
-    function render() {
-      if (!ctx || !canvas) return;
-      const W = canvas.width, H = canvas.height;
-      tickRef.current++;
-      const t = tickRef.current;
-
-      ctx.clearRect(0, 0, W, H);
-
-      if (view === 'interior') {
-        drawInterior(ctx, W, H, state.currentLocation, t, currentEvent?.speaker);
-        af = requestAnimationFrame(render);
-        return;
-      }
-
-      const GH = H ; // game area height (top 65%)
-
-  // ...everything else you already have (GH, sky, grass, buildings, player, etc.) stays exactly as-is below this
-
-      // Move player
-      const p = player.current;
-      const dx = p.tx - p.x, dy = p.ty - p.y;
-      const dist = Math.sqrt(dx * dx + dy * dy);
-      if (dist > 0.003) { const spd = 0.004; p.x += (dx / dist) * spd; p.y += (dy / dist) * spd; }
-
-      // Sky
-      const sky = ctx.createLinearGradient(0, 0, 0, GH * 0.35);
-      sky.addColorStop(0, '#87CEEB');
-      sky.addColorStop(1, '#a8d8a8');
-      ctx.fillStyle = sky;
-      ctx.fillRect(0, 0, W, GH * 0.35);
-
-      // Grass
-      ctx.fillStyle = '#3a8a2a';
-      ctx.fillRect(0, GH * 0.3, W, GH * 0.7);
-
-      // Grass detail
-      for (let i = 0; i < 150; i++) {
-        const gx = (i * 137 + 50) % W;
-        const gy = GH * 0.3 + (i * 97 + 30) % (GH * 0.65);
-        ctx.fillStyle = i % 3 === 0 ? '#45a035' : '#2e7a1e';
-        ctx.fillRect(gx, gy, 10 + (i % 4) * 4, 4 + (i % 3) * 2);
-      }
-
-      // Paths
-      ctx.fillStyle = '#c4a87a';
-      const pathY = GH * 0.62;
-      ctx.fillRect(0, pathY, W, GH * 0.04);
-      BUILDINGS.forEach(b => {
-        const bx = b.xPct * W + (b.wPct * W) / 2;
-        const by = b.yPct * GH + b.hPct * GH;
-        ctx.fillRect(bx - 6, by, 12, pathY - by);
-      });
-
-      // Path texture
-      ctx.fillStyle = '#b49a6a';
-      for (let px = 0; px < W; px += 25) {
-        ctx.fillRect(px + 5, pathY + 3, 6, 2);
-      }
-
-      // Trees
-      const trees = [[0.03, 0.2], [0.92, 0.5], [0.15, 0.08], [0.5, 0.25], [0.85, 0.08], [0.45, 0.55], [0.95, 0.15]];
-      trees.forEach(([tx, ty]) => {
-        const x = tx * W, y = ty * GH;
-        ctx.fillStyle = '#5c3a1e';
-        ctx.fillRect(x - 3, y, 6, 16);
-        ctx.fillStyle = '#2d7a1e';
-        ctx.beginPath(); ctx.arc(x, y - 5, 16, 0, Math.PI * 2); ctx.fill();
-        ctx.fillStyle = '#3a8b28';
-        ctx.beginPath(); ctx.arc(x - 4, y - 2, 11, 0, Math.PI * 2); ctx.fill();
-      });
-
-      // Flowers
-      [[0.08, 0.28], [0.42, 0.55], [0.75, 0.48], [0.25, 0.5], [0.6, 0.3]].forEach(([fx, fy], i) => {
-        ctx.fillStyle = ['#ff6b8a', '#ffaa44', '#ff44aa', '#44aaff', '#ffff44'][i];
-        ctx.beginPath(); ctx.arc(fx * W, fy * GH, 3, 0, Math.PI * 2); ctx.fill();
-      });
-
-      // Sort and draw buildings + player by Y
-      const objects: { type: string; y: number; b?: BDef }[] = [
-        ...BUILDINGS.map(b => ({ type: 'b', y: (b.yPct + b.hPct) * GH, b })),
-        { type: 'p', y: p.y * GH },
-      ];
-      objects.sort((a, b) => a.y - b.y);
-
-      objects.forEach(obj => {
-        if (obj.type === 'b' && obj.b) {
-          const b = obj.b;
-          const bx = b.xPct * W, by = b.yPct * GH, bw = b.wPct * W, bh = b.hPct * GH;
-          const isH = hovered === b.id, isC = state.currentLocation === b.id;
-
-          // Shadow
-          ctx.fillStyle = 'rgba(0,0,0,0.1)';
-          ctx.fillRect(bx + 4, by + 4, bw, bh);
-          // Wall
-          ctx.fillStyle = b.wall;
-          ctx.fillRect(bx, by, bw, bh);
-          // Roof
-          ctx.fillStyle = b.roof;
-          ctx.beginPath();
-          ctx.moveTo(bx - 8, by);
-          ctx.lineTo(bx + bw / 2, by - bh * 0.25);
-          ctx.lineTo(bx + bw + 8, by);
-          ctx.closePath();
-          ctx.fill();
-          // Door
-          ctx.fillStyle = b.door;
-          ctx.fillRect(bx + bw / 2 - 8, by + bh - 24, 16, 24);
-          ctx.fillStyle = '#f0c038';
-          ctx.beginPath(); ctx.arc(bx + bw / 2 + 4, by + bh - 12, 2, 0, Math.PI * 2); ctx.fill();
-          // Windows
-          ctx.fillStyle = (isH || isC) ? '#ffee88' : '#aaddee';
-          ctx.fillRect(bx + 10, by + bh * 0.2, bw * 0.2, bh * 0.2);
-          ctx.fillRect(bx + bw - 10 - bw * 0.2, by + bh * 0.2, bw * 0.2, bh * 0.2);
-          // Border
-          if (isC) { ctx.strokeStyle = '#f0c038'; ctx.lineWidth = 3; ctx.strokeRect(bx - 3, by - bh * 0.27, bw + 6, bh + bh * 0.3); }
-          else if (isH) { ctx.strokeStyle = 'rgba(255,255,255,0.5)'; ctx.lineWidth = 2; ctx.strokeRect(bx - 2, by - bh * 0.26, bw + 4, bh + bh * 0.28); }
-          // Label
-          ctx.font = `bold ${Math.max(11, W * 0.012)}px "Segoe UI", Arial`;
-          ctx.textAlign = 'center';
-          ctx.fillStyle = isC ? '#f0c038' : '#fff';
-          ctx.strokeStyle = 'rgba(0,0,0,0.6)';
-          ctx.lineWidth = 3;
-          const lx = bx + bw / 2, ly = by - bh * 0.3;
-          ctx.strokeText(b.label, lx, ly);
-          ctx.fillText(b.label, lx, ly);
-        } else if (obj.type === 'p') {
-          // Player
-          const px = p.x * W, py = p.y * GH;
-          const walking = dist > 0.003;
-          const facing = p.tx >= p.x ? 1 : -1;
-          const bob = walking ? Math.sin(t * 0.3) * 2 : 0;
-          const s = Math.max(2, W * 0.003);
-
-          // Shadow
-          ctx.fillStyle = 'rgba(0,0,0,0.2)';
-          ctx.beginPath(); ctx.ellipse(px, py + 8 * s, 5 * s, 2 * s, 0, 0, Math.PI * 2); ctx.fill();
-          // Legs
-          ctx.fillStyle = '#334466';
-          if (walking) {
-            const la = Math.sin(t * 0.4) * 3;
-            ctx.fillRect(px - 3 * s, py + bob + 2, 2.5 * s, 5 * s + la);
-            ctx.fillRect(px + 0.5 * s, py + bob + 2, 2.5 * s, 5 * s - la);
-          } else {
-            ctx.fillRect(px - 3 * s, py + 2, 2.5 * s, 5 * s);
-            ctx.fillRect(px + 0.5 * s, py + 2, 2.5 * s, 5 * s);
-          }
-          // Body
-          ctx.fillStyle = '#3366cc';
-          ctx.fillRect(px - 4 * s, py - 9 * s + bob, 8 * s, 11 * s);
-          // Head
-          ctx.fillStyle = '#ffcc99';
-          ctx.fillRect(px - 3 * s, py - 15 * s + bob, 6 * s, 6 * s);
-          // Hair
-          ctx.fillStyle = '#442211';
-          ctx.fillRect(px - 3 * s, py - 16 * s + bob, 6 * s, 2.5 * s);
-          // Eyes
-          ctx.fillStyle = '#000';
-          const ex = facing === 1 ? 0 : -2;
-          ctx.fillRect(px + ex * s, py - 13.5 * s + bob, 1.2 * s, 1.2 * s);
-          ctx.fillRect(px + (ex + 2.5) * s, py - 13.5 * s + bob, 1.2 * s, 1.2 * s);
-          // Backpack
-          ctx.fillStyle = '#cc3333';
-          ctx.fillRect(px + (facing === 1 ? -5 : 3) * s, py - 7 * s + bob, 2 * s, 6 * s);
-        }
-      });
-
-      // Weather
-      if (dayData?.weather === 'cloudy') {
-        ctx.fillStyle = 'rgba(60,70,90,0.1)';
-        ctx.fillRect(0, 0, W, GH);
-      }
-
-      // Subtle darken behind the bottom dialogue area only
-      const grad = ctx.createLinearGradient(0, H * 0.72, 0, H);
-      grad.addColorStop(0, 'rgba(10,10,20,0)');
-      grad.addColorStop(1, 'rgba(10,10,20,0.55)');
-      ctx.fillStyle = grad;
-      ctx.fillRect(0, H * 0.72, W, H * 0.28);
-
-      af = requestAnimationFrame(render);
-    }
-
-    af = requestAnimationFrame(render);
-
-    // Click
-    function onClick(e: MouseEvent) {
-      if (view !== 'map') { if (canvas) canvas.style.cursor = 'default'; return; }
-        const W = dimRef.current.w, GH = dimRef.current.h ;
-        const rect = canvas!.getBoundingClientRect();
-        const mx = e.clientX - rect.left, my = e.clientY - rect.top;
-
-      for (const b of BUILDINGS) {
-        const bx = b.xPct * W, by = b.yPct * GH, bw = b.wPct * W, bh = b.hPct * GH;
-        if (mx >= bx - 10 && mx <= bx + bw + 10 && my >= by - bh * 0.3 && my <= by + bh + 10) {
-          player.current.tx = b.xPct + b.wPct / 2;
-          player.current.ty = b.yPct + b.hPct + 0.05;
-          const d = Math.sqrt(Math.pow(player.current.x - player.current.tx, 2) + Math.pow(player.current.y - player.current.ty, 2));
-          setTimeout(() => {
-          setState(p => ({ ...p, currentLocation: b.id }));
-          setView('interior');
-          }, Math.max(200, (d / 0.004) * 16));          
-          return;
-        }
-      }
-    }
-
-    function onMove(e: MouseEvent) {
-      if (view !== 'map') { if (canvas) canvas.style.cursor = 'default'; return; }
-        const W = dimRef.current.w, GH = dimRef.current.h;
-        const rect = canvas!.getBoundingClientRect();
-        const mx = e.clientX - rect.left, my = e.clientY - rect.top;
-        let found = false;
-      for (const b of BUILDINGS) {
-        const bx = b.xPct * W, by = b.yPct * GH, bw = b.wPct * W, bh = b.hPct * GH;
-        if (mx >= bx - 10 && mx <= bx + bw + 10 && my >= by - bh * 0.3 && my <= by + bh + 10) {
-          setHovered(b.id); canvas!.style.cursor = 'pointer'; found = true; break;
-        }
-      }
-      
-      if (!found) { setHovered(null); canvas!.style.cursor = 'default'; }
-    }
-
-    canvas.addEventListener('click', onClick);
-    canvas.addEventListener('mousemove', onMove);
-
-    return () => {
-      cancelAnimationFrame(af);
-      window.removeEventListener('resize', resize);
-      canvas.removeEventListener('click', onClick);
-      canvas.removeEventListener('mousemove', onMove);
-    };
-  }, [screen, state.currentLocation, hovered, dayData?.weather, view, evtIdx]);
-
-  // Move player to location
-  useEffect(() => {
-    const b = BUILDINGS.find(b => b.id === state.currentLocation);
-    if (b) { player.current.tx = b.xPct + b.wPct / 2; player.current.ty = b.yPct + b.hPct + 0.05; }
-  }, [state.currentLocation]);
-
-  function handleChoice(c: TimeChoice) {
-    const isSave = c.emoji === '🐷';
-    const spend = (!isSave && c.walletChange < 0) ? Math.abs(c.walletChange) : 0;
-    const earn = c.walletChange > 0 ? c.walletChange : 0;
-    setState(p => ({
-      ...p, wallet: +(p.wallet + c.walletChange).toFixed(2),
-      piggyBank: isSave ? +(p.piggyBank + Math.abs(c.walletChange)).toFixed(2) : p.piggyBank,
-      totalSpent: +(p.totalSpent + spend).toFixed(2),
-      totalEarned: earn > 0 ? +(p.totalEarned + earn).toFixed(2) : p.totalEarned,
-      financialHealth: Math.max(0, Math.min(100, p.financialHealth + c.healthChange)),
-      currentTime: p.currentTime + c.timeCost,
-      currentLocation: c.travelTo || p.currentLocation,
-      daySpending: +(p.daySpending + spend).toFixed(2),
-      flags: c.flag ? { ...p.flags, [c.flag]: true } : p.flags,
-    }));
-    setResponse(c.response);
-  }
-
-  function advance() {
-    setResponse(null);
-    let next = evtIdx + 1;
-    while (next < events.length) {
-      if (events[next].location === state.currentLocation || events[next].type === 'alert') break;
-      next++;
-    }
-    if (next >= events.length) {
-      const smart = state.daySpending <= 5;
-      const ns = smart ? state.streak + 1 : 0;
-      setState(p => ({ ...p, streak: ns, bestStreak: Math.max(p.bestStreak, ns), flags: state.daySpending === 0 ? { ...p.flags, no_spend_day: true } : p.flags }));
-      setScreen('summary');
-    } else setEvtIdx(next);
-  }
-
-  function nextDay() {
-    if (day >= 4) { setScreen('complete'); return; }
-    setDay(day + 1); setEvtIdx(0); setResponse(null);
-    setState(p => ({ ...p, currentTime: 0, currentLocation: 'home', daySpending: 0 }));
-    player.current = { x: 0.12, y: 0.58, tx: 0.12, ty: 0.58 };
-    setView('interior');
-    setScreen('play');
-  }
-
-  // Lock body scroll when playing
-  useEffect(() => {
-    document.documentElement.style.overflow = 'hidden';
-    document.body.style.overflow = 'hidden';
-    document.body.style.margin = '0';
-    document.body.style.padding = '0';
-    document.body.style.height = '100vh';
-    return () => {
-      document.documentElement.style.overflow = '';
-      document.body.style.overflow = '';
-      document.body.style.height = '';
-    };
+    const email = loadSession();
+    if (!email) return;
+    const accounts = loadAccounts();
+    const acc = accounts[email];
+    if (acc) { setProfile(acc); }
   }, []);
 
-  const font = "'Segoe UI', Helvetica, Arial, sans-serif";
-  const pixelHeadFont = "'Press Start 2P', monospace";
-  const pixelBodyFont = "'VT323', monospace";
+  const login = () => {
+    const accounts = loadAccounts();
+    const acc = accounts[authEmail.trim().toLowerCase()];
+    if (!acc || !verifyPassword(authPassword, acc.passwordHash)) { setAuthError('Wrong email or password.'); return; }
+    saveSession(acc.email);
+    setProfile(acc);
+  };
+  const register = () => {
+    const email = authEmail.trim().toLowerCase();
+    if (!email || !authPassword || !authName) { setAuthError('Fill in every field.'); return; }
+    const accounts = loadAccounts();
+    if (accounts[email]) { setAuthError('An account already exists for that email.'); return; }
+    const newProfile: PlayerProfile = {
+      name: authName, email, passwordHash: hashPassword(authPassword), lifePath: 'school',
+      avatar: '🧑', level: 1, xp: 0, achievements: [], createdAt: Date.now(),
+    };
+    accounts[email] = newProfile; saveAccounts(accounts); saveSession(email);
+    setProfile(newProfile);
+    setAuthScreen('path_select');
+  };
+  const choosePath = (path: LifePath) => {
+    if (!profile) return;
+    const updated = { ...profile, lifePath: path };
+    const accounts = loadAccounts(); accounts[profile.email] = updated; saveAccounts(accounts);
+    setProfile(updated);
+    setAuthScreen('login'); // clear the path_select screen so we actually drop into the game
+  };
+  const logout = () => { clearSession(); setProfile(null); setAuthScreen('login'); };
 
-  // ===== INTRO =====
-  if (screen === 'intro') {
+  if (!profile) {
     return (
-      <div className="fixed inset-0 flex items-center justify-center" style={{ background: '#1a1a2e', fontFamily: font }}>
-        <style>{`@keyframes pulse { 0%, 100% { transform: scale(1); } 50% { transform: scale(1.15); } }`}</style>
-        <div className="text-center px-6 max-w-lg" style={{ color: '#eee' }}>
-          <div className="text-6xl mb-4" style={{ animation: 'pulse 2s infinite' }}>⛺</div>
-          <div className="text-xs tracking-[3px] uppercase mb-1" style={{ color: '#f0c038' }}>Level 1 — School Days</div>
-          <h1 className="text-3xl font-bold mb-3">The Camp Trip</h1>
-          <p className="text-sm leading-relaxed mb-6" style={{ color: '#8892a4' }}>
-            School camp in Queenstown is 6 weeks away. You need <strong style={{ color: '#f0c038' }}>$50</strong> spending money.
-            Mum gives you $15/week. Click buildings to explore. Every choice costs time or money.
-          </p>
-          <div className="grid grid-cols-3 gap-3 mb-6 text-[11px]" style={{ color: '#8892a4' }}>
-            <div className="rounded-lg p-2.5" style={{ background: '#16213e' }}>😎 Jake<br /><span className="text-[10px]">Big spender</span></div>
-            <div className="rounded-lg p-2.5" style={{ background: '#16213e' }}>🤓 Mia<br /><span className="text-[10px]">Smart saver</span></div>
-            <div className="rounded-lg p-2.5" style={{ background: '#16213e' }}>😅 Liam<br /><span className="text-[10px]">Borrower</span></div>
-          </div>
-          <button onClick={() => { setScreen('play'); setState(init()); setDay(1); setEvtIdx(0); setView('interior'); }}
-          className="px-10 py-4 rounded-full text-base font-bold cursor-pointer border-none hover:scale-105 transition-transform"
-          style={{ background: '#f0c038', color: '#1a1a2e' }}>
-          Start Week 1
-          </button>
-        </div>
-      </div>
+      <AuthScreen
+        screen={authScreen} setScreen={setAuthScreen}
+        email={authEmail} setEmail={setAuthEmail}
+        password={authPassword} setPassword={setAuthPassword}
+        name={authName} setName={setAuthName}
+        error={authError} onLogin={login} onRegister={register}
+      />
     );
   }
-
-  // ===== SUMMARY =====
-  if (screen === 'summary' && dayData) {
-    return (
-      <div className="fixed inset-0 flex items-center justify-center" style={{ background: 'rgba(0,0,0,0.85)', fontFamily: font }}>
-        <div className="rounded-2xl p-6 text-center max-w-sm mx-4" style={{ background: '#16213e', color: '#eee' }}>
-          <div className="text-xs tracking-[3px] uppercase mb-2" style={{ color: '#8892a4' }}>{dayData.dayName} Done</div>
-          <div className="text-4xl mb-3">{state.daySpending <= 5 ? '⭐' : '📊'}</div>
-          <div className="flex justify-around mb-4">
-            {([['Spent', `$${state.daySpending.toFixed(0)}`, '#e94560'], ['Wallet', `$${state.wallet.toFixed(0)}`, '#4ecca3'], ['Saved', `$${state.piggyBank.toFixed(0)}`, '#f0c038']] as const).map(([l, v, c]) => (
-              <div key={l}><div className="text-[10px] uppercase" style={{ color: '#8892a4' }}>{l}</div><div className="text-xl font-bold" style={{ color: c }}>{v}</div></div>
-            ))}
-          </div>
-          <div className="h-2 rounded-full mb-3 overflow-hidden" style={{ background: 'rgba(255,255,255,0.1)' }}>
-            <div className="h-full rounded-full" style={{ width: `${Math.min(100, (state.piggyBank / CAMP_GOAL) * 100)}%`, background: '#f0c038' }} />
-          </div>
-          <div className="text-xs mb-4" style={{ color: '#8892a4' }}>Camp fund: ${state.piggyBank.toFixed(0)} / $50</div>
-          <button onClick={nextDay} className="px-8 py-2.5 rounded-full text-sm font-bold cursor-pointer border-none" style={{ background: '#f0c038', color: '#1a1a2e' }}>Next Day →</button>
-        </div>
-      </div>
-    );
+  // profile exists but no life path confirmed yet (fresh registration) -> path select
+  if (authScreen === 'path_select' || !LIFE_PATHS.find(p => p.id === profile.lifePath)) {
+    return <PathSelect onChoose={choosePath} />;
   }
 
-  // ===== COMPLETE =====
-  if (screen === 'complete') {
-    const g = state.piggyBank >= 30 ? 'A' : state.piggyBank >= 20 ? 'B' : state.piggyBank >= 10 ? 'C' : 'D';
-    return (
-      <div className="fixed inset-0 flex items-center justify-center" style={{ background: '#1a1a2e', fontFamily: font, color: '#eee' }}>
-        <div className="text-center max-w-sm mx-4">
-          <div className="text-5xl mb-3">🎓</div>
-          <div className="text-5xl font-bold mb-2" style={{ color: g === 'A' ? '#4ecca3' : g === 'B' ? '#f0c038' : '#e94560' }}>{g}</div>
-          <div className="flex justify-around my-4">
-            {([['Earned', `$${state.totalEarned.toFixed(0)}`, '#8892a4'], ['Spent', `$${state.totalSpent.toFixed(0)}`, '#e94560'], ['Saved', `$${state.piggyBank.toFixed(0)}`, '#f0c038']] as const).map(([l, v, c]) => (
-              <div key={l}><div className="text-[10px] uppercase" style={{ color: '#8892a4' }}>{l}</div><div className="text-xl font-bold" style={{ color: c }}>{v}</div></div>
-            ))}
-          </div>
-          <div className="rounded-xl p-3 text-[12px]" style={{ background: 'rgba(240,192,56,0.1)', color: '#f0c038' }}>🔜 More days coming soon!</div>
-        </div>
-      </div>
-    );
-  }
+  return <GameCanvas profile={profile} onLogout={logout} onChangePath={() => setAuthScreen('path_select')} />;
+}
 
-  // ===== PLAY — FULL SCREEN =====
-  if (!dayData || !currentEvent) return null;
+// ─────────────────────────────────────────────────────────────────────────────
+// AUTH / PATH SELECT SCREENS
+// ─────────────────────────────────────────────────────────────────────────────
 
+function AuthScreen(props: {
+  screen: AuthScreen; setScreen: (s: AuthScreen) => void;
+  email: string; setEmail: (v: string) => void;
+  password: string; setPassword: (v: string) => void;
+  name: string; setName: (v: string) => void;
+  error: string; onLogin: () => void; onRegister: () => void;
+}) {
+  const isRegister = props.screen === 'register';
   return (
-    <div className="fixed inset-0" style={{ fontFamily: font, overflow: 'hidden' }}>
-      <style>{`
-
-        @keyframes fadeIn { 0% { opacity: 0; transform: translateY(6px); } 100% { opacity: 1; transform: translateY(0); } }
-        @keyframes achPop { 0% { transform: translateY(-20px) scale(0.8); opacity: 0; } 100% { transform: translateY(0) scale(1); opacity: 1; } }
-        @keyframes blink { 0%, 100% { opacity: 1; } 50% { opacity: 0; } }
-
-        .pixel-panel {
-          background: #241b3a;
-          border: 4px solid #000;
-          border-radius: 0;
-          box-shadow:
-            inset 0 4px 0 0 rgba(255,255,255,0.12),
-            inset 4px 0 0 0 rgba(255,255,255,0.06),
-            inset -4px 0 0 0 rgba(0,0,0,0.4),
-            inset 0 -4px 0 0 rgba(0,0,0,0.4),
-            0 -4px 0 0 #000;
-          clip-path: polygon(
-            8px 0, calc(100% - 8px) 0, 100% 8px, 100% calc(100% - 8px),
-            calc(100% - 8px) 100%, 8px 100%, 0 calc(100% - 8px), 0 8px
-          );
-        }
-
-        .pixel-btn {
-          background: #3a2d5c;
-          border: 3px solid #000;
-          border-radius: 0;
-          box-shadow:
-            inset 2px 2px 0 0 rgba(255,255,255,0.15),
-            inset -2px -2px 0 0 rgba(0,0,0,0.4);
-          image-rendering: pixelated;
-        }
-        .pixel-btn:active {
-          box-shadow:
-            inset -2px -2px 0 0 rgba(255,255,255,0.1),
-            inset 2px 2px 0 0 rgba(0,0,0,0.4);
-          transform: translateY(1px);
-        }
-
-        .pixel-font-head { font-family: ${pixelHeadFont}; letter-spacing: 0.5px; }
-        .pixel-font-body { font-family: ${pixelBodyFont}; }
-      `}</style>
-
-      {/* FULL SCREEN CANVAS */}
-      <canvas ref={canvasRef} style={{ position: 'fixed', top: 0, left: 0, width: '100vw', height: '100vh', imageRendering: 'pixelated' }} />
-
-      {/* HUD — top bar, pixel style */}
-      <div className="fixed top-0 left-0 right-0 flex items-center justify-between px-3 py-2 z-10 pixel-panel"
-        style={{ borderTop: 'none', clipPath: 'none', borderBottom: '4px solid #000' }}>
-        <div className="flex items-center gap-3">
-          <span className="pixel-font-head text-[9px]" style={{ color: '#eee' }}>{dayData.dayName} WK{week}</span>
-          <span className="pixel-font-head text-[9px] px-2 py-1" style={{ background: '#000', color: '#f0c038', border: '2px solid #f0c038' }}>
-            {formatTime(state.currentTime)}
-          </span>
-        </div>
-        <div className="flex items-center gap-3 pixel-font-head text-[9px]">
-          <span style={{ color: '#4ecca3' }}>${state.wallet.toFixed(2)}</span>
-          <span style={{ color: '#f0c038' }}>${state.piggyBank.toFixed(0)}</span>
-          <span style={{ color: '#8892a4' }}>{state.piggyBank.toFixed(0)}/50</span>
-          {state.streak >= 2 && <span style={{ color: '#e94560' }}>x{state.streak}</span>}
-        </div>
-      </div>
-
-      {view === 'interior' && (
-        <button onClick={() => setView('map')}
-        className="pixel-btn fixed z-10 pixel-font-head text-[9px] px-3 py-2"
-        style={{ top: 54, left: 12, color: '#f0c038' }}>
-        ← MAP
-      </button>
-      )}
-
-      {/* ACHIEVEMENT — pixel banner */}
-      {achPopup && (
-        <div className="fixed top-14 left-1/2 -translate-x-1/2 z-50 px-4 py-2 pixel-btn pixel-font-head text-[10px]"
-          style={{ color: '#1a1a2e', background: '#f0c038', animation: 'achPop 0.3s steps(4)' }}>
-          {achPopup}
-        </div>
-      )}
-
-      {/* DIALOGUE — pixel textbox, part of the game frame */}
-      <div className="fixed bottom-0 left-0 right-0 z-20 pointer-events-auto flex justify-center pb-3 px-3"
-        onClick={isTyping ? skipTyping : undefined}>
-        <div className="w-full max-w-2xl pixel-panel px-5 pt-4 pb-4">
-          {currentEvent.speaker && (
-            <div className="inline-flex items-center gap-2 -mt-8 mb-2 px-2 py-1 pixel-panel"
-              style={{ background: '#1a1a2e' }}>
-              <span className="text-base">{currentEvent.speakerEmoji || '💬'}</span>
-              <span className="pixel-font-head text-[9px]" style={{ color: '#f0c038' }}>{currentEvent.speaker}</span>
-            </div>
-          )}
-
-          <div className="pixel-font-body text-[20px] leading-snug mb-3" style={{ color: '#eee', minHeight: 40 }}>
-            {typedText}
-            {isTyping && <span style={{ animation: 'blink 0.5s steps(1) infinite' }}>▌</span>}
-          </div>
-
-          {response && (
-            <div className="pixel-panel p-3 mb-3 pixel-font-body text-[17px]" style={{ background: '#1a1430', color: '#bbb', animation: 'fadeIn 0.2s steps(3)' }}>
-              {response}
-            </div>
-          )}
-
-          {currentEvent.choices && !response && !isTyping && (
-            <div className="flex flex-col gap-2 mb-1" style={{ animation: 'fadeIn 0.2s steps(3)' }}>
-              {currentEvent.choices.map((c, i) => (
-                <button key={i} onClick={(e) => { e.stopPropagation(); handleChoice(c); }}
-                  className="pixel-btn text-left px-3 py-2 pixel-font-body text-[17px] cursor-pointer"
-                  style={{ color: '#eee' }}>
-                  {c.emoji} {c.label}
-                  {c.walletChange !== 0 && <span className="ml-1.5 text-[14px]" style={{ color: c.walletChange < 0 ? '#e94560' : '#4ecca3' }}>{c.walletChange < 0 ? `-$${Math.abs(c.walletChange)}` : `+$${c.walletChange}`}</span>}
-                  {c.timeCost > 0 && <span className="ml-1 text-[13px]" style={{ color: '#888' }}> · {c.timeCost}min</span>}
-                </button>
-              ))}
-            </div>
-          )}
-
-          {(!currentEvent.choices || response) && !isTyping && (
-            <button onClick={(e) => { e.stopPropagation(); advance(); }}
-              className="pixel-btn w-full py-2 pixel-font-body text-[17px] cursor-pointer"
-              style={{ color: '#f0c038', animation: 'fadeIn 0.2s steps(3)' }}>
-              ▶ CONTINUE
-            </button>
-          )}
+    <div style={{ minHeight: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center', background: '#0d1117', color: '#e6edf3', fontFamily: 'monospace' }}>
+      <div style={{ width: 'min(320px, 92vw)', padding: 24, border: '1px solid #30363d', borderRadius: 10, background: '#161b22' }}>
+        <h1 style={{ fontSize: 20, marginBottom: 16 }}>💰 MoniMate</h1>
+        {isRegister && (
+          <input placeholder="Name" value={props.name} onChange={e => props.setName(e.target.value)}
+            style={inputStyle} />
+        )}
+        <input placeholder="Email" value={props.email} onChange={e => props.setEmail(e.target.value)} style={inputStyle} />
+        <input placeholder="Password" type="password" value={props.password} onChange={e => props.setPassword(e.target.value)} style={inputStyle} />
+        {props.error && <div style={{ color: '#ff6060', fontSize: 12, marginBottom: 8 }}>{props.error}</div>}
+        <button onClick={isRegister ? props.onRegister : props.onLogin} style={btnStyle}>
+          {isRegister ? 'Create account' : 'Log in'}
+        </button>
+        <div style={{ marginTop: 10, fontSize: 12, textAlign: 'center' }}>
+          <a style={{ color: '#60b8ff', cursor: 'pointer' }} onClick={() => props.setScreen(isRegister ? 'login' : 'register')}>
+            {isRegister ? 'Already have an account? Log in' : "New here? Create an account"}
+          </a>
         </div>
       </div>
     </div>
   );
 }
+const inputStyle: React.CSSProperties = { width: '100%', padding: 8, marginBottom: 8, background: '#0d1117', border: '1px solid #30363d', color: '#e6edf3', borderRadius: 6 };
+const btnStyle: React.CSSProperties = { width: '100%', padding: 10, background: '#3fb950', border: 'none', borderRadius: 6, color: '#0d1117', fontWeight: 700, cursor: 'pointer' };
+
+function PathSelect({ onChoose }: { onChoose: (p: LifePath) => void }) {
+  return (
+    <div style={{ minHeight: '100vh', background: '#0d1117', color: '#e6edf3', display: 'flex', flexDirection: 'column', alignItems: 'center', padding: 32, fontFamily: 'monospace' }}>
+      <h1 style={{ marginBottom: 24 }}>Choose your life path</h1>
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: 16, width: '100%', maxWidth: 700 }}>
+        {LIFE_PATHS.map(p => (
+          <div key={p.id} onClick={() => onChoose(p.id)}
+            style={{ cursor: 'pointer', border: `2px solid ${p.color}`, borderRadius: 10, padding: 16, background: '#161b22' }}>
+            <div style={{ fontSize: 28 }}>{p.emoji}</div>
+            <div style={{ fontWeight: 700, margin: '6px 0' }}>{p.name}</div>
+            <div style={{ fontSize: 13, opacity: 0.8 }}>{p.tagline}</div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GAME CANVAS — the actual simulation
+// ─────────────────────────────────────────────────────────────────────────────
+
+function GameCanvas({ profile, onLogout, onChangePath }: { profile: PlayerProfile; onLogout: () => void; onChangePath: () => void }) {
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const keysRef = useRef<Set<string>>(new Set());
+  const rafRef = useRef<number>(0);
+  const storeRef = useRef<GameStore | null>(null);
+  const loopRef = useRef<GameLoop | null>(null);
+  const [, forceTick] = useState(0);
+  const [dialogueLines, setDialogueLines] = useState<{ npc?: string; text: string } | null>(null);
+  useEffect(() => {
+    if (!dialogueLines) return;
+    const t = setTimeout(() => setDialogueLines(null), 4000);
+    return () => clearTimeout(t);
+  }, [dialogueLines]);
+  useEffect(() => {
+    if (dialogueLines && voiceOn) speakLine(dialogueLines.npc, dialogueLines.text);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [dialogueLines]);
+  const [showJournal, setShowJournal] = useState(false);
+  const [showPhone, setShowPhone] = useState(false);
+  const [showMentor, setShowMentor] = useState(false);
+  const [showRelationships, setShowRelationships] = useState(false);
+  const [achievementToast, setAchievementToast] = useState<{ id: string; name: string; emoji: string } | null>(null);
+  // Step 26: a lightweight, self-dismissing notification when store.takeOffers() reports a genuinely
+  // new mission — mirrors the existing achievementToast pattern exactly (same drain-a-queue,
+  // auto-timeout shape) rather than inventing a second notification mechanism.
+  const [missionToast, setMissionToast] = useState<{ id: string; name: string; emoji: string } | null>(null);
+  const missionToastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const toastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [boardingAt, setBoardingAt] = useState<string | null>(null); // stopId whose destination picker is open
+  // Step 10: the Step 7B adapter-driven Monday transport choice (transportChoiceDay/transportFailure/
+  // chooseTransport/executeMorningTransport/the "How are you getting to school" DialoguePanel) has
+  // been REMOVED — it duplicated the live game's own pre-existing 'get_to_school' mission
+  // (src/lib/missions.ts), which already offers the identical walk/bus choice through the mission
+  // engine's own DialoguePanel (driven by `actionable`), complete with lateness tracking the adapter
+  // never had. Keeping both meant two independent systems could each move the player/spend
+  // money/advance time depending on which one happened to fire first — see the Step 9 audit. Per
+  // that audit's decision, 'get_to_school' (the stronger, already-integrated implementation) is now
+  // the SOLE owner of Monday transport; the adapter/UI duplicate is deleted, not left dormant.
+  //
+  // Step 8: Attend Class. `classCompletedDay` records the absolute in-game day class was last
+  // completed on — comparing against the CURRENT day is how "already attended today" is tracked,
+  // without a second clock/flag system. `classFailure` holds a message when executeAttendClass()
+  // reports failure (e.g. energy too low), so the player sees why nothing happened. Eligibility no
+  // longer cross-references the (now-removed) transport flag — see `classEligible` below: actually
+  // being at 'university' is itself the proof transport succeeded, whichever mechanism got the
+  // player there.
+  const [classCompletedDay, setClassCompletedDay] = useState<number | null>(null);
+  const [classFailure, setClassFailure] = useState<string | null>(null);
+  const classResolvingRef = useRef(false);
+  // Step 15: Help Parents. HELP_PARENTS (src/game/content/schoolActivities.ts) has no
+  // `requirement.place` on the Core Simulation ActivityDef itself (confirmed by inspection), so
+  // "at home" and "once per day" are both live UI decisions, not Core Simulation rules. Chosen
+  // behavior: option A (once-per-day contextual activity), mirroring `classCompletedDay` exactly —
+  // this is the least invasive choice because (1) it matches the only other adapter-driven
+  // activity's own precedent in this file, (2) an unlimited-repeat chore would let the player farm
+  // unbounded income by standing at home and re-triggering it, which nothing else in the currently
+  // implemented Monday content allows (every other earn path — pocket_money, the grocery errand
+  // change, mission rewards — happens at most once per day/week), and (3) it needs no new
+  // persisted field, since the day-of-completion pattern already exists on this component.
+  const [helpParentsCompletedDay, setHelpParentsCompletedDay] = useState<number | null>(null);
+  const [helpParentsFailure, setHelpParentsFailure] = useState<string | null>(null);
+  const helpParentsResolvingRef = useRef(false);
+  // Step 27 — first real-activity vertical slice for Help Parents. `helpParentsDeclinedDay` mirrors
+  // `helpParentsCompletedDay`'s day-tracking pattern exactly, so declining doesn't re-show the offer
+  // again the same day but does re-offer it the next day (declining is not permanent). `phase` drives
+  // the reusable activity sequence: 'ask' (the initial Accept/Decline prompt) -> 'seek' (accepted;
+  // player must find Mum and press E, reusing the existing npcNearPlayer() proximity system rather
+  // than inventing a new object/interaction system) -> 'working' (a short, reusable progress-bar
+  // sequence) -> back to idle once the adapter call resolves. This is deliberately the smallest
+  // reusable shape the Step 27 audit called for (Part 3/9's "Activity Sequence") — a phase plus a
+  // 0-100 progress value — rather than a new parallel mission/animation architecture.
+  const [helpParentsDeclinedDay, setHelpParentsDeclinedDay] = useState<number | null>(null);
+  const [helpParentsPhase, setHelpParentsPhase] = useState<'ask' | 'seek' | 'working' | null>(null);
+  // Mirrors helpParentsPhase for the keydown handler below, which (like the rest of this file's
+  // keyboard effect) is registered once with an empty dependency array — a plain state read in its
+  // closure would go stale the moment the phase changes. Every setHelpParentsPhase call keeps this
+  // ref in sync in the same statement (see setPhase() helper below), same pattern keysRef already
+  // uses to keep the animation-frame loop reading live input state.
+  const helpParentsPhaseRef = useRef<typeof helpParentsPhase>(null);
+  const setHelpParentsPhaseBoth = useCallback((p: typeof helpParentsPhase) => {
+    helpParentsPhaseRef.current = p;
+    setHelpParentsPhase(p);
+  }, []);
+  const [helpParentsProgress, setHelpParentsProgress] = useState(0);
+  // Snapshot of balance/energy taken the instant the activity sequence starts, so the completion
+  // toast can report the REAL deltas the adapter actually applied, not a hardcoded guess.
+  const helpParentsSnapshotRef = useRef<{ balance: number; energy: number } | null>(null);
+  // Generic, reusable "what just happened" feedback toast — not specific to Help Parents. Any future
+  // activity can reuse this exact shape (icon + short lines) rather than inventing its own popup.
+  const [activityToast, setActivityToast] = useState<{ icon: string; lines: string[] } | null>(null);
+  const activityToastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [isTouch, setIsTouch] = useState(false);
+  const [voiceOn, setVoiceOn] = useState(true);
+  const [skipSignal, setSkipSignal] = useState(0); // bumped by the touch "SKIP" button to fast-forward dialogue
+  useEffect(() => () => stopSpeaking(), []); // stop any speech mid-line if the page/component unmounts
+
+  // Detect a touch/coarse-pointer device (phone/tablet) so we can show on-screen controls.
+  useEffect(() => {
+    setIsTouch(window.matchMedia('(pointer: coarse)').matches || 'ontouchstart' in window);
+  }, []);
+
+  // ── Fullscreen viewport (this step) ─────────────────────────────────────────────────────────
+  // The canvas used to render at a FIXED 1280x800 resolution with CSS `objectFit: 'contain'`
+  // scaling that image to fit the page — which is exactly what makes a full-window canvas still
+  // look like a small embedded box with letterboxing on wide/tall screens. draw()/drawInterior()
+  // already take cw/ch as parameters on every call (camera translate, room-centering math, HUD
+  // layout) rather than hardcoding 1280x800 anywhere, so the fix is purely at the canvas-sizing
+  // layer: give the canvas element real pixel dimensions matching the actual viewport, and let the
+  // existing camera-clamp math (SmoothCamera.update, which already handles viewW/viewH larger than
+  // the world by centering) and drawInterior's `(cw - roomW) / 2` centering do the rest untouched.
+  const [canvasSize, setCanvasSize] = useState(() => ({
+    w: typeof window !== 'undefined' ? window.innerWidth : 1280,
+    h: typeof window !== 'undefined' ? window.innerHeight : 800,
+  }));
+  useEffect(() => {
+    const onResize = () => setCanvasSize({ w: window.innerWidth, h: window.innerHeight });
+    onResize();
+    window.addEventListener('resize', onResize);
+    return () => window.removeEventListener('resize', onResize);
+  }, []);
+
+  // Touch-control helpers — reuse the same keysRef the keyboard handler reads from render.MoveInput,
+  // so pressing a virtual button is indistinguishable from holding the matching key.
+  const pressKey = useCallback((k: string) => keysRef.current.add(k), []);
+  const releaseKey = useCallback((k: string) => keysRef.current.delete(k), []);
+
+  // Create the store once, hydrating from a save if one exists.
+  if (!storeRef.current) {
+    const saved = loadGameSave(profile.email, profile.lifePath);
+    const config: LifePathConfig = getLifePath(profile.lifePath);
+    const state = saved && saved.lifePath === profile.lifePath
+      ? saved
+      : createInitialState(profile.lifePath, makeInitialFinance(config));
+    storeRef.current = saved ? (GameStore.hydrate(JSON.stringify(state)) ?? new GameStore(state)) : new GameStore(state);
+    loopRef.current = new GameLoop(storeRef.current);
+    storeRef.current.subscribe(() => forceTick(t => t + 1));
+  }
+  const store = storeRef.current!;
+  const loop = loopRef.current!;
+
+  // Autosave every 10s and on unmount.
+  useEffect(() => {
+    const id = setInterval(() => saveGame(profile.email, profile.lifePath, store.state), 10_000);
+    return () => { clearInterval(id); saveGame(profile.email, profile.lifePath, store.state); };
+  }, [profile.email, profile.lifePath, store]);
+
+  // Step 27 — the reusable "activity sequence" progress driver: while helpParentsPhase is 'working',
+  // fill a 0-100 progress bar over ~1.2 real seconds, then resolve it via the existing helpParents()
+  // adapter call. This is real-time, not game-time — the actual time/energy/money/relationship
+  // changes are still applied atomically and only once, by the existing, already-tested
+  // executeHelpParents() adapter, exactly as before Step 27. The progress bar is purely presentational.
+  useEffect(() => {
+    if (helpParentsPhase !== 'working') return;
+    const durationMs = 1200;
+    const start = performance.now();
+    let raf = 0;
+    const tick = (now: number) => {
+      const pct = Math.min(100, ((now - start) / durationMs) * 100);
+      setHelpParentsProgress(pct);
+      if (pct >= 100) { helpParents(); return; }
+      raf = requestAnimationFrame(tick);
+    };
+    raf = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(raf);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [helpParentsPhase]);
+
+  // Switching life paths: force a save under the CURRENT path's key first, so
+  // nothing from this session is lost, then hand control back to path select.
+  const handleChangePath = () => {
+    if (!window.confirm('Switch life paths? Your progress on this path is saved and will be here if you come back to it.')) return;
+    saveGame(profile.email, profile.lifePath, store.state);
+    onChangePath();
+  };
+
+  // Keyboard input.
+  // This step — Part 4: normalize the key once (lower-cased, same as the WASD/keysRef path already
+  // did) instead of checking each letter's upper- and lower-case form separately at every call
+  // site — one interaction pathway, not a duplicated one. `key` (not `e.key`) is used below, so E/e,
+  // J/j, and P/p all reach the same single branch regardless of Caps Lock/Shift state.
+  useEffect(() => {
+    const down = (e: KeyboardEvent) => {
+      const key = e.key.toLowerCase();
+      keysRef.current.add(key);
+      if (key === 'escape' && store.state.player.scene !== 'outdoor' && store.state.player.scene !== 'bus') loop.exit();
+      if (key === 'e') { if (!tryStartHelpParentsActivity()) handleInteract(); }
+      if (key === 'j') setShowJournal(s => !s);
+      if (key === 'p') setShowPhone(s => !s);
+    };
+    const up = (e: KeyboardEvent) => keysRef.current.delete(e.key.toLowerCase());
+    window.addEventListener('keydown', down);
+    window.addEventListener('keyup', up);
+    return () => { window.removeEventListener('keydown', down); window.removeEventListener('keyup', up); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const handleInteract = useCallback(() => {
+    const npc = store.npcNearPlayer();
+    if (npc) store.talkTo(npc.id);
+    const step = store.actionableStep();
+    if (step) return; // handled by the main mission DialoguePanel (driven by `actionable`, not this state)
+    if (npc) { setDialogueLines({ npc: getNpcDef(npc.id)?.name ?? npc.id, text: idleLineFor(npc.id) }); return; }
+    // Phase 10: walk-up-and-buy shopping (Rule 27) — no dropdown, just interact with what's in reach.
+    // Step 28: when this item is also a grocery-list need for the active shopping mission, the same
+    // real purchase doubles as "physical pickup" — reusing the existing buy path rather than a second
+    // pickup system, per Part 10/12's instruction against duplicating item catalogs or mission state.
+    const item = store.nearbyShopItem();
+    if (item) {
+      const label = `${item.brand ? item.brand + ' ' : ''}${item.name}`;
+      const progressBefore = store.shoppingProgress();
+      const isGroceryPickup = !!progressBefore?.need.some(p => item.id.startsWith(p));
+      const result = store.buyNearbyShopItem();
+      setDialogueLines({
+        npc: label,
+        text: result.ok
+          ? (isGroceryPickup ? `Picked up ${item.name}. Checklist updated.` : `Bought for $${item.price.toFixed(2)}. Balance updated.`)
+          : (result.reason ?? 'Could not buy that.'),
+      });
+      return;
+    }
+    // Phase 14: board the bus if one is standing at the stop you're at.
+    const stopId = store.playerNearBusStop();
+    if (stopId) {
+      // This step: freeze the clock for exactly as long as the destination picker is open — see
+      // setPaused()'s own comment for why (the 1-game-minute dwell window could otherwise elapse
+      // while the player is still reading the two destination choices, silently failing boardBus()
+      // and looking exactly like "nothing happened, no travel graphics").
+      if (busAtStop(stopId, store.state.minutes)) { store.setPaused(true); setBoardingAt(stopId); }
+      else {
+        const next = nextBusAt(stopId, store.state.minutes);
+        setDialogueLines({
+          npc: stopById(stopId).name,
+          text: next ? `Next bus at ${formatTime(next.arrivesAt)}.` : 'No more buses running today.',
+        });
+      }
+    }
+  }, [store]);
+
+  // Step 27: once the player has accepted "Help Mum" and is in the 'seek' phase, pressing E near
+  // Mum (the same npcNearPlayer() check handleInteract() already uses for dialogue/idle-chat) starts
+  // the activity sequence instead of the normal idle-chat fallback. This reuses the existing NPC
+  // proximity system rather than inventing a new interactable-object system, per the Step 27 Part 3
+  // instruction to prefer existing systems when they genuinely cover the need.
+  const tryStartHelpParentsActivity = useCallback(() => {
+    if (helpParentsPhaseRef.current !== 'seek') return false;
+    const npc = store.npcNearPlayer();
+    if (!npc || npc.id !== 'mum') return false;
+    helpParentsSnapshotRef.current = { balance: store.state.finance.balance, energy: store.getEnergy().current };
+    setHelpParentsProgress(0);
+    setHelpParentsPhaseBoth('working');
+    return true;
+  }, [store, setHelpParentsPhaseBoth]);
+
+  // Step 8: Attend Class. The ONLY path to executing it — never touches store.state directly,
+  // only the adapter's return value and this component's own local UI state (same double-fire-guard
+  // pattern the removed Step 7B transport handler used).
+  const attendClass = useCallback(() => {
+    if (classResolvingRef.current) return; // already handling a click for this prompt
+    classResolvingRef.current = true;
+    try {
+      const outcome = executeAttendClass(store);
+      const dayNow = parts(store.state.minutes).day;
+      if (!outcome.ok) {
+        // Never pretend a failed activity succeeded: not marked complete, so the player remains
+        // eligible to try again (e.g. after energy recovers).
+        setClassFailure(outcome.message ?? 'That didn\'t work.');
+        return;
+      }
+      setClassCompletedDay(dayNow);
+      setClassFailure(null);
+    } finally {
+      classResolvingRef.current = false;
+    }
+  }, [store]);
+
+  // Step 15/27: Help Parents. Same never-touch-store-directly shape as attendClass() — this only
+  // ever reads the adapter's return value plus this component's own local UI state. Step 27 adds:
+  // called once the 'working' progress sequence finishes (not directly from a dialogue choice
+  // anymore), and builds the completion toast from the real before/after balance+energy snapshot
+  // rather than hardcoding the numbers shown to the player.
+  const helpParents = useCallback(() => {
+    if (helpParentsResolvingRef.current) return; // already handling a click for this prompt
+    helpParentsResolvingRef.current = true;
+    try {
+      const before = helpParentsSnapshotRef.current;
+      const outcome = executeHelpParents(store);
+      const dayNow = parts(store.state.minutes).day;
+      if (!outcome.ok) {
+        // Never pretend a failed activity succeeded: not marked complete, so the player remains
+        // eligible to try again (e.g. after energy recovers).
+        setHelpParentsFailure(outcome.message ?? 'That didn\'t work.');
+        setHelpParentsPhaseBoth(null);
+        return;
+      }
+      setHelpParentsCompletedDay(dayNow);
+      setHelpParentsFailure(null);
+      setHelpParentsPhaseBoth(null);
+      // Real deltas, read from the snapshot taken when the activity started vs. the store's
+      // current values — not the adapter's own numbers restated, so this can never drift from
+      // what actually happened even if the adapter's shape changes later.
+      const after = { balance: store.state.finance.balance, energy: store.getEnergy().current };
+      const moneyDelta = before ? after.balance - before.balance : outcome.amountEarned;
+      const energyDelta = before ? before.energy - after.energy : outcome.energyConsumed;
+      setActivityToast({
+        icon: '🧹',
+        lines: [
+          'Helped around the house',
+          `${moneyDelta > 0 ? '+' : ''}$${moneyDelta.toFixed(2)} · -${energyDelta.toFixed(0)} energy · Mum +1`,
+        ],
+      });
+      if (activityToastTimerRef.current) clearTimeout(activityToastTimerRef.current);
+      activityToastTimerRef.current = setTimeout(() => setActivityToast(null), 4000);
+    } finally {
+      helpParentsResolvingRef.current = false;
+    }
+  }, [store, setHelpParentsPhaseBoth]);
+
+  // Step 27: DECLINE path. Not silent — applies a small, believable relationship consequence
+  // (mirroring the -1 scale every other mission's "decline"-shaped choice already uses, e.g.
+  // arcade_invite's 'home' choice), via the new adjustRelationship() method, and gives the player
+  // immediate feedback for why. No money/time/energy change — declining a chore costs nothing
+  // materially, only a little goodwill, which is the believable-consequence bar Step 27 set.
+  const declineHelpParents = useCallback(() => {
+    const dayNow = parts(store.state.minutes).day;
+    store.adjustRelationship('Mum', -1);
+    setHelpParentsDeclinedDay(dayNow);
+    setHelpParentsPhaseBoth(null);
+    setActivityToast({ icon: '🙁', lines: ["Mum looks a little disappointed, but doesn't push it.", 'Mum -1'] });
+    if (activityToastTimerRef.current) clearTimeout(activityToastTimerRef.current);
+    activityToastTimerRef.current = setTimeout(() => setActivityToast(null), 4000);
+  }, [store, setHelpParentsPhaseBoth]);
+
+  // Main loop.
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d')!;
+
+    const frame = (ts: number) => {
+      const input: MoveInput = {
+        up: keysRef.current.has('w') || keysRef.current.has('arrowup'),
+        down: keysRef.current.has('s') || keysRef.current.has('arrowdown'),
+        left: keysRef.current.has('a') || keysRef.current.has('arrowleft'),
+        right: keysRef.current.has('d') || keysRef.current.has('arrowright'),
+      };
+      loop.frame(ts, input, { w: canvas.width, h: canvas.height }, { worldW: MAP_W * TILE_PX, worldH: MAP_H * TILE_PX });
+      draw(ctx, canvas.width, canvas.height, store, loop);
+      const newToasts = store.takeAchievementToasts();
+      if (newToasts.length) {
+        setAchievementToast(newToasts[0]);
+        if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
+        toastTimerRef.current = setTimeout(() => setAchievementToast(null), 4000);
+      }
+      // Step 26: store.takeOffers() already existed (mirrors takeAchievementToasts()) but had no
+      // consumer — it drains store.offerQueue and self-clears, so each call only ever returns
+      // missions that became available since the last drain, never the same one twice.
+      const newOffers = store.takeOffers();
+      if (newOffers.length) {
+        setMissionToast({ id: newOffers[0].id, name: newOffers[0].name, emoji: newOffers[0].emoji });
+        if (missionToastTimerRef.current) clearTimeout(missionToastTimerRef.current);
+        missionToastTimerRef.current = setTimeout(() => setMissionToast(null), 4000);
+      }
+      rafRef.current = requestAnimationFrame(frame);
+    };
+    rafRef.current = requestAnimationFrame(frame);
+    return () => cancelAnimationFrame(rafRef.current);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const s = store.state;
+  const { day, time } = hudTime(s.minutes);
+  const waypoint = waypointReadout(s, store.defs);
+  // Step 26: reuses the existing trackedMission() (already the source waypointReadout() itself
+  // calls internally) purely to read its mission name for the new Objective HUD card — no new
+  // tracking/priority logic, just a second read of the same authoritative pick.
+  const objective = trackedMission(s, store.defs);
+  const journal = buildJournal(s, store.defs);
+  const daySummary = store.pendingDaySummary ? dayToSummaryView(store.pendingDaySummary, store.defs) : null;
+  const weekSummary = store.pendingWeekSummary ? weekToSummaryView(store.pendingWeekSummary) : null;
+  const actionable = store.actionableStep();
+  const nearbyItem = store.nearbyShopItem();
+  const shopping = store.shoppingProgress();
+  const nearStopId = s.player.scene === 'outdoor' ? store.playerNearBusStop() : null;
+  const lifeEvent = s.pendingLifeEvent ? LIFE_EVENTS.find(e => e.id === s.pendingLifeEvent!.id) : undefined;
+  // Step 28: reusable "who/what is in reach right now" reads, built entirely on existing store data
+  // (npcNearPlayer(), shoppingProgress()) — no new interaction system, just new HUD consumers of it.
+  const nearbyNpc = store.npcNearPlayer();
+  const objectiveStep = objective ? objective.def.steps[objective.rt.stepIndex] : null;
+  const objectiveNpcId = objectiveStep?.npcId;
+  const objectiveNpcName = objectiveNpcId ? getNpcDef(objectiveNpcId)?.name ?? objectiveNpcId : null;
+  const groceryNeedIdx = shopping && nearbyItem ? shopping.need.findIndex(p => nearbyItem.id.startsWith(p)) : -1;
+  const groceryAlreadyGot = groceryNeedIdx >= 0 && shopping!.covered[groceryNeedIdx];
+  // Step 10: Monday morning transport is now owned solely by the live 'get_to_school' mission
+  // (src/lib/missions.ts), reached through the normal `actionable` mission DialoguePanel — the
+  // Step 7B adapter-driven transport panel/eligibility that used to live here has been removed
+  // (see the Step 9 audit / Step 10 report for why).
+  const clockParts = parts(s.minutes);
+  // Step 8: Attend Class eligibility — school life path, actually at the school building (the
+  // live, authoritative `store.state.player.place` check, not a second location system), Monday,
+  // class not already completed today. Deliberately does NOT cross-reference how the player got to
+  // 'university' (Step 10: that used to check a Step 7B transport flag which no longer exists) —
+  // actually being at 'university' already proves transport succeeded, whichever mechanism (now
+  // exclusively the 'get_to_school' mission) got them there. School-hours gating is NOT duplicated
+  // here either: getting to 'university' at all already went through store.enterPlace(), which
+  // itself checks store.isOpenNow() against world.ts's HOURS table.
+  const classEligible =
+    profile.lifePath === 'school' &&
+    s.player.place === 'university' &&
+    clockParts.dayOfWeek === 0 &&
+    classCompletedDay !== clockParts.day;
+  // Step 15: Help Parents eligibility — school life path (the same gate classEligible uses, since
+  // HELP_PARENTS is School-life content, same as ATTEND_CLASS), actually at 'home' (the live,
+  // authoritative store.state.player.place check, not a new location system), and not already
+  // completed today (option A — see the helpParentsCompletedDay state comment above). Deliberately
+  // does NOT check day-of-week or time-of-day: HELP_PARENTS itself has no such requirement, and
+  // inventing one here would be exactly the "silently add a requirement" the audit warned against.
+  const helpParentsEligible =
+    profile.lifePath === 'school' &&
+    s.player.place === 'home' &&
+    helpParentsCompletedDay !== clockParts.day &&
+    helpParentsDeclinedDay !== clockParts.day; // Step 27: declining still lets tomorrow re-offer it
+  const busArrived = nearStopId ? busAtStop(nearStopId, s.minutes) : null;
+  const nextBus = nearStopId && !busArrived ? nextBusAt(nearStopId, s.minutes) : null;
+
+  return (
+    <div style={{ position: 'relative', width: '100%', height: '100dvh', background: '#000', overflow: 'hidden' }}>
+      <canvas
+        ref={canvasRef} width={canvasSize.w} height={canvasSize.h}
+        style={{ position: 'absolute', inset: 0, width: '100%', height: '100%', imageRendering: 'pixelated', touchAction: 'none' }}
+      />
+
+      {/* On-screen touch controls (phone/tablet only) */}
+      {isTouch && (
+        <>
+          <div style={hud.dpad}>
+            <div style={hud.dpadRow}>
+              <div style={hud.dpadSpacer} />
+              <button style={hud.dpadBtn} onPointerDown={() => pressKey('w')} onPointerUp={() => releaseKey('w')} onPointerLeave={() => releaseKey('w')} onPointerCancel={() => releaseKey('w')}>▲</button>
+              <div style={hud.dpadSpacer} />
+            </div>
+            <div style={hud.dpadRow}>
+              <button style={hud.dpadBtn} onPointerDown={() => pressKey('a')} onPointerUp={() => releaseKey('a')} onPointerLeave={() => releaseKey('a')} onPointerCancel={() => releaseKey('a')}>◀</button>
+              <div style={hud.dpadSpacer} />
+              <button style={hud.dpadBtn} onPointerDown={() => pressKey('d')} onPointerUp={() => releaseKey('d')} onPointerLeave={() => releaseKey('d')} onPointerCancel={() => releaseKey('d')}>▶</button>
+            </div>
+            <div style={hud.dpadRow}>
+              <div style={hud.dpadSpacer} />
+              <button style={hud.dpadBtn} onPointerDown={() => pressKey('s')} onPointerUp={() => releaseKey('s')} onPointerLeave={() => releaseKey('s')} onPointerCancel={() => releaseKey('s')}>▼</button>
+              <div style={hud.dpadSpacer} />
+            </div>
+          </div>
+          {actionable && !lifeEvent ? (
+            // Mission dialogue starts itself the moment you're in the right place — there's
+            // nothing to "act" on, so the touch button here fast-forwards the conversation instead.
+            <button style={hud.interactBtn} onPointerDown={() => { stopSpeaking(); setSkipSignal(n => n + 1); }}>SKIP</button>
+          ) : dialogueLines && !lifeEvent && !boardingAt ? (
+            <button style={hud.interactBtn} onPointerDown={() => { stopSpeaking(); setDialogueLines(null); }}>SKIP</button>
+          ) : (
+            <button style={hud.interactBtn} onPointerDown={handleInteract}>ACT</button>
+          )}
+          {s.player.scene !== 'outdoor' && s.player.scene !== 'bus' && (
+            <button style={hud.exitBtn} onPointerDown={() => loop.exit()}>EXIT</button>
+          )}
+        </>
+      )}
+
+      {/* HUD */}
+      <div style={hud.bar}>
+        <span style={{ color: '#7cfc00' }}>💰 ${s.finance.balance.toFixed(2)}</span>
+        <span style={{ color: '#ffe066' }}>⚡ {Math.round(s.energy.current)}</span>
+        <span style={{ color: '#ffd700' }}>{day} {time}</span>
+        <span style={{ color: '#aaffaa' }}>{profile.name} · Lv{profile.level}</span>
+        <div style={hud.btnGroup}>
+          <button style={hud.smallBtn} onClick={() => setShowJournal(v => !v)}>📔 Journal{!isTouch && ' (J)'}</button>
+          <button style={hud.smallBtn} onClick={() => setShowPhone(v => !v)}>📱 Wallet{!isTouch && ' (P)'}</button>
+          <button style={hud.smallBtn} onClick={() => setShowRelationships(v => !v)}>❤️ Relations</button>
+          <button style={hud.smallBtn} onClick={() => setShowMentor(v => !v)}>🧑‍🏫 Mentor</button>
+          <button style={hud.smallBtn} onClick={() => { setVoiceOn(v => { if (v) stopSpeaking(); return !v; }); }}>{voiceOn ? '🔊 Voice' : '🔇 Voice'}</button>
+          <button style={hud.smallBtn} onClick={handleChangePath}>🔀 Path</button>
+          <button style={hud.smallBtn} onClick={onLogout}>Log out</button>
+        </div>
+      </div>
+
+      {/* Step 26 — Objective HUD: the "what should I care about right now?" layer, so the player
+          doesn't have to open the Journal just to see the current objective. Reads the same
+          trackedMission()/waypointReadout() data the minimap already used internally — no new
+          mission-tracking logic, this only renders what already existed. */}
+      <div style={hud.objective}>
+        {objective ? (
+          <>
+            <div style={hud.objectiveLabel}>🎯 NEXT</div>
+            <div style={hud.objectiveName}>
+              {/* Step 28: when the current step's target is an NPC (e.g. "Find Mum"), name them
+                  directly instead of just the mission title — closing the "told to find someone
+                  I can't identify" gap. Purely a label change; waypoint targeting is unchanged. */}
+              {objectiveNpcName ? `${objective.def.name} — ${objectiveNpcName}` : objective.def.name}
+            </div>
+            {waypoint && <div style={hud.objectiveLocation}>{waypoint.arrow} {waypoint.label} · {waypoint.metres}m</div>}
+          </>
+        ) : (
+          <div style={hud.objectiveLabel}>🎯 NO ACTIVE OBJECTIVE</div>
+        )}
+      </div>
+
+      {/* Step 26 — Relationship HUD: compact, toggled panel (not a permanent fixture) surfacing the
+          existing world.relationships values. Reads whatever NPCs are actually in that object —
+          nothing hardcoded, nothing invented, no change to how relationship values are computed. */}
+      {showRelationships && (
+        <div style={hud.relationships}>
+          <div style={{ fontWeight: 700, marginBottom: 6 }}>❤️ Relationships</div>
+          {Object.entries(s.world.relationships).length === 0 ? (
+            <div style={{ fontSize: 12, opacity: 0.7 }}>No relationships yet.</div>
+          ) : (
+            Object.entries(s.world.relationships).map(([name, value]) => (
+              <div key={name} style={hud.phoneLine}>
+                <span>{name}</span>
+                <span style={{ color: value > 0 ? '#7cfc00' : value < 0 ? '#ff8080' : '#ccc' }}>
+                  {value > 0 ? '+' : ''}{value}
+                </span>
+              </div>
+            ))
+          )}
+        </div>
+      )}
+
+      {!isTouch && s.player.scene !== 'outdoor' && s.player.scene !== 'bus' && (
+        <div style={hud.exitHint}>Press ESC to go outside</div>
+      )}
+
+      {/* Shopping-list mission (e.g. Mum's errand): a live checklist off real purchases, not a script */}
+      {shopping && (
+        <div style={hud.shoppingList}>
+          <div style={{ fontWeight: 700, marginBottom: 6 }}>{shopping.def.emoji} {shopping.def.name}</div>
+          {shopping.need.map((prefix, i) => (
+            <div key={prefix} style={{ fontSize: 13, marginBottom: 3, opacity: shopping.covered[i] ? 1 : 0.5 }}>
+              {shopping.covered[i] ? '✅' : '⬜'} {prefix.replace(/_$/, '').replace(/^./, c => c.toUpperCase())}
+            </div>
+          ))}
+          <div style={{ fontSize: 11, opacity: 0.7, marginTop: 6 }}>Spent so far: ${shopping.total.toFixed(2)}</div>
+          {shopping.covered.every(Boolean) && (
+            <div style={{ fontSize: 12, color: '#7cfc00', marginTop: 4 }}>✓ GROCERIES COMPLETE — head back out!</div>
+          )}
+        </div>
+      )}
+
+      {/* Contextual "what can I do here" prompt (Rule 42) — only shown when something's in reach.
+          Step 28: when the item in reach is also a grocery-list need, this is a physical pickup —
+          same underlying buy path (buyNearbyShopItem()), just worded and gated as a collection. */}
+      {nearbyItem && !actionable && (
+        groceryNeedIdx >= 0 ? (
+          <div style={hud.buyPrompt}>
+            {groceryAlreadyGot
+              ? `✓ Already picked up ${nearbyItem.name} — find what's left on the list`
+              : `[E] Pick Up — ${nearbyItem.brand ? `${nearbyItem.brand} ` : ''}${nearbyItem.name} ($${nearbyItem.price.toFixed(2)})`}
+          </div>
+        ) : (
+          <div style={hud.buyPrompt}>
+            E: Buy {nearbyItem.brand ? `${nearbyItem.brand} ` : ''}{nearbyItem.name} — ${nearbyItem.price.toFixed(2)}
+            {!nearbyItem.affordable && <span style={{ color: '#ff8080' }}> (not enough money)</span>}
+          </div>
+        )
+      )}
+
+      {/* Step 28 — Part 2/7: a generic "[E] Talk" affordance whenever an NPC is close enough to
+          interact with and nothing higher-priority (a mission panel, a shop item, a bus stop) is
+          already claiming the prompt slot. Reuses the same npcNearPlayer() proximity check
+          handleInteract() already uses — no new detection logic, just a visible cue for it. */}
+      {nearbyNpc && !actionable && !nearbyItem && !nearStopId && !dialogueLines && !lifeEvent && !boardingAt &&
+        helpParentsPhase !== 'seek' && helpParentsPhase !== 'working' && (
+        <div style={hud.buyPrompt}>[E] Talk — {getNpcDef(nearbyNpc.id)?.name ?? nearbyNpc.id}</div>
+      )}
+
+      {/* Phase 14 / Step 27: bus-stop prompt — arrived bus vs. a countdown to the next one. Step 27
+          adds the energy cost alongside the fare, so the player sees all three affected resources
+          (money/time/energy) before boarding, not just the fare — closing the Step 27 audit's
+          "bus energy is applied but never shown" finding. */}
+      {/* This step — Part 2: a real timetable readout, not just an arrived/next-departure line, so
+          the player can see the whole route (BUS_ROUTE.name/fare, unchanged authoritative data)
+          the moment they reach any stop — "make it obvious what the player can do here." */}
+      {nearStopId && !actionable && !nearbyItem && (
+        <div style={hud.buyPrompt}>
+          <div style={{ fontSize: 11, opacity: 0.8, marginBottom: 2 }}>
+            🚏 {stopById(nearStopId).name} · {BUS_ROUTE.name} · Fare ${BUS_ROUTE.fare.toFixed(2)}
+          </div>
+          {busArrived
+            ? `E: Board the bus — $${BUS_ROUTE.fare.toFixed(2)} · -1 energy`
+            : nextBus
+              ? `Waiting for the bus — next arrives at ${formatTime(nextBus.arrivesAt)}`
+              : 'No more buses today'}
+        </div>
+      )}
+
+      {/* Step 27: while riding, a short, honest "you are travelling" banner — real time is already
+          fast-forwarding via s.ride (unchanged), this just makes that visible instead of abstract,
+          per the Step 27 bus-experience audit. No new rendering/animation system, no change to the
+          existing ride/fare/energy validation in boardBus()/finishRide(). */}
+      {s.ride && (
+        <div style={hud.busRideBanner}>
+          🚌 On the bus to {stopById(s.ride.toStop).name} — arriving in {Math.max(0, Math.ceil(s.ride.endsAt - s.minutes))}m
+        </div>
+      )}
+
+      {/* Destination picker once you've boarded a standing bus */}
+      {boardingAt && (
+        <DialoguePanel
+          speaker={`${stopById(boardingAt).name} — Route 1`}
+          lines={['Where to?']}
+          choices={Object.values(BUS_STOPS).filter(st => st.id !== boardingAt).map(st => ({
+            id: st.id, label: st.name, sublabel: `~${rideMinutes(boardingAt, st.id)} min · $${BUS_ROUTE.fare.toFixed(2)} · -1 energy`,
+            cost: 0, minutes: 0, consequence: '',
+          }))}
+          onChoose={(c) => {
+            const result = store.boardBus(boardingAt, c.id);
+            store.setPaused(false);
+            setBoardingAt(null);
+            // Surface a real failure (fare/energy/bus already gone) instead of silently doing
+            // nothing — this is exactly the "no travel graphics" symptom when boardBus() refuses.
+            if (!result.ok) setDialogueLines({ npc: stopById(boardingAt).name, text: result.reason ?? "Couldn't board the bus." });
+          }}
+          voiceOn={voiceOn}
+        />
+      )}
+
+      {/* Step 10: the Step 7B "How are you getting to school today?" panel has been removed — Monday
+          transport is now handled solely by the live 'get_to_school' mission's own DialoguePanel
+          (rendered via the `actionable` mission-step panel elsewhere in this file), which already
+          offered the identical walk/bus choice. See the Step 9/10 reports for why keeping both was
+          a genuine duplicate-state risk, not a stylistic preference. */}
+
+      {/* Step 8: Attend Class prompt — same priority pattern as the other contextual panels above. */}
+      {classEligible && !actionable && !lifeEvent && !boardingAt && !classFailure && (
+        <DialoguePanel
+          speaker="Teacher"
+          lines={['Take your seat — class is starting.']}
+          choices={[
+            { id: 'attend', label: 'Attend class', sublabel: '4 hours · 15 energy', cost: 0, minutes: 0, consequence: '' },
+          ]}
+          balance={s.finance.balance}
+          voiceOn={voiceOn}
+          onChoose={() => attendClass()}
+        />
+      )}
+
+      {/* Result of a rejected Attend Class attempt (e.g. not enough energy) — informational, click
+          to dismiss. Does NOT mark class complete or advance the day on its own. */}
+      {classFailure && (
+        <div style={hud.dialogue} onClick={() => setClassFailure(null)}>
+          <div style={{ fontWeight: 700, color: '#ffd700', marginBottom: 4 }}>Teacher</div>
+          <div>{classFailure}</div>
+        </div>
+      )}
+
+      {/* Step 15/27: Help Parents — the Step 27 first-vertical-slice mission. Same priority pattern
+          as the Attend Class panel, only shown when nothing else is active AND the player hasn't
+          already been asked today (helpParentsPhase === null means "not yet accepted/declined
+          today" — the panel disappears the instant a choice is made, it does not linger). */}
+      {helpParentsEligible && helpParentsPhase === null && !actionable && !lifeEvent && !boardingAt &&
+        !classEligible && !classFailure && !helpParentsFailure && !nearbyItem && !nearStopId && (
+        <DialoguePanel
+          speaker="Mum"
+          lines={['Could you help out around the house for a bit?']}
+          choices={[
+            { id: 'help', label: 'Help Mum', sublabel: '~30 min · 5 energy · +$5', cost: 0, minutes: 0, consequence: '' },
+            { id: 'decline', label: 'Not right now', sublabel: 'Mum will understand — probably', cost: 0, minutes: 0, consequence: '' },
+          ]}
+          balance={s.finance.balance}
+          voiceOn={voiceOn}
+          onChoose={(c) => { if (c.id === 'help') setHelpParentsPhaseBoth('seek'); else declineHelpParents(); }}
+        />
+      )}
+
+      {/* Step 27: 'seek' phase — the player accepted, dialogue has closed, and they keep full normal
+          movement/control. This is a HUD hint only (same style as the existing shop/bus contextual
+          prompts), not a menu — pressing E near Mum (handled in the keydown handler via
+          tryStartHelpParentsActivity()) is what actually starts the activity. */}
+      {helpParentsPhase === 'seek' && (
+        <div style={hud.buyPrompt}>🧹 Find Mum and press E to start helping</div>
+      )}
+
+      {/* Step 27: 'working' phase — the reusable short activity sequence itself. A real progress
+          bar (driven by the useEffect above), not a fake video and not a full mini-game. The
+          player's objective/HUD stays visible underneath; this is an overlay, not a modal that
+          blocks the rest of the screen. */}
+      {helpParentsPhase === 'working' && (
+        <div style={hud.activitySequence}>
+          <div style={{ fontSize: 22, marginBottom: 4 }}>🧹</div>
+          <div style={{ fontSize: 13, marginBottom: 8 }}>Helping around the house…</div>
+          <div style={hud.activityBarTrack}>
+            <div style={{ ...hud.activityBarFill, width: `${helpParentsProgress}%` }} />
+          </div>
+        </div>
+      )}
+
+      {/* Result of a rejected Help Parents attempt (e.g. not enough energy) — informational, click
+          to dismiss. Does NOT mark the chore complete. */}
+      {helpParentsFailure && (
+        <div style={hud.dialogue} onClick={() => setHelpParentsFailure(null)}>
+          <div style={{ fontWeight: 700, color: '#ffd700', marginBottom: 4 }}>Mum</div>
+          <div>{helpParentsFailure}</div>
+        </div>
+      )}
+
+      {/* Idle chat / purchase confirmation / bus-timing toast — auto-dismisses, yields to real dialogue */}
+      {dialogueLines && !actionable && !lifeEvent && !boardingAt && (
+        <div style={hud.dialogue} onClick={() => { stopSpeaking(); setDialogueLines(null); }}>
+          {dialogueLines.npc && <div style={{ fontWeight: 700, color: '#ffd700', marginBottom: 4 }}>{dialogueLines.npc}</div>}
+          <div>{dialogueLines.text}</div>
+        </div>
+      )}
+
+      {/* Contextual dialogue / choice panel (life event takes priority if both somehow line up) */}
+      {actionable && !lifeEvent && (
+        <DialoguePanel
+          speaker={actionable.step.speaker} lines={actionable.step.lines}
+          choices={actionable.step.choices}
+          balance={s.finance.balance}
+          voiceOn={voiceOn}
+          skipSignal={skipSignal}
+          onChoose={(c) => { store.applyChoice(actionable.def.id, c); setDialogueLines(null); }}
+        />
+      )}
+
+      {/* Journal */}
+      {showJournal && (
+        <JournalPanel journal={journal} onClose={() => setShowJournal(false)} />
+      )}
+
+      {/* Phone / wallet dashboard */}
+      {showPhone && (
+        <PhoneDashboard state={s} onClose={() => setShowPhone(false)} />
+      )}
+
+      {/* AI Mentor chat */}
+      {showMentor && (
+        <MentorPanel
+          context={{ lifePath: profile.lifePath, day, balance: s.finance.balance, activeMissions: journal.active.map(a => a.name) }}
+          onClose={() => setShowMentor(false)}
+          voiceOn={voiceOn}
+        />
+      )}
+
+      {/* Achievement toast */}
+      {achievementToast && (
+        <div style={hud.achievementToast}>
+          <span style={{ fontSize: 22 }}>{achievementToast.emoji}</span>
+          <div>
+            <div style={{ fontSize: 10, opacity: 0.75, letterSpacing: 0.5 }}>ACHIEVEMENT UNLOCKED</div>
+            <div style={{ fontWeight: 700 }}>{achievementToast.name}</div>
+          </div>
+        </div>
+      )}
+
+      {/* Step 26 — mission-availability toast: same shape as the achievement toast above (a
+          non-blocking overlay that self-dismisses after 4s), fed by store.takeOffers(), which
+          already existed and already de-duplicates/self-clears — so this never repeats for a
+          mission that simply remains available. */}
+      {missionToast && (
+        <div style={hud.missionToast}>
+          <span style={{ fontSize: 22 }}>{missionToast.emoji}</span>
+          <div>
+            <div style={{ fontSize: 10, opacity: 0.75, letterSpacing: 0.5 }}>NEW OBJECTIVE</div>
+            <div style={{ fontWeight: 700 }}>{missionToast.name}</div>
+          </div>
+        </div>
+      )}
+
+      {/* Step 27 — generic activity/consequence-feedback toast (reusable beyond Help Parents: any
+          future accepted/declined activity can call setActivityToast with its own icon/lines rather
+          than each one inventing its own popup). Same non-blocking, self-dismissing shape as the
+          achievement/mission toasts above. */}
+      {activityToast && (
+        <div style={hud.activityToast}>
+          <span style={{ fontSize: 22 }}>{activityToast.icon}</span>
+          <div>
+            {activityToast.lines.map((line, i) => (
+              <div key={i} style={i === 0 ? { fontWeight: 700 } : { fontSize: 12, opacity: 0.85 }}>{line}</div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Life event (small, optional, day-to-day decision — separate from scheduled missions) */}
+      {lifeEvent && s.pendingLifeEvent && (
+        <DialoguePanel
+          speaker={`${lifeEvent.emoji} ${lifeEvent.text}`}
+          lines={[]}
+          choices={lifeEvent.choices.map(c => ({
+            id: c.id, label: c.label,
+            sublabel: c.amount !== 0 ? (c.amount > 0 ? `+$${c.amount.toFixed(2)}` : `-$${Math.abs(c.amount).toFixed(2)}`) : '',
+            cost: 0, minutes: 0, consequence: c.consequence,
+          }))}
+          onChoose={(c) => store.resolveLifeEvent(c.id)}
+        />
+      )}
+
+      {/* Day / week summaries */}
+      {daySummary && (
+        <SummaryModal title={daySummary.title} lines={[daySummary.moneyLine, daySummary.spentLine, daySummary.schoolLine, daySummary.missionsLine, daySummary.timeLine].filter(Boolean) as string[]}
+          onClose={() => store.dismissDaySummary()} />
+      )}
+      {!daySummary && weekSummary && (
+        <SummaryModal title={weekSummary.title} lines={[weekSummary.income, weekSummary.spending, weekSummary.savings, weekSummary.missions, weekSummary.social, weekSummary.school, ...weekSummary.decisions]}
+          onClose={() => store.dismissWeekSummary()} />
+      )}
+
+      {/* "Make It to Friday" recap — real numbers computed at completion, not scripted */}
+      {!daySummary && store.pendingLevelSummary && (
+        <LevelSummaryModal summary={store.pendingLevelSummary} onClose={() => store.dismissLevelSummary()} />
+      )}
+
+      {/* Sleep button (only shown at home, outdoor scene excluded) */}
+      {s.player.place === 'home' && (
+        <button style={hud.sleepBtn} onClick={() => store.sleep(false)}>🛏️ Go to sleep</button>
+      )}
+    </div>
+  );
+}
+
+function DialoguePanel({ speaker, lines, choices, onChoose, balance, voiceOn, skipSignal }: {
+  speaker?: string; lines: string[]; choices?: MissionChoice[]; onChoose: (c: MissionChoice) => void;
+  /** When given, a choice costing more than this is shown but disabled — real trade-offs mean some
+   *  options genuinely aren't available, not just unwise (Rule 3/4: the game never hides the option,
+   *  but it doesn't let you spend money you don't have either). */
+  balance?: number;
+  /** When true, each revealed line is read aloud in a voice fingerprinted to `speaker` (src/lib/tts.ts). */
+  voiceOn?: boolean;
+  /** Bump this (any changed number) to fast-forward straight to the choices — driven by the
+   *  on-screen "SKIP" touch button, since there's no keyboard shortcut to hold down on mobile. */
+  skipSignal?: number;
+}) {
+  // Reveal one line at a time (tap/click to advance) instead of dumping the whole exchange at
+  // once — reads like an actual back-and-forth instead of a wall of text with buttons under it.
+  const [shown, setShown] = useState(1);
+  const key = speaker + '|' + lines.join('|');
+  useEffect(() => { setShown(1); }, [key]);
+  const skipSignalRef = useRef(skipSignal);
+  useEffect(() => {
+    if (skipSignal !== undefined && skipSignal !== skipSignalRef.current) {
+      skipSignalRef.current = skipSignal;
+      setShown(lines.length);
+    }
+  }, [skipSignal, lines.length]);
+  useEffect(() => {
+    if (voiceOn) speakLine(speaker, lines[shown - 1] ?? '');
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [key, shown, voiceOn]);
+  const atEnd = shown >= lines.length;
+  return (
+    <div style={hud.dialogue} onClick={() => { if (!atEnd) setShown(n => n + 1); }}>
+      {speaker && <div style={{ fontWeight: 700, color: '#ffd700', marginBottom: 4 }}>{speaker}</div>}
+      {lines.slice(0, shown).map((l, i) => <div key={i} style={{ marginBottom: 4 }}>{l}</div>)}
+      {!atEnd && <div style={{ fontSize: 11, opacity: 0.6, marginTop: 6 }}>▾ tap to continue</div>}
+      {atEnd && choices && (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 6, marginTop: 10 }}>
+          {choices.map(c => {
+            const affordable = balance === undefined || -c.cost <= balance;
+            return (
+              <button
+                key={c.id}
+                style={{ ...hud.choiceBtn, ...(affordable ? {} : hud.choiceBtnDisabled) }}
+                disabled={!affordable}
+                onClick={() => affordable && onChoose(c)}
+              >
+                <div>{c.label}{!affordable && <span style={{ color: '#ff8080', fontWeight: 400 }}> — can't afford</span>}</div>
+                <div style={{ fontSize: 11, opacity: 0.7 }}>{c.sublabel}</div>
+              </button>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function JournalPanel({ journal, onClose }: { journal: ReturnType<typeof buildJournal>; onClose: () => void }) {
+  const section = (title: string, entries: typeof journal.active) => entries.length > 0 && (
+    <div style={{ marginBottom: 12 }}>
+      <div style={{ fontWeight: 700, marginBottom: 4 }}>{title}</div>
+      {entries.map(e => (
+        <div key={e.id} style={{ fontSize: 13, marginBottom: 4 }}>{e.emoji} {e.name} — {e.text}</div>
+      ))}
+    </div>
+  );
+  return (
+    <div style={hud.journal}>
+      <button style={{ float: 'right', ...hud.smallBtn }} onClick={onClose}>Close</button>
+      <h3>Mission Journal</h3>
+      {section('ACTIVE', journal.active)}
+      {section('OPTIONAL', journal.optional)}
+      {journal.upcoming.length > 0 && (
+        <div style={{ marginBottom: 12 }}>
+          <div style={{ fontWeight: 700, marginBottom: 4, opacity: 0.75 }}>UPCOMING THIS WEEK</div>
+          {journal.upcoming.map(e => (
+            <div key={e.id} style={{ fontSize: 12, marginBottom: 4, opacity: 0.6 }}>{e.emoji} {e.name} — {e.text}</div>
+          ))}
+        </div>
+      )}
+      {section('COMPLETED TODAY', journal.completed)}
+      {section('MISSED', journal.missed)}
+      {journal.active.length + journal.optional.length === 0 && <div style={{ opacity: 0.6 }}>Nothing pending right now.</div>}
+    </div>
+  );
+}
+
+/** AI Mentor chat — a small in-game chat window backed by src/app/api/mentor/route.ts. */
+interface MentorMsg { from: 'you' | 'kai'; text: string }
+function MentorPanel({ context, onClose, voiceOn }: {
+  context: { lifePath: string; day: string; balance: number; activeMissions: string[] };
+  onClose: () => void;
+  voiceOn?: boolean;
+}) {
+  const greeting = "Hey, I'm Kai — your money mentor. Ask me anything about budgeting, saving, or what to do this week.";
+  const [msgs, setMsgs] = useState<MentorMsg[]>([{ from: 'kai', text: greeting }]);
+  const [input, setInput] = useState('');
+  const [sending, setSending] = useState(false);
+  useEffect(() => { if (voiceOn) speakLine('Kai', greeting); /* eslint-disable-next-line react-hooks/exhaustive-deps */ }, []);
+
+  const send = async () => {
+    const text = input.trim();
+    if (!text || sending) return;
+    setInput('');
+    setMsgs(m => [...m, { from: 'you', text }]);
+    setSending(true);
+    const reply = await askMentorChat(text, context);
+    setMsgs(m => [...m, { from: 'kai', text: reply }]);
+    if (voiceOn) speakLine('Kai', reply);
+    setSending(false);
+  };
+
+  return (
+    <div style={hud.modalBackdrop}>
+      <div style={{ ...hud.modal, width: 'min(380px, 92vw)', display: 'flex', flexDirection: 'column', maxHeight: '70vh' }}>
+        <h3 style={{ margin: '0 0 10px' }}>🧑‍🏫 Kai — Money Mentor</h3>
+        <div style={{ flex: 1, overflowY: 'auto', marginBottom: 10, paddingRight: 4 }}>
+          {msgs.map((m, i) => (
+            <div key={i} style={{
+              marginBottom: 8, padding: '8px 10px', borderRadius: 8, fontSize: 13, lineHeight: 1.4,
+              background: m.from === 'you' ? '#1f6feb22' : '#0d1117',
+              marginLeft: m.from === 'you' ? 30 : 0, marginRight: m.from === 'you' ? 0 : 30,
+            }}>
+              {m.text}
+            </div>
+          ))}
+          {sending && <div style={{ fontSize: 12, opacity: 0.6 }}>Kai is thinking…</div>}
+        </div>
+        <div style={{ display: 'flex', gap: 6 }}>
+          <input
+            value={input} onChange={e => setInput(e.target.value)}
+            onKeyDown={e => { if (e.key === 'Enter') send(); }}
+            placeholder="Ask Kai something…" style={{ ...inputStyle, marginBottom: 0, flex: 1 }}
+          />
+          <button style={{ ...btnStyle, width: 'auto', padding: '0 14px' }} onClick={send} disabled={sending}>Send</button>
+        </div>
+        <button style={{ ...hud.smallBtn, marginTop: 10, alignSelf: 'flex-end' }} onClick={onClose}>Close</button>
+      </div>
+    </div>
+  );
+}
+
+/** Phone/wallet dashboard (Rule: the player should be able to see their own finances without me
+ *  narrating them) — reads straight off GameState.finance + the running ledger, nothing separately
+ *  tracked. Balance/goals/bills are always current; the ledger/spending-breakdown cover the last 7
+ *  days so a fresh save doesn't show an empty "spending" section on day one. */
+function PhoneDashboard({ state, onClose }: { state: GameState; onClose: () => void }) {
+  const f = state.finance;
+  const weekCutoff = state.minutes - 7 * 24 * 60;
+  const recentLedger = state.ledger.filter(e => e.minutes >= weekCutoff);
+
+  const byCategory = new Map<string, number>();
+  for (const e of recentLedger) {
+    if (e.amount >= 0) continue; // spending only
+    byCategory.set(e.category, (byCategory.get(e.category) ?? 0) + -e.amount);
+  }
+  const spendRows = Array.from(byCategory.entries()).sort((a, b) => b[1] - a[1]);
+  const maxSpend = spendRows.length ? spendRows[0][1] : 1;
+  const weekSpent = spendRows.reduce((sum, [, v]) => sum + v, 0);
+
+  const recent = [...state.ledger].slice(-12).reverse();
+  const CATEGORY_EMOJI: Record<string, string> = {
+    shop: '🛒', mission: '🎯', rent: '🏠', transport: '🚌', income: '💵', reward: '🎁',
+  };
+
+  return (
+    <div style={hud.modalBackdrop} onClick={onClose}>
+      <div style={hud.phone} onClick={e => e.stopPropagation()}>
+        <button style={{ float: 'right', ...hud.smallBtn }} onClick={onClose}>Close</button>
+        <h3 style={{ margin: '0 0 12px' }}>📱 Wallet</h3>
+
+        <div style={hud.phoneBalance}>
+          <div style={{ fontSize: 26, fontWeight: 700, color: f.balance < 0 ? '#ff6060' : '#7cfc00' }}>
+            ${f.balance.toFixed(2)}
+          </div>
+          <div style={{ fontSize: 11, opacity: 0.7 }}>Available balance</div>
+        </div>
+        <div style={{ display: 'flex', gap: 10, marginBottom: 14, fontSize: 12 }}>
+          <div style={hud.phoneStat}>Savings<br /><b>${f.savings.toFixed(2)}</b></div>
+          <div style={hud.phoneStat}>Emergency<br /><b>${f.emergencyFund.toFixed(2)}</b></div>
+          <div style={hud.phoneStat}>Debt<br /><b style={{ color: f.debt > 0 ? '#ff8080' : undefined }}>${f.debt.toFixed(2)}</b></div>
+        </div>
+
+        {/* Bills */}
+        <div style={hud.phoneSection}>
+          <div style={hud.phoneSectionTitle}>UPCOMING</div>
+          {f.rentAmount > 0 && (
+            <div style={hud.phoneLine}><span>🏠 Rent — ${f.rentAmount.toFixed(2)}</span><span>{f.rentDueInDays === 999 ? '—' : `in ${f.rentDueInDays}d`}</span></div>
+          )}
+          <div style={hud.phoneLine}><span>📄 {f.nextBillName} — ${f.nextBillAmount.toFixed(2)}</span><span>in {f.nextBillDueInDays}d</span></div>
+          {f.job && (
+            <div style={hud.phoneLine}><span>💼 {f.job.name} pay</span><span>${f.weeklyIncome.toFixed(2)}/wk</span></div>
+          )}
+        </div>
+
+        {/* Goals */}
+        {f.goals.length > 0 && (
+          <div style={hud.phoneSection}>
+            <div style={hud.phoneSectionTitle}>SAVINGS GOALS</div>
+            {f.goals.map(g => {
+              const pct = Math.min(100, Math.round((g.saved / Math.max(1, g.target)) * 100));
+              return (
+                <div key={g.id} style={{ marginBottom: 8 }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 12 }}>
+                    <span>{g.name}</span><span>${g.saved.toFixed(0)} / ${g.target.toFixed(0)}</span>
+                  </div>
+                  <div style={hud.phoneBarTrack}><div style={{ ...hud.phoneBarFill, width: `${pct}%` }} /></div>
+                </div>
+              );
+            })}
+          </div>
+        )}
+
+        {/* Spending breakdown (last 7 days) */}
+        <div style={hud.phoneSection}>
+          <div style={hud.phoneSectionTitle}>SPENT THIS WEEK — ${weekSpent.toFixed(2)}</div>
+          {spendRows.length === 0 && <div style={{ fontSize: 12, opacity: 0.6 }}>Nothing spent yet.</div>}
+          {spendRows.map(([cat, amt]) => (
+            <div key={cat} style={{ marginBottom: 6 }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 12 }}>
+                <span>{CATEGORY_EMOJI[cat] ?? '💳'} {cat}</span><span>${amt.toFixed(2)}</span>
+              </div>
+              <div style={hud.phoneBarTrack}><div style={{ ...hud.phoneBarFill, width: `${Math.round((amt / maxSpend) * 100)}%`, background: '#ffab40' }} /></div>
+            </div>
+          ))}
+        </div>
+
+        {/* Recent transactions */}
+        <div style={hud.phoneSection}>
+          <div style={hud.phoneSectionTitle}>RECENT</div>
+          {recent.length === 0 && <div style={{ fontSize: 12, opacity: 0.6 }}>No transactions yet.</div>}
+          {recent.map((e, i) => (
+            <div key={i} style={hud.phoneLine}>
+              <span>{CATEGORY_EMOJI[e.category] ?? '💳'} {e.label}</span>
+              <span style={{ color: e.amount < 0 ? '#ff8080' : '#7cfc00' }}>
+                {e.amount < 0 ? '-' : '+'}${Math.abs(e.amount).toFixed(2)}
+              </span>
+            </div>
+          ))}
+        </div>
+
+        {/* Achievements */}
+        <div style={hud.phoneSection}>
+          <div style={hud.phoneSectionTitle}>
+            ACHIEVEMENTS — {ACHIEVEMENTS.filter(a => isUnlocked(state, a.id)).length}/{ACHIEVEMENTS.length}
+          </div>
+          {ACHIEVEMENTS.map(a => {
+            const unlocked = isUnlocked(state, a.id);
+            return (
+              <div key={a.id} style={{ ...hud.phoneLine, opacity: unlocked ? 1 : 0.4 }}>
+                <span>{unlocked ? a.emoji : '🔒'} {a.name}</span>
+                <span style={{ fontSize: 10, opacity: 0.7, maxWidth: 150, textAlign: 'right' }}>{a.description}</span>
+              </div>
+            );
+          })}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function SummaryModal({ title, lines, onClose }: { title: string; lines: string[]; onClose: () => void }) {
+  return (
+    <div style={hud.modalBackdrop}>
+      <div style={hud.modal}>
+        <h2 style={{ marginBottom: 12 }}>{title}</h2>
+        {lines.map((l, i) => <div key={i} style={{ marginBottom: 6 }}>{l}</div>)}
+        <button style={{ ...btnStyle, marginTop: 16 }} onClick={onClose}>Continue</button>
+      </div>
+    </div>
+  );
+}
+
+/** "Make It to Friday" week recap. Every line reads a real value off the summary the store computed
+ *  at the moment of completion — nothing here is templated flavor text pretending to be data. */
+function LevelSummaryModal({ summary: sm, onClose }: { summary: LevelSummary; onClose: () => void }) {
+  const [mentorTake, setMentorTake] = useState<string | null>(null);
+  useEffect(() => {
+    let live = true;
+    setMentorTake(null);
+    askMentorWeeklyRecap({
+      startBalance: sm.startBalance, endBalance: sm.endBalance,
+      daysAttended: sm.daysAttended, daysTotal: sm.daysTotal,
+      schoolProjectDone: sm.schoolProjectDone, birthdayOutcome: sm.birthdayOutcome,
+      unexpectedOutcome: sm.unexpectedOutcome, wentToArcade: sm.wentToArcade,
+    }).then(reply => { if (live) setMentorTake(reply); });
+    return () => { live = false; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sm]);
+  const net = sm.endBalance - sm.startBalance;
+  const birthdayLine = sm.birthdayOutcome === 'full' ? "✓ Paid Riley's birthday in full"
+    : sm.birthdayOutcome === 'partial' ? '~ Paid Riley part of what you promised'
+    : "✗ Didn't come through for Riley's birthday";
+  const projectLine = sm.schoolProjectDone ? '✓ Got the school project supplies in time' : "✗ Never got the school project supplies";
+  const unexpectedLine = sm.unexpectedOutcome === 'paid' ? '⚡ Paid to top up the bus card'
+    : sm.unexpectedOutcome === 'walked' ? '⚡ Walked it off instead of paying'
+    : null;
+  return (
+    <div style={hud.modalBackdrop}>
+      <div style={{ ...hud.modal, width: 'min(400px, 92vw)' }}>
+        <h2 style={{ marginBottom: 4 }}>📅 Made It to Friday</h2>
+        <div style={{ opacity: 0.7, fontSize: 13, marginBottom: 16 }}>Here's how the week actually went.</div>
+        <div style={{ display: 'flex', justifyContent: 'space-between', background: '#0d1117', borderRadius: 8, padding: '10px 14px', marginBottom: 14 }}>
+          <div><div style={{ fontSize: 11, opacity: 0.6 }}>STARTED WITH</div><div style={{ fontSize: 18, fontWeight: 700 }}>${sm.startBalance.toFixed(2)}</div></div>
+          <div style={{ fontSize: 20, opacity: 0.5, alignSelf: 'center' }}>→</div>
+          <div><div style={{ fontSize: 11, opacity: 0.6 }}>ENDED WITH</div><div style={{ fontSize: 18, fontWeight: 700, color: net >= 0 ? '#7cfc00' : '#ff8080' }}>${sm.endBalance.toFixed(2)}</div></div>
+        </div>
+        <div style={{ marginBottom: 6 }}>🏫 School: {sm.daysAttended}/{sm.daysTotal} days attended</div>
+        <div style={{ marginBottom: 6 }}>{projectLine}</div>
+        <div style={{ marginBottom: 6 }}>{birthdayLine}</div>
+        {unexpectedLine && <div style={{ marginBottom: 6 }}>{unexpectedLine}</div>}
+        <div style={{ marginBottom: 6 }}>{sm.wentToArcade ? '🕹️ Made it to the arcade with friends' : '🕹️ Skipped the arcade this week'}</div>
+        <div style={{ marginTop: 14, padding: '10px 12px', background: '#0d1117', borderRadius: 8, borderLeft: '3px solid #60b8ff' }}>
+          <div style={{ fontSize: 11, opacity: 0.6, marginBottom: 4 }}>🧑‍🏫 KAI'S TAKE</div>
+          <div style={{ fontSize: 13, lineHeight: 1.4 }}>{mentorTake ?? 'Thinking it over…'}</div>
+        </div>
+        <button style={{ ...btnStyle, marginTop: 16 }} onClick={onClose}>Start next week</button>
+      </div>
+    </div>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// CANVAS DRAWING
+// ─────────────────────────────────────────────────────────────────────────────
+
+function draw(ctx: CanvasRenderingContext2D, cw: number, ch: number, store: GameStore, loop: GameLoop) {
+  const s = store.state;
+  ctx.imageSmoothingEnabled = false;
+  ctx.clearRect(0, 0, cw, ch);
+
+  if (s.player.scene === 'bus') {
+    drawBusRide(ctx, cw, ch, store);
+    return;
+  }
+  if (s.player.scene !== 'outdoor') {
+    drawInterior(ctx, cw, ch, store);
+    return;
+  }
+
+  const camX = loop.camera.x, camY = loop.camera.y;
+  ctx.save();
+  ctx.translate(cw / 2 - camX, ch / 2 - camY);
+
+  // Ground tiles (viewport-culled)
+  const startTx = Math.max(0, Math.floor((camX - cw / 2) / TILE_PX));
+  const endTx = Math.min(MAP_W, Math.ceil((camX + cw / 2) / TILE_PX));
+  const startTy = Math.max(0, Math.floor((camY - ch / 2) / TILE_PX));
+  const endTy = Math.min(MAP_H, Math.ceil((camY + ch / 2) / TILE_PX));
+  for (let ty = startTy; ty < endTy; ty++) {
+    for (let tx = startTx; tx < endTx; tx++) {
+      const img = getImg(groundSprite(tx, ty));
+      if (img) ctx.drawImage(img, tx * TILE_PX, ty * TILE_PX, TILE_PX, TILE_PX);
+      else { ctx.fillStyle = '#5a8a4a'; ctx.fillRect(tx * TILE_PX, ty * TILE_PX, TILE_PX, TILE_PX); }
+    }
+  }
+
+  // Buildings (backdrop — player can't walk onto their footprint except through the door gap,
+  // so a simple "buildings first, entities after" draw order is correct without needing to
+  // Y-sort buildings themselves against the player).
+  for (const p of PLACES) {
+    const x = p.tx * TILE_PX, y = p.ty * TILE_PX, w = p.tw * TILE_PX, h = p.th * TILE_PX;
+    if (p.interior === 'none') { ctx.fillStyle = 'rgba(60,120,60,0.5)'; ctx.fillRect(x, y, w, h); continue; }
+    const open = placeIsOpen(p.id, s.minutes);
+    const img = p.sprite ? getImg(p.sprite) : null;
+    if (img) {
+      if (!open) ctx.filter = 'brightness(0.6)';
+      ctx.drawImage(img, x, y, w, h);
+      ctx.filter = 'none';
+    } else {
+      // Rule-50 gap: no supplied sprite for this building — labelled placeholder, not invented art.
+      ctx.fillStyle = open ? '#7a8a6a' : '#5a5a5a';
+      ctx.fillRect(x, y, w, h);
+      ctx.font = `${Math.round(TILE_PX * 0.5)}px sans-serif`;
+      ctx.textAlign = 'center';
+      ctx.fillText(p.emoji, x + w / 2, y + h / 2 + 10);
+    }
+    ctx.font = `bold ${Math.round(TILE_PX * 0.22)}px sans-serif`;
+    ctx.textAlign = 'center';
+    ctx.fillStyle = '#fff'; ctx.strokeStyle = '#000'; ctx.lineWidth = 2;
+    ctx.strokeText(p.name, x + w / 2, y + h + TILE_PX * 0.3);
+    ctx.fillText(p.name, x + w / 2, y + h + TILE_PX * 0.3);
+  }
+
+  // This step — Part 2: a real, visible bus stop (a sign at the stop tile) rather than an invisible
+  // trigger zone the player only discovers via a HUD prompt. No new stop data — BUS_STOPS/BUS_ROUTE
+  // (world.ts, Step 16) remain the sole source of stop positions/fare/timetable; this only draws
+  // what's already there. When a bus is actually at the stop (busAtStop(), the same check the E-key
+  // boarding prompt already uses), a simple rectangle "bus" is also drawn parked at the stop so the
+  // player is never staring at an empty street while a boarding prompt claims one is available.
+  for (const stop of Object.values(BUS_STOPS)) {
+    const x = stop.tile.x * TILE_PX, y = stop.tile.y * TILE_PX;
+    const arrived = !!busAtStop(stop.id, s.minutes);
+    // sign post
+    ctx.fillStyle = '#444';
+    ctx.fillRect(x - 3, y - TILE_PX * 0.9, 6, TILE_PX * 0.9);
+    ctx.fillStyle = '#2b6cb0';
+    ctx.fillRect(x - TILE_PX * 0.32, y - TILE_PX * 1.15, TILE_PX * 0.64, TILE_PX * 0.32);
+    ctx.strokeStyle = '#fff'; ctx.lineWidth = 1.5;
+    ctx.strokeRect(x - TILE_PX * 0.32, y - TILE_PX * 1.15, TILE_PX * 0.64, TILE_PX * 0.32);
+    ctx.font = `${Math.round(TILE_PX * 0.22)}px sans-serif`;
+    ctx.textAlign = 'center';
+    ctx.fillStyle = '#fff';
+    ctx.fillText('🚏', x, y - TILE_PX * 0.9);
+    ctx.font = `bold ${Math.round(TILE_PX * 0.16)}px monospace`;
+    ctx.fillStyle = '#fff'; ctx.strokeStyle = '#000'; ctx.lineWidth = 2;
+    ctx.strokeText(stop.name, x, y + TILE_PX * 0.35);
+    ctx.fillText(stop.name, x, y + TILE_PX * 0.35);
+    if (arrived) {
+      // a plain rectangle "bus" (Rule 50: no supplied bus sprite) parked just beside the sign —
+      // present the moment busAtStop() is true, gone the moment it isn't, so the world always
+      // matches the boarding prompt's claim that a bus is here right now.
+      const bx = x + TILE_PX * 0.9, by = y - TILE_PX * 0.55;
+      ctx.fillStyle = '#e0a800';
+      ctx.fillRect(bx, by, TILE_PX * 1.6, TILE_PX * 0.8);
+      ctx.strokeStyle = '#000'; ctx.lineWidth = 2;
+      ctx.strokeRect(bx, by, TILE_PX * 1.6, TILE_PX * 0.8);
+      ctx.fillStyle = '#bde3ff';
+      for (let i = 0; i < 3; i++) ctx.fillRect(bx + 8 + i * 26, by + 8, 18, 16);
+      ctx.font = `${Math.round(TILE_PX * 0.3)}px sans-serif`;
+      ctx.textAlign = 'center';
+      ctx.fillText('🚌', bx + TILE_PX * 0.8, by + TILE_PX * 0.65);
+    }
+  }
+
+  // Phase 8: school-exterior decoration (fence line, sign, lamps) — visual only, drawn on the
+  // ground layer since these props sit outside any building footprint that already has collision.
+  for (const prop of DECOR_PROPS) {
+    const img = getImg(prop.sprite);
+    if (!img) continue;
+    const w = img.naturalWidth, h = img.naturalHeight;
+    const px = prop.tx * TILE_PX, py = prop.ty * TILE_PX;
+    const drawY = prop.anchorBottom ? py - h : py;
+    ctx.drawImage(img, px, drawY, w, h);
+  }
+
+  // Player + NPCs, Y-sorted by their base (feet) position so whoever is "lower" on screen draws
+  // on top — this is the depth-sort the master doc asks for among characters.
+  const runFrame = Math.floor((performance.now() / 90) % CHAR_RUN_FRAMES);
+  type Entity = { x: number; y: number; facing: number; moving: boolean; sheetName: string; npcId?: string };
+  const entities: Entity[] = [
+    ...(Object.values(s.npcs) as NpcRuntime[]).filter(n => n.visible).map(n => ({
+      // npc.facing is already the real per-step walking direction the store computed in stepNpcs()
+      x: n.x, y: n.y, facing: n.facing, moving: n.moving, sheetName: getNpcDef(n.id)?.sheet ?? 'alex', npcId: n.id,
+    })),
+    { x: s.player.x, y: s.player.y, facing: s.player.facing, moving: Math.hypot(s.player.vx, s.player.vy) > 4, sheetName: 'adam' },
+  ];
+  entities.sort((a, b) => a.y - b.y);
+  // Step 28 — Part 2: a subtle world-space indicator over whichever NPC the current objective
+  // targets, reusing trackedMission() (already the source of the Objective HUD/waypoint) rather
+  // than a second "who matters right now" lookup. Deliberately just a small bobbing marker + label,
+  // not a debug-style highlight, per Part 2's "should not make the game look like a debug tool".
+  const targetNpcId = trackedMission(s, store.defs)?.def.steps[trackedMission(s, store.defs)!.rt.stepIndex]?.npcId;
+  const bob = Math.sin(performance.now() / 300) * 3;
+  for (const e of entities) {
+    const dir = facingToDir(e.facing);
+    const dirIdx = DIR_ORDER.indexOf(dir);
+    const sheet = getImg(characterSheet(e.sheetName, e.moving ? 'run' : 'idle'));
+    const drawH = TILE_PX * 1.25, drawW = drawH * (CHAR_FRAME_W / CHAR_FRAME_H);
+    if (sheet) {
+      const sx = e.moving ? (dirIdx * CHAR_RUN_FRAMES + runFrame) * CHAR_FRAME_W : dirIdx * CHAR_FRAME_W;
+      ctx.drawImage(sheet, sx, 0, CHAR_FRAME_W, CHAR_FRAME_H, e.x - drawW / 2, e.y - drawH + TILE_PX * 0.15, drawW, drawH);
+    } else {
+      drawPersonFallback(ctx, e.x, e.y, TILE_PX, e.sheetName === 'adam' ? '#3a6aaa' : '#d68ac0');
+    }
+    if (e.npcId && e.npcId === targetNpcId) {
+      ctx.font = `${Math.round(TILE_PX * 0.4)}px sans-serif`;
+      ctx.textAlign = 'center';
+      ctx.fillText('📍', e.x, e.y - drawH + TILE_PX * 0.15 - 6 + bob);
+    }
+  }
+
+  ctx.restore();
+
+  // Day/night overlay (screen space, after world draw)
+  drawDayNightOverlay(ctx, s.minutes, cw, ch);
+
+  // Minimap (bottom-right)
+  drawMinimap(ctx, cw - 190, ch - 190, { size: 170, worldW: MAP_W * TILE_PX, worldH: MAP_H * TILE_PX }, s, store.defs, loop.pulseT);
+}
+
+/** Phase 7: a real explorable interior room — its own small tile grid, camera-centred (rooms are
+ *  small enough not to need scrolling), real floor sprite + collision, furniture drawn as sliced
+ *  sprites where confirmed or a labelled placeholder block where not (see world.ts INTERIORS). */
+function drawInterior(ctx: CanvasRenderingContext2D, cw: number, ch: number, store: GameStore) {
+  const s = store.state;
+  const interior = getInterior(s.player.scene);
+  if (!interior) return;
+  const T = INTERIOR_TILE_PX;
+  const roomW = interior.widthTiles * T, roomH = interior.heightTiles * T;
+  // This step: interiors used to draw at native tile size and simply center that (usually small)
+  // room on the canvas — correct at the old fixed 1280x800 canvas, but on a real fullscreen viewport
+  // (now often much larger, see the canvas-resize fix) the room looked like a small box floating in
+  // a sea of black, i.e. "not fullscreen". Scale the room up to actually fill the viewport instead of
+  // just centering it at native size — clamped to [1, 3] so a tiny window never shrinks it below
+  // native size and a huge monitor never blows it up into blurry oversized tiles. Every draw call
+  // below this point still uses plain room-local pixel coordinates (tx*T, ty*T, …) — only the
+  // translate/scale setup changes, so nothing else in this function needed to move.
+  const scale = Math.min(3, Math.max(1, Math.min((cw * 0.92) / roomW, (ch * 0.85) / roomH)));
+  const ox = Math.round((cw - roomW * scale) / 2), oy = Math.round((ch - roomH * scale) / 2);
+
+  ctx.save();
+  ctx.translate(ox, oy);
+  ctx.scale(scale, scale);
+
+  // walls (room bounding rect) + floor
+  ctx.fillStyle = interior.wallColor;
+  ctx.fillRect(-8, -8, roomW + 16, roomH + 16);
+  const floorImg = getImg(interior.floorSprite.src);
+  for (let ty = 0; ty < interior.heightTiles; ty++) {
+    for (let tx = 0; tx < interior.widthTiles; tx++) {
+      if (floorImg) {
+        const f = interior.floorSprite;
+        ctx.drawImage(floorImg, f.sx, f.sy, f.sw, f.sh, tx * T, ty * T, T, T);
+      } else { ctx.fillStyle = '#7a5a3a'; ctx.fillRect(tx * T, ty * T, T, T); }
+    }
+  }
+
+  // door markers — one per link (leave the building, or hop to another room in it)
+  for (const link of interior.links) {
+    ctx.fillStyle = link.toScene === 'outside' ? 'rgba(255,215,63,0.35)' : 'rgba(120,200,255,0.35)';
+    ctx.fillRect(link.tile.x * T - T / 2, link.tile.y * T - T / 4, T, T * 0.7);
+    ctx.font = `${Math.round(T * 0.28)}px monospace`;
+    ctx.textAlign = 'center';
+    ctx.fillStyle = '#fff'; ctx.strokeStyle = '#000'; ctx.lineWidth = 2;
+    ctx.strokeText(link.label, link.tile.x * T, link.tile.y * T - T * 0.4);
+    ctx.fillText(link.label, link.tile.x * T, link.tile.y * T - T * 0.4);
+  }
+
+  // shop products (Phase 10) — a real price tag at each product's spot on the shelf, not a menu
+  if (interior.shopItems) {
+    for (const item of interior.shopItems) {
+      const x = item.tx * T, y = item.ty * T;
+      ctx.fillStyle = 'rgba(255,255,255,0.9)';
+      ctx.strokeStyle = '#333'; ctx.lineWidth = 1;
+      const w = T * 0.62, h = T * 0.32;
+      ctx.fillRect(x - w / 2, y - h / 2, w, h);
+      ctx.strokeRect(x - w / 2, y - h / 2, w, h);
+      ctx.font = `bold ${Math.round(T * 0.16)}px monospace`;
+      ctx.textAlign = 'center';
+      ctx.fillStyle = '#222';
+      ctx.fillText(item.name, x, y - T * 0.02);
+      ctx.fillStyle = '#0a7a3a';
+      ctx.fillText(`$${item.price.toFixed(2)}`, x, y + T * 0.14);
+    }
+  }
+
+  // furniture (Y-sorted with the player below)
+  type Drawable = { y: number; draw: () => void };
+  const drawables: Drawable[] = interior.furniture.map(f => ({
+    y: (f.ty + f.th) * T,
+    draw: () => {
+      const x = f.tx * T, y = f.ty * T, w = f.tw * T, h = f.th * T;
+      if (f.sprite) {
+        const img = getImg(f.sprite.src);
+        if (img) { ctx.drawImage(img, f.sprite.sx, f.sprite.sy, f.sprite.sw, f.sprite.sh, x, y, w, h); return; }
+      }
+      // Rule-50 placeholder: not yet sliced from the furniture sheet — labelled block, no invented art.
+      ctx.fillStyle = 'rgba(120,100,80,0.55)';
+      ctx.fillRect(x + 2, y + 2, w - 4, h - 4);
+      ctx.strokeStyle = 'rgba(255,255,255,0.4)'; ctx.strokeRect(x + 2, y + 2, w - 4, h - 4);
+      ctx.font = `${Math.round(T * 0.5)}px sans-serif`;
+      ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      ctx.fillStyle = '#fff';
+      ctx.fillText(f.emoji, x + w / 2, y + h / 2);
+      ctx.textBaseline = 'alphabetic';
+    },
+  }));
+  // NPCs currently in this same building (e.g. Mum at home, Jordan/Riley in the school hallway) —
+  // previously nothing drew them indoors at all, so mission dialogue popped up with nobody on
+  // screen to have it with. Anchored near the middle of the room, offset per NPC so two people in
+  // the same room don't stack on the same tile.
+  const roomNpcs = (Object.values(s.npcs) as NpcRuntime[]).filter(n => n.place === s.player.place);
+  // Step 28 — Part 2: same target-NPC lookup as the outdoor draw() — indoors, "Find Mom" needs the
+  // same subtle marker once she's actually in view.
+  const indoorTargetNpcId = trackedMission(s, store.defs)?.def.steps[trackedMission(s, store.defs)!.rt.stepIndex]?.npcId;
+  const indoorBob = Math.sin(performance.now() / 300) * 3;
+  roomNpcs.forEach((npc, i) => {
+    const anchorX = (interior.widthTiles / 2 + (i - (roomNpcs.length - 1) / 2) * 1.4) * T;
+    const anchorY = Math.min(interior.heightTiles - 1.5, 1.4) * T;
+    drawables.push({
+      y: anchorY,
+      draw: () => {
+        const sheet = getImg(characterSheet(getNpcDef(npc.id)?.sheet ?? 'alex', 'idle'));
+        const dirIdx = DIR_ORDER.indexOf('down');
+        const drawH = T * 1.25, drawW = drawH * (CHAR_FRAME_W / CHAR_FRAME_H);
+        if (sheet) {
+          ctx.drawImage(sheet, dirIdx * CHAR_FRAME_W, 0, CHAR_FRAME_W, CHAR_FRAME_H, anchorX - drawW / 2, anchorY - drawH + T * 0.15, drawW, drawH);
+        } else {
+          drawPersonFallback(ctx, anchorX, anchorY, T, '#d68ac0');
+        }
+        ctx.font = `bold ${Math.round(T * 0.22)}px monospace`;
+        ctx.textAlign = 'center';
+        ctx.fillStyle = '#fff'; ctx.strokeStyle = '#000'; ctx.lineWidth = 2;
+        const name = getNpcDef(npc.id)?.name ?? npc.id;
+        ctx.strokeText(name, anchorX, anchorY + T * 0.3);
+        ctx.fillText(name, anchorX, anchorY + T * 0.3);
+        if (npc.id === indoorTargetNpcId) {
+          ctx.font = `${Math.round(T * 0.4)}px sans-serif`;
+          ctx.fillText('📍', anchorX, anchorY - drawH + T * 0.15 - 6 + indoorBob);
+        }
+      },
+    });
+  });
+
+  drawables.push({
+    y: s.player.y,
+    draw: () => {
+      const dir = facingToDir(s.player.facing);
+      const dirIdx = DIR_ORDER.indexOf(dir);
+      const moving = Math.hypot(s.player.vx, s.player.vy) > 4;
+      const sheet = getImg(characterSheet('adam', moving ? 'run' : 'idle'));
+      const runFrame = Math.floor((performance.now() / 90) % CHAR_RUN_FRAMES);
+      const drawH = T * 1.25, drawW = drawH * (CHAR_FRAME_W / CHAR_FRAME_H);
+      if (sheet) {
+        const sx = moving ? (dirIdx * CHAR_RUN_FRAMES + runFrame) * CHAR_FRAME_W : dirIdx * CHAR_FRAME_W;
+        ctx.drawImage(sheet, sx, 0, CHAR_FRAME_W, CHAR_FRAME_H, s.player.x - drawW / 2, s.player.y - drawH + T * 0.15, drawW, drawH);
+      } else {
+        drawPersonFallback(ctx, s.player.x, s.player.y, T, '#3a6aaa');
+      }
+    },
+  });
+  drawables.sort((a, b) => a.y - b.y);
+  for (const d of drawables) d.draw();
+
+  ctx.restore();
+
+  ctx.fillStyle = '#fff';
+  ctx.font = 'bold 14px monospace';
+  ctx.textAlign = 'center';
+  ctx.fillText(interior.name.toUpperCase(), cw / 2, oy - 16);
+}
+
+/** Phase 14: a real "riding the bus" screen — no matching bus-interior sprite was supplied in the
+ *  asset packs (Rule 50), so this is drawn as plain shapes (seat rows, a window strip, a progress
+ *  bar) rather than an instant scene-flip with nothing to look at while the clock fast-forwards. */
+function drawBusRide(ctx: CanvasRenderingContext2D, cw: number, ch: number, store: GameStore) {
+  const s = store.state;
+  const ride = s.ride;
+  ctx.fillStyle = '#1a1d24';
+  ctx.fillRect(0, 0, cw, ch);
+  if (!ride) return;
+
+  const from = stopById(ride.fromStop), to = stopById(ride.toStop);
+  const pct = Math.min(1, Math.max(0, (s.minutes - ride.startedAt) / Math.max(1, ride.endsAt - ride.startedAt)));
+  const cx = cw / 2, panelW = Math.min(560, cw - 80), panelY = ch / 2 - 140;
+
+  // window strip up top — a moving pale-sky band with silhouette "buildings" drifting past
+  ctx.fillStyle = '#7fa8c9';
+  ctx.fillRect(cx - panelW / 2, panelY, panelW, 90);
+  ctx.save();
+  ctx.beginPath(); ctx.rect(cx - panelW / 2, panelY, panelW, 90); ctx.clip();
+  ctx.fillStyle = '#4c6f8f';
+  const scroll = (performance.now() / 40) % 80;
+  for (let i = -1; i < panelW / 80 + 1; i++) {
+    const bx = cx - panelW / 2 + i * 80 - scroll;
+    ctx.fillRect(bx, panelY + 30, 46, 60);
+    ctx.fillRect(bx + 50, panelY + 50, 26, 40);
+  }
+  ctx.restore();
+  ctx.strokeStyle = '#0d0f13'; ctx.lineWidth = 4;
+  ctx.strokeRect(cx - panelW / 2, panelY, panelW, 90);
+
+  // a couple of seat-back rows below the window, just enough to read as "inside a bus"
+  ctx.fillStyle = '#3a4a63';
+  for (const row of [0, 1]) {
+    for (const side of [-1, 1]) {
+      const sx = cx + side * panelW * 0.28 - 22;
+      ctx.fillRect(sx, panelY + 110 + row * 46, 44, 34);
+    }
+  }
+
+  ctx.textAlign = 'center';
+  ctx.fillStyle = '#fff';
+  ctx.font = 'bold 18px monospace';
+  ctx.fillText(`${BUS_ROUTE.name}`, cx, panelY - 34);
+  ctx.font = '14px monospace';
+  ctx.fillStyle = '#cfd8e3';
+  ctx.fillText(`${from.name} → ${to.name}`, cx, panelY - 12);
+
+  // progress bar with the two stop names anchored at each end
+  const barY = panelY + 220, barW = panelW;
+  ctx.fillStyle = '#2b2f3a';
+  ctx.fillRect(cx - barW / 2, barY, barW, 10);
+  ctx.fillStyle = '#3fb950';
+  ctx.fillRect(cx - barW / 2, barY, barW * pct, 10);
+  ctx.beginPath(); ctx.arc(cx - barW / 2 + barW * pct, barY + 5, 7, 0, Math.PI * 2); ctx.fill();
+  ctx.font = '12px monospace';
+  ctx.fillStyle = '#9aa4b2';
+  ctx.textAlign = 'left'; ctx.fillText(from.name, cx - barW / 2, barY + 26);
+  ctx.textAlign = 'right'; ctx.fillText(to.name, cx + barW / 2, barY + 26);
+
+  const remaining = Math.max(0, Math.ceil(ride.endsAt - s.minutes));
+  ctx.textAlign = 'center';
+  ctx.fillStyle = '#ffd23f';
+  ctx.font = 'bold 15px monospace';
+  ctx.fillText(`Arriving in ${remaining} min`, cx, barY + 52);
+  ctx.fillStyle = '#7cfc00';
+  ctx.font = '12px monospace';
+  ctx.fillText(ride.fare > 0 ? `Fare paid: $${ride.fare.toFixed(2)}` : 'Riding on your bus pass', cx, barY + 72);
+}
+
+const hud: Record<string, React.CSSProperties> = {
+  bar: {
+    position: 'absolute', top: 0, left: 0, right: 0, minHeight: 38, background: 'rgba(0,0,0,0.75)',
+    display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 8, rowGap: 4, padding: '4px 10px', color: '#fff',
+    fontFamily: 'monospace', fontSize: 13, zIndex: 10,
+  },
+  btnGroup: { marginLeft: 'auto', display: 'flex', flexWrap: 'wrap', gap: 6 },
+  smallBtn: { background: '#222', color: '#fff', border: '1px solid #444', borderRadius: 4, padding: '4px 8px', cursor: 'pointer', fontSize: 12 },
+  waypoint: { position: 'absolute', top: 44, left: 12, color: '#ffd23f', fontFamily: 'monospace', fontSize: 13, textShadow: '0 1px 2px #000', zIndex: 10 },
+  // Step 26: compact "what should I care about right now?" card — deliberately small (no border/
+  // background box beyond a soft shadow) so it reads as part of the game HUD, not a debug panel.
+  objective: {
+    position: 'absolute', top: 44, left: 12, zIndex: 10, fontFamily: 'monospace',
+    textShadow: '0 1px 2px #000', maxWidth: 220,
+  },
+  objectiveLabel: { fontSize: 11, color: '#ffd23f', letterSpacing: 0.5, opacity: 0.9 },
+  objectiveName: { fontSize: 14, color: '#fff', fontWeight: 700, marginTop: 1 },
+  objectiveLocation: { fontSize: 12, color: '#ffd23f', marginTop: 1 },
+  relationships: {
+    position: 'absolute', top: 48, right: 12, width: 'min(200px, 60vw)',
+    background: 'rgba(10,10,20,0.92)', border: '1px solid #444', borderRadius: 10, padding: 12,
+    color: '#fff', fontFamily: 'monospace', zIndex: 20,
+  },
+  exitHint: { position: 'absolute', bottom: 12, left: 12, color: '#fff', fontFamily: 'monospace', fontSize: 12, background: 'rgba(0,0,0,0.6)', padding: '6px 10px', borderRadius: 6, zIndex: 10 },
+  buyPrompt: { position: 'absolute', bottom: 12, left: '50%', transform: 'translateX(-50%)', color: '#ffd700', fontFamily: 'monospace', fontSize: 13, background: 'rgba(0,0,0,0.75)', padding: '8px 14px', borderRadius: 8, zIndex: 10 },
+  sleepBtn: { position: 'absolute', bottom: 12, left: 12, ...btnStyle, width: 'auto', padding: '8px 14px', zIndex: 10 },
+  dialogue: {
+    position: 'absolute', bottom: 16, left: '50%', transform: 'translateX(-50%)', width: 'min(480px, 92vw)',
+    background: 'rgba(10,10,20,0.92)', border: '1px solid #444', borderRadius: 10, padding: 16,
+    color: '#fff', fontFamily: 'monospace', fontSize: 13, zIndex: 20,
+  },
+  choiceBtn: { textAlign: 'left', background: '#1c2440', border: '1px solid #3a4a7a', borderRadius: 6, color: '#fff', padding: '8px 10px', cursor: 'pointer' },
+  choiceBtnDisabled: { opacity: 0.45, cursor: 'not-allowed' },
+  journal: {
+    position: 'absolute', top: 48, right: 12, width: 'min(280px, 90vw)', maxHeight: '60vh', overflowY: 'auto',
+    background: 'rgba(10,10,20,0.92)', border: '1px solid #444', borderRadius: 10, padding: 14,
+    color: '#fff', fontFamily: 'monospace', zIndex: 20,
+  },
+  shoppingList: {
+    position: 'absolute', top: 48, left: 12, width: 'min(200px, 55vw)',
+    background: 'rgba(10,10,20,0.92)', border: '1px solid #444', borderRadius: 10, padding: 12,
+    color: '#fff', fontFamily: 'monospace', zIndex: 15,
+  },
+  dpad: {
+    position: 'absolute', left: 16, bottom: 16, display: 'flex', flexDirection: 'column', gap: 4,
+    zIndex: 25, touchAction: 'none', userSelect: 'none',
+  },
+  dpadRow: { display: 'flex', gap: 4 },
+  dpadSpacer: { width: 52, height: 52 },
+  dpadBtn: {
+    width: 52, height: 52, borderRadius: 10, background: 'rgba(255,255,255,0.18)', border: '1px solid rgba(255,255,255,0.35)',
+    color: '#fff', fontSize: 20, touchAction: 'none', userSelect: 'none', WebkitUserSelect: 'none',
+  },
+  interactBtn: {
+    position: 'absolute', right: 20, bottom: 30, width: 74, height: 74, borderRadius: '50%',
+    background: 'rgba(63,185,80,0.75)', border: '2px solid rgba(255,255,255,0.5)', color: '#fff',
+    fontFamily: 'monospace', fontWeight: 700, fontSize: 14, zIndex: 25, touchAction: 'none', userSelect: 'none',
+  },
+  exitBtn: {
+    position: 'absolute', right: 20, bottom: 116, width: 60, height: 40, borderRadius: 8,
+    background: 'rgba(200,60,60,0.8)', border: '1px solid rgba(255,255,255,0.5)', color: '#fff',
+    fontFamily: 'monospace', fontWeight: 700, fontSize: 11, zIndex: 25, touchAction: 'none', userSelect: 'none',
+  },
+  modalBackdrop: { position: 'absolute', inset: 0, background: 'rgba(0,0,0,0.7)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 30 },
+  modal: { width: 'min(360px, 92vw)', maxHeight: '85vh', overflowY: 'auto', background: '#161b22', border: '1px solid #30363d', borderRadius: 10, padding: 24, color: '#fff', fontFamily: 'monospace' },
+  phone: {
+    width: 'min(320px, 92vw)', maxHeight: '85vh', overflowY: 'auto', background: '#14161c',
+    border: '3px solid #2a2d36', borderRadius: 22, padding: 18,
+    color: '#fff', fontFamily: 'monospace', boxShadow: '0 10px 40px rgba(0,0,0,0.6)',
+  },
+  phoneBalance: { textAlign: 'center', background: '#1c1f27', borderRadius: 12, padding: '12px 8px', marginBottom: 12 },
+  phoneStat: { flex: 1, background: '#1c1f27', borderRadius: 8, padding: '6px 8px', textAlign: 'center' },
+  phoneSection: { background: '#1a1c23', borderRadius: 10, padding: '10px 12px', marginBottom: 10 },
+  phoneSectionTitle: { fontSize: 11, opacity: 0.6, marginBottom: 6, letterSpacing: 0.5 },
+  phoneLine: { display: 'flex', justifyContent: 'space-between', fontSize: 12, marginBottom: 5, gap: 8 },
+  phoneBarTrack: { height: 6, background: '#2a2d36', borderRadius: 4, overflow: 'hidden' },
+  phoneBarFill: { height: '100%', background: '#3fb950', borderRadius: 4 },
+  achievementToast: {
+    position: 'absolute', top: 48, left: '50%', transform: 'translateX(-50%)',
+    display: 'flex', alignItems: 'center', gap: 10,
+    background: 'rgba(20,16,30,0.95)', border: '1px solid #ffd23f', borderRadius: 10,
+    padding: '8px 16px', color: '#fff', fontFamily: 'monospace', zIndex: 40,
+    boxShadow: '0 4px 20px rgba(255,210,63,0.25)',
+  },
+  // Step 26: same shape as achievementToast, positioned lower so the (rare) case of both firing at
+  // once stacks rather than overlaps. Non-blocking overlay — it never intercepts input or pauses
+  // the game, and self-dismisses via the same setTimeout pattern.
+  missionToast: {
+    position: 'absolute', top: 96, left: '50%', transform: 'translateX(-50%)',
+    display: 'flex', alignItems: 'center', gap: 10,
+    background: 'rgba(20,16,30,0.95)', border: '1px solid #7cc7ff', borderRadius: 10,
+    padding: '8px 16px', color: '#fff', fontFamily: 'monospace', zIndex: 40,
+    boxShadow: '0 4px 20px rgba(124,199,255,0.25)',
+  },
+  // Step 27: a third toast slot, stacked below the other two so all three can never overlap even
+  // in the (very rare) case they all fire close together.
+  activityToast: {
+    position: 'absolute', top: 144, left: '50%', transform: 'translateX(-50%)',
+    display: 'flex', alignItems: 'center', gap: 10,
+    background: 'rgba(20,16,30,0.95)', border: '1px solid #7cfc00', borderRadius: 10,
+    padding: '8px 16px', color: '#fff', fontFamily: 'monospace', zIndex: 40,
+    boxShadow: '0 4px 20px rgba(124,252,0,0.2)',
+  },
+  // Step 27 — the reusable short activity sequence overlay (Help Parents today; any future
+  // Level 1-2 activity per the Step 27 audit can reuse this same box+progress-bar shape).
+  // Deliberately small and non-blocking-looking (no full-screen backdrop) — an overlay, not a modal.
+  activitySequence: {
+    position: 'absolute', top: '38%', left: '50%', transform: 'translate(-50%, -50%)',
+    width: 200, textAlign: 'center', background: 'rgba(10,10,20,0.9)', border: '1px solid #444',
+    borderRadius: 10, padding: '14px 16px', color: '#fff', fontFamily: 'monospace', zIndex: 35,
+  },
+  activityBarTrack: { height: 8, background: '#2a2d36', borderRadius: 4, overflow: 'hidden' },
+  activityBarFill: { height: '100%', background: '#7cfc00', borderRadius: 4, transition: 'width 60ms linear' },
+  // Step 27 — the "you are travelling" bus-ride banner (see the bus-experience audit).
+  busRideBanner: {
+    position: 'absolute', bottom: 12, left: '50%', transform: 'translateX(-50%)',
+    color: '#cbe8ff', fontFamily: 'monospace', fontSize: 13, background: 'rgba(0,0,40,0.7)',
+    padding: '6px 14px', borderRadius: 8, zIndex: 10,
+  },
+};
