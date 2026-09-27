@@ -209,18 +209,7 @@ function roundRect(ctx: CanvasRenderingContext2D, x: number, y: number, w: numbe
 }
 
 // ── Waypoint distance/direction readout (subtle, non-GPS) ───────────────
-export function waypointReadout(state: GameState, defs: MissionDef[]): { label: string; metres: number; arrow: string } | null {
-  const tracked = trackedMission(state, defs);
-  if (!tracked) return null;
-  const place = getPlace(tracked.placeId);
-  const d = doorTile(tracked.placeId);
-  const dx = d.x * TILE_PX - state.player.x, dy = d.y * TILE_PX - state.player.y;
-  const metres = Math.round(Math.hypot(dx, dy) / TILE_PX * 8 / 10) * 10;
-  const angle = Math.atan2(dy, dx);
-  const arrows = ['→', '↘', '↓', '↙', '←', '↖', '↑', '↗'];
-  const arrow = arrows[Math.round(((angle + Math.PI * 2) % (Math.PI * 2)) / (Math.PI / 4)) % 8];
-  return { label: place?.name ?? tracked.placeId, metres, arrow };
-}
+export { waypointReadout } from './waypoint';
 
 // ── HUD strings ───────────────────────────────────────────────────────────
 export const hudTime = (minutes: number) => ({ day: formatDay(minutes), time: formatTime(minutes) });

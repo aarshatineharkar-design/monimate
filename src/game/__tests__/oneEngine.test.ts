@@ -124,8 +124,8 @@ test('Save upgrade: a version-2 save loads, keeping money, savings, history and 
   assert.equal(migrateSave({ version: 1 }), null);
 });
 
-test('Life paths: only School is playable; the others are marked Coming soon', () => {
-  assert.deepEqual(LIFE_PATHS.filter(p => p.available).map(p => p.id), ['school']);
+test('Life paths: School and University are playable; the rest are marked Coming soon', () => {
+  assert.deepEqual(LIFE_PATHS.filter(p => p.available).map(p => p.id), ['school', 'university']);
 });
 
 test('Save upgrade: a mission saved on a step that no longer exists is clamped so it can still finish', () => {

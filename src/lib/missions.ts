@@ -9,6 +9,10 @@
 import { MIN_PER_DAY, at, hm, parts } from './clock';
 import type { GameEvent, GameState, MissionKind, MissionRuntime } from './types';
 import type { TransactionCategory } from '../game/types/transaction';
+import { DAILY_MISSIONS } from './dailyMissions';
+import { UNI_MISSIONS, UNI_DAILY } from './content/university';
+import { markKey, hasMark, attendedToday, doneThisWeek, resolvedThisWeek } from './missionUtil';
+export { markKey, hasMark };
 
 // ── Definition types ───────────────────────────────────────────────────────
 export type Trigger =
@@ -38,6 +42,15 @@ export interface MissionChoice {
   flags?: string[];
   social?: boolean;
   finish?: boolean;        // resolves the mission
+  /** Picks this week's goal (see WEEK_GOALS in gameData.ts). */
+  setsGoal?: string;
+  /** A special world effect this choice has (bus pass, subscription…), applied by GameStore. */
+  effect?: 'bus_pass_week' | 'subscribe_streambox' | 'no_packed_lunch_today' | 'save_5_matched'
+    | 'student_loan_draw' | 'subscribe_sky' | 'bnpl_headphones';
+  /** Hide this option when it doesn't make sense right now (e.g. packed lunch when you have none). */
+  hideIf?: (s: GameState) => boolean;
+  /** Energy this choice gives back (food, rest). */
+  energyRestore?: number;
   /** Step 22: optional Energy consumed via GameStore.consumeEnergy() when this choice is applied.
    *  Hand-authored per choice — never derived from cost/minutes/text/mission type. Omitted or 0 means
    *  no Energy effect. Non-blocking: consumeEnergy()'s own clamp-at-0 semantics apply, so a choice
@@ -71,6 +84,9 @@ export interface MissionStep {
   awaitsPurchase?: boolean;
   purchaseNeeds?: string[];
   purchaseBudget?: number;
+  /** Alternative versions of this step. One is picked per day (seeded), so the same mission
+   *  reads and costs differently on different days. Each variant replaces lines/choices/speaker. */
+  variants?: { speaker?: string; npcId?: string; lines: string[]; choices?: MissionChoice[] }[];
 }
 
 export interface MissionDef {
@@ -89,28 +105,41 @@ export interface MissionDef {
   requires?: (s: GameState) => boolean;
   steps: MissionStep[];
   rewards: { xp: number; money?: number; message: string; flag?: string };
-  /** what happens if it expires or is failed */
-  onExpire?: { message: string; flags?: string[]; relationship?: { npc: string; delta: number } };
+  /** what happens if it expires or is failed. `fine` is charged (or owed) when it expires. */
+  onExpire?: { message: string; flags?: string[]; relationship?: { npc: string; delta: number }; fine?: number };
+  /** Daily-pool missions only happen on days the pool picks them (see DAILY_POOLS in dailyMissions.ts). */
+  pool?: 'morning' | 'after_school' | 'evening' | 'weekend';
+}
+
+/** Is this mission on today's menu? Always true for scripted missions; pool missions only on days
+ *  the daily roll picked them. */
+export function offeredToday(s: GameState, def: MissionDef): boolean {
+  return !def.pool || hasMark(s, `pool:${def.id}`);
 }
 
 const WK = [0, 1, 2, 3, 4];
 
-const attendedToday = (s: GameState) => hasMark(s, 'at_school');
-/** THIS WEEK's completion — unlike a flag in world.flags (which never clears), a mission's own
- *  runtime resets to 'locked' every Monday (see missionsOnDayStart), so this correctly re-gates
- *  each step of a weekly chain instead of staying permanently unlocked after its first-ever week. */
-const doneThisWeek = (s: GameState, id: string) => s.missions.find(m => m.id === id)?.state === 'completed';
-/** Completed OR missed this week. Story beats later in the week wait on this, never on
- *  `doneThisWeek`, so one missed moment can't soft-lock the rest of the week (the consequence of
- *  missing it lives in flags/relationships instead). */
-const resolvedThisWeek = (s: GameState, id: string) => {
-  const st = s.missions.find(m => m.id === id)?.state;
-  return st === 'completed' || st === 'expired';
-};
 /** Rode a bus at least once this week (today or an earlier day). */
 const rodeBusThisWeek = (s: GameState) => s.today.travel.includes('bus') || s.weekDays.some(d => d.travel.includes('bus'));
-export const markKey = (name: string, day: number) => `${name}:${day}`;
-export const hasMark = (s: GameState, name: string, day = parts(s.minutes).day) => s.world.dailyMarks.includes(markKey(name, day));
+
+function homeworkChoices(study: string, free: string): MissionChoice[] {
+  return [
+    { id: 'study', label: study, sublabel: 'About 1 hour', cost: 0, minutes: 60, energyCost: 5, consequence: 'Done. You feel ready for tomorrow.', flags: ['did_homework'], finish: true },
+    { id: 'free', label: free, sublabel: 'Homework can wait', cost: 0, minutes: 60, energyRestore: 5, consequence: 'Fun, but the homework is still there.', finish: true },
+  ];
+}
+
+/** The four lunch options every lunch variant offers, with that day's menu and prices. */
+function lunchChoices(menu: { meal: [string, number, number]; snack: [string, number, number, boolean?] }): MissionChoice[] {
+  const [mLabel, mCost, mEnergy] = menu.meal, [sLabel, sCost, sEnergy, sSocial] = menu.snack;
+  return [
+    { id: 'meal', label: `${mLabel} ($${mCost.toFixed(2).replace('.00', '')})`, sublabel: `With friends · +${mEnergy} energy`, category: 'food', cost: -mCost, minutes: 30, energyRestore: mEnergy, relationship: 1, social: true, consequence: 'Lunch with friends. Good fun.', lesson: `$${mCost.toFixed(2)} a day is $${(mCost * 5).toFixed(2)} a week.`, flags: ['bought_canteen'], finish: true },
+    { id: 'snack', label: `${sLabel} ($${sCost.toFixed(2).replace('.00', '')})`, sublabel: `+${sEnergy} energy`, category: 'food', cost: -sCost, minutes: 30, energyRestore: sEnergy, social: !!sSocial, relationship: sSocial ? 1 : 0, consequence: 'Cheaper, still tasty.', flags: ['bought_snack'], finish: true },
+    { id: 'packed', label: '🥪 Eat what I brought', sublabel: 'Free — you planned ahead · +12 energy', cost: 0, minutes: 30, energyRestore: 12, consequence: 'Packed lunch. Nobody minds.', lesson: 'Bringing lunch can save $15–35 a week.', flags: ['ate_home_lunch'], finish: true,
+      hideIf: s => hasMark(s, 'no_packed_lunch') },
+    { id: 'skip', label: '❌ Skip lunch', sublabel: 'Save the money · -10 energy', cost: 0, minutes: 10, energyCost: 10, relationship: -1, consequence: "You save the cash, but by 2pm you can't focus.", lesson: "Skipping meals to save money isn't always worth it.", flags: ['skipped_lunch'], finish: true },
+  ];
+}
 
 // ── School-student week ────────────────────────────────────────────────────
 export const SCHOOL_MISSIONS: MissionDef[] = [
@@ -118,7 +147,7 @@ export const SCHOOL_MISSIONS: MissionDef[] = [
     // MISSION 1 of "Make It to Friday" — the week's whole budget is handed over right here, on
     // screen, so the player knows exactly what they're working with before anything else happens.
     id: 'pocket_money', kind: 'main', priority: 200, name: 'Make It to Friday', emoji: '🌅',
-    journalText: "Mum has sent your $35 for the week — it has to last until Friday. You already promised Riley $5 for her birthday.",
+    journalText: "Mum has sent your $20 for the week. Saturday is the school fair ($10 a ticket), and you promised Riley $5 for her birthday.",
     storySetup: "It's Monday morning. Your phone buzzes on the bedside table.",
     paths: ['school'], repeat: 'weekly',
     // A phone message, not a face-to-face talk: it arrives the moment the week starts and waits for
@@ -128,13 +157,35 @@ export const SCHOOL_MISSIONS: MissionDef[] = [
     steps: [{
       id: 's1', place: 'home', waypoint: 'Check your phone', speaker: 'Mum', npcId: 'mum', remote: true,
       lines: [
-        "Morning! I've sent you $35 — it needs to last you until Friday.",
-        "You're covering your own bus fares and lunches this week, and Ms Patel mentioned a project needing supplies.",
-        "Oh — and don't forget, you told Riley you'd chip in $5 for her birthday.",
+        "Morning! I've sent you $20 pocket money for the week.",
+        "It covers your bus fares and lunches. Ms Patel mentioned a project needing supplies, too.",
+        "Saturday's the school fair — tickets are $10. And don't forget you promised Riley $5 for her birthday.",
+        "If you want extra, I always need help around the house.",
       ],
-      choices: [{ id: 'take', label: '💵 Thanks Mum! (+$35)', sublabel: 'Five days, a project and a birthday to plan around', cost: 35, minutes: 1, relationship: 1, consequence: 'The $35 lands in your account.', flags: ['got_pocket_money', 'week_started'], finish: true }],
+      choices: [{ id: 'take', label: '💵 Thanks Mum! (+$20)', sublabel: 'A project, a birthday and a fair to plan around', category: 'income', cost: 20, minutes: 1, relationship: 1, consequence: 'The $20 lands in your account.', flags: ['got_pocket_money', 'week_started'], finish: true }],
     }],
     rewards: { xp: 20, message: 'Pocket money in hand. The week begins — make it to Friday.', flag: 'pocket_money_done' },
+  },
+  {
+    // Blueprint section 24: the player chooses what "a good week" means. The Sunday recap judges it.
+    id: 'pick_goal', kind: 'main', priority: 199, name: "This Week's Goal", emoji: '🎯',
+    journalText: 'Pick one goal for the week. Sunday night, Mum asks how it went.',
+    storySetup: 'Your phone asks what you want out of this week.',
+    paths: ['school'], repeat: 'weekly',
+    window: { days: [0], from: hm(7), until: hm(23, 59) },
+    trigger: { type: 'time' },
+    requires: s => doneThisWeek(s, 'pocket_money'),
+    steps: [{
+      id: 's1', place: 'home', waypoint: 'Pick a goal', speaker: 'Goals', remote: true,
+      lines: ['$20 has to cover the whole week.', 'What matters most to you this week?'],
+      choices: [
+        { id: 'save_event', label: '🎟️ Go to the school fair', sublabel: 'Have $10 for a ticket on Saturday', cost: 0, minutes: 0, setsGoal: 'save_event', consequence: 'Goal set: the fair. $10 by Saturday.', finish: true },
+        { id: 'arcade', label: '🕹️ Hit the arcade with Jordan', sublabel: "Thursday's arcade run costs $8", cost: 0, minutes: 0, setsGoal: 'arcade', consequence: 'Goal set: the arcade on Thursday.', finish: true },
+        { id: 'buy_headphones', label: '🎧 Buy the $15 headphones', sublabel: 'They are at the Mall', cost: 0, minutes: 0, setsGoal: 'buy_headphones', consequence: 'Goal set: headphones from the Mall.', finish: true },
+        { id: 'friends', label: '🤝 Be there for your friends', sublabel: "Don't let Jordan or Riley down", cost: 0, minutes: 0, setsGoal: 'friends', consequence: 'Goal set: keep your friendships strong.', finish: true },
+      ],
+    }],
+    rewards: { xp: 10, message: 'Goal set.' },
   },
   {
     // MISSION 2 — locked (via `requires`) until pocket_money is actually done on Monday, so the
@@ -167,11 +218,19 @@ export const SCHOOL_MISSIONS: MissionDef[] = [
     steps: [{
       id: 's1', place: 'university', waypoint: 'Canteen', speaker: 'Jordan', npcId: 'jordan',
       lines: ['Oi, come get lunch with me!', "I'm getting chips and a drink. You in?"],
-      choices: [
-        { id: 'meal', label: '🍟 Chips & drink ($6)', sublabel: 'Go with Jordan', category: 'food', cost: -6, minutes: 30, relationship: 1, social: true, consequence: 'You and Jordan grab lunch together. Good fun.', lesson: 'Canteen meals add up — $6 a day is $30 a week.', flags: ['bought_canteen'], finish: true },
-        { id: 'snack', label: '🍎 Just a snack ($3)', sublabel: 'Small bite, save some', category: 'food', cost: -3, minutes: 30, consequence: "A snack bar. Jordan doesn't mind — you still chat.", flags: ['bought_snack'], finish: true },
-        { id: 'packed', label: '🥪 Eat what I brought', sublabel: 'Free — you planned ahead', cost: 0, minutes: 30, relationship: -1, consequence: 'Packed lunch. Jordan teases you, all good.', lesson: 'Bringing lunch can save $30+ a week.', flags: ['ate_home_lunch'], finish: true },
-        { id: 'skip', label: '❌ Skip lunch', sublabel: 'Save the money', cost: 0, minutes: 10, relationship: -1, consequence: "You save the cash, but by 2pm you can't focus.", lesson: "Skipping meals to save money isn't always worth it.", flags: ['skipped_lunch'], finish: true },
+      choices: lunchChoices({ meal: ['🍟 Chips & drink', 6, 15], snack: ['🍎 Just a snack', 3, 8] }),
+      // A different menu (and price) each day — the same "buy vs bring" decision never costs the same twice.
+      variants: [
+        { speaker: 'Jordan', npcId: 'jordan', lines: ['Oi, come get lunch with me!', "I'm getting chips and a drink. You in?"],
+          choices: lunchChoices({ meal: ['🍟 Chips & drink', 6, 15], snack: ['🍎 Just a snack', 3, 8] }) },
+        { speaker: 'Riley', npcId: 'riley', lines: ["It's taco day!! They're $5.", 'Or there are fruit cups for $2.50.'],
+          choices: lunchChoices({ meal: ['🌮 Tacos', 5, 15], snack: ['🍉 Fruit cup', 2.5, 8] }) },
+        { speaker: 'Jordan', npcId: 'jordan', lines: ['PIZZA DAY. Slices are $3.50.', "Or we get a whole one with Riley — $5 each, it's huge."],
+          choices: lunchChoices({ meal: ['🍕 A slice', 3.5, 12], snack: ['🍕 Share a whole pizza', 5, 20, true] }) },
+        { speaker: 'Riley', npcId: 'riley', lines: ['The sushi van is here! Rolls are $7…', 'Pricey. Miso soup is $2 though.'],
+          choices: lunchChoices({ meal: ['🍣 Sushi roll', 7, 15], snack: ['🍜 Miso soup', 2, 6] }) },
+        { speaker: 'Ms Patel', npcId: 'teacher', lines: ['The Year 13 bake sale is on: muffins are $2.', 'All money goes to the camp fund.'],
+          choices: lunchChoices({ meal: ['🍔 Canteen burger', 6, 15], snack: ['🧁 Bake sale muffin', 2, 8] }) },
       ],
     }],
     rewards: { xp: 15, message: "Lunch sorted. How's the budget looking?" },
@@ -187,7 +246,7 @@ export const SCHOOL_MISSIONS: MissionDef[] = [
       id: 's1', place: 'park', waypoint: 'Food truck', speaker: 'Riley', npcId: 'riley',
       lines: ['Hey! That noodle truck smells amazing.', "I've got $5. Noodle cups are $4."],
       choices: [
-        { id: 'noodles', label: '🍜 Noodles ($4)', sublabel: 'Sounds good', category: 'food', cost: -4, minutes: 20, relationship: 1, social: true, consequence: 'You and Riley eat noodles on the walk home.', flags: ['bought_stall'], finish: true },
+        { id: 'noodles', label: '🍜 Noodles ($4)', sublabel: 'Sounds good · +8 energy', category: 'food', cost: -4, minutes: 20, energyRestore: 8, relationship: 1, social: true, consequence: 'You and Riley eat noodles on the walk home.', flags: ['bought_stall'], finish: true },
         { id: 'decline', label: '👋 Decline — I\'m good', sublabel: 'Save your money', cost: 0, minutes: 2, consequence: 'You head home. Riley waves.', lesson: 'Saying no to impulse food is the easiest way to save.', finish: true },
         { id: 'home', label: '🏠 Suggest food at home', sublabel: 'Free and better', cost: 0, minutes: 10, relationship: 1, social: true, consequence: 'Riley loves the idea. Toast at yours. Easy win.', lesson: 'Suggesting a free alternative saves money without hurting friendships.', finish: true },
       ],
@@ -276,6 +335,12 @@ export const SCHOOL_MISSIONS: MissionDef[] = [
         { id: 'study', label: '📚 Do homework', sublabel: 'About 1 hour', cost: 0, minutes: 60, consequence: 'Homework finished. You feel ready for tomorrow.', flags: ['did_homework'], finish: true },
         { id: 'free', label: '🎮 Free time', sublabel: 'Homework can wait', cost: 0, minutes: 60, consequence: 'Fun, but the homework is still there.', finish: true },
       ],
+      variants: [
+        { lines: ['Maths worksheet due tomorrow. Ugh.'], choices: homeworkChoices('📐 Do the worksheet', '🎮 Game with Jordan online') },
+        { lines: ['Science: label a diagram of the water cycle.'], choices: homeworkChoices('🔬 Do the diagram', '📺 Watch videos instead') },
+        { lines: ['Reading log: 20 pages of your novel.'], choices: homeworkChoices('📖 Read 20 pages', '📱 Scroll your phone') },
+        { lines: ['No homework tonight! A free evening.'], choices: [{ id: 'free', label: '😌 Relax', sublabel: '+10 energy', cost: 0, minutes: 60, energyRestore: 10, consequence: 'A calm evening. You feel recharged.', finish: true }] },
+      ],
     }],
     rewards: { xp: 10, message: 'Evening sorted.' },
   },
@@ -321,7 +386,7 @@ export const SCHOOL_MISSIONS: MissionDef[] = [
       lines: ['Arcade run after school — you in?', 'Tokens are about $8. Riley and Sam are already coming.'],
       choices: [
         { id: 'arcade', label: '🕹️ Go all in ($8, 2 hrs)', sublabel: 'Full arcade session', category: 'entertainment', cost: -8, minutes: 120, relationship: 2, social: true, consequence: 'Great afternoon. You feel part of the crew.', flags: ['arcade_visit'], finish: true, energyCost: 8 },
-        { id: 'spend_less', label: '🪙 Go, but spend less ($5, 1.5 hrs)', sublabel: 'A couple of games, then watch', category: 'entertainment', cost: -5, minutes: 90, relationship: 1, social: true, consequence: 'You play a bit, then hang out. Still fun, still $3 saved.', finish: true, energyCost: 5 },
+        { id: 'spend_less', label: '🪙 Go, but spend less ($5, 1.5 hrs)', sublabel: 'A couple of games, then watch', category: 'entertainment', cost: -5, minutes: 90, relationship: 1, social: true, consequence: 'You play a bit, then hang out. Still fun, still $3 saved.', flags: ['arcade_visit'], finish: true, energyCost: 5 },
         { id: 'park', label: '🌳 Suggest the park instead', sublabel: 'Free alternative', cost: 0, minutes: 90, relationship: 1, social: true, consequence: 'Everyone agrees. A genuinely great time, for free.', lesson: 'Free activities can be just as fun — suggesting them is its own skill.', flags: ['park_alternative'], finish: true, energyCost: 5 },
         { id: 'home', label: '🏠 Head home', sublabel: 'Keep the whole $8', cost: 0, minutes: 5, relationship: -1, consequence: 'Jordan sends a "next time?" text.', finish: true },
       ],
@@ -352,28 +417,187 @@ export const SCHOOL_MISSIONS: MissionDef[] = [
     rewards: { xp: 15, message: 'That could have gone worse.', flag: 'unexpected_handled' },
   },
   {
+    // Blueprint Thursday: "opportunity to earn". It lands on the same afternoon as Jordan's arcade
+    // run on purpose — two good things, one afternoon (opportunity cost, felt rather than taught).
+    id: 'dairy_shift', kind: 'side', priority: 70, name: 'Shift at the Dairy', emoji: '📦',
+    journalText: 'Mr Lee will pay $8 to help stock shelves at the Dairy, 4–6 PM Thursday.',
+    storySetup: 'Mr Lee from the Dairy texts you after school.',
+    destination: 'dairy', paths: ['school'], repeat: 'weekly',
+    window: { days: [3], from: hm(15, 40), until: hm(17, 30) },
+    trigger: { type: 'time' },
+    steps: [
+      {
+        id: 's1', place: 'dairy', waypoint: 'Reply to Mr Lee', speaker: 'Mr Lee', npcId: 'shopkeeper', remote: true,
+        lines: ['Hi! Delivery day. Can you help stock shelves till 6? I pay $8.'],
+        choices: [
+          { id: 'accept', label: "👍 I'll come by", sublabel: 'Head to the Dairy before 5:30', cost: 0, minutes: 1, consequence: 'Mr Lee sends a thumbs up.' },
+          { id: 'decline', label: '🙅 Busy today', sublabel: 'Keep the afternoon free', cost: 0, minutes: 1, consequence: 'Mr Lee: "No worries, next time!"', flags: ['dairy_shift_declined'], finish: true },
+        ],
+      },
+      {
+        id: 's2', place: 'dairy', waypoint: 'Dairy', speaker: 'Mr Lee', npcId: 'shopkeeper',
+        lines: ['Great timing — the boxes are out back.'],
+        choices: [
+          { id: 'work', label: '📦 Stock the shelves (+$8)', sublabel: '1.5 hours · 15 energy', category: 'income', cost: 8, minutes: 90, energyCost: 15, consequence: 'Hard work, but Mr Lee hands you $8 cash.', flags: ['dairy_shift_done'], finish: true },
+        ],
+      },
+    ],
+    rewards: { xp: 25, message: 'Earned $8 at the Dairy.' },
+  },
+  {
+    // Walkers get their own Thursday surprise (bus riders get the bus-card one): a split shoe.
+    id: 'unexpected_shoe', kind: 'main', priority: 150, name: 'Unexpected Expense', emoji: '👟',
+    journalText: 'Your shoe sole has split from all the walking — fix it or make do.',
+    storySetup: 'Thursday afternoon. Your shoe starts flapping with every step.',
+    destination: 'home', paths: ['school'], repeat: 'weekly',
+    window: { days: [3], from: hm(16), until: hm(21) },
+    trigger: { type: 'time' },
+    // Only for players who actually walked to school this week and never took the bus.
+    requires: s => resolvedThisWeek(s, 'friend_birthday') && !rodeBusThisWeek(s)
+      && (s.today.schoolAttended === true || s.weekDays.some(d => d.schoolAttended === true)),
+    steps: [{
+      id: 's1', place: 'home', waypoint: 'Sort out your shoe', remote: true,
+      lines: ['All that walking has split your shoe sole.', 'The Bookshop sells shoe glue for $4. Or you could tape it.'],
+      choices: [
+        { id: 'pay', label: '🧴 Buy shoe glue ($4)', sublabel: 'Fixed properly', category: 'shopping', cost: -4, minutes: 15, consequence: 'Good as new.', flags: ['unexpected_paid'], finish: true },
+        { id: 'walk', label: '🩹 Tape it (free)', sublabel: 'It squeaks, but it holds', cost: 0, minutes: 5, consequence: 'It squeaks all Friday, but it holds.', lesson: 'Walking saves money — but it wears things out. Hidden costs are still costs.', flags: ['unexpected_walked'], finish: true },
+      ],
+    }],
+    rewards: { xp: 15, message: 'Sorted.', flag: 'unexpected_handled' },
+  },
+  {
+    // Tuesday's story beat: a small commitment now that pays off (or doesn't) on Friday.
+    id: 'sports_signup', kind: 'main', priority: 155, name: 'Basketball Sign-Up', emoji: '🏀',
+    journalText: "Coach Rangi is signing people up for the Friday basketball team — $6 for the term.",
+    storySetup: 'Tuesday lunchtime. Coach Rangi is at the gym door with a sign-up sheet.',
+    destination: 'university', paths: ['school'], repeat: 'weekly',
+    // Lunchtime onwards: class runs 8:30–12:30, so a morning window would expire mid-lesson.
+    window: { days: [1], from: hm(12, 30), until: hm(15, 25) },
+    trigger: { type: 'time' },
+    requires: attendedToday,
+    steps: [{
+      id: 's1', place: 'university', waypoint: 'Coach (School)', speaker: 'Coach Rangi',
+      lines: ['Friday team is short a player!', "It's $6 for the term, first game this Friday, 4 PM at the Community Gym."],
+      choices: [
+        { id: 'join', label: '🏀 Sign up ($6)', sublabel: 'First game Friday 4 PM', category: 'entertainment', cost: -6, minutes: 5, consequence: 'Your name goes on the sheet. Friday, 4 PM, Community Gym.', flags: ['team_joined'], finish: true },
+        { id: 'pass', label: '🙅 Not this term', sublabel: 'Keep the $6', cost: 0, minutes: 2, consequence: 'Coach: "Door\'s always open."', lesson: 'Saying no to one thing keeps money free for another.', flags: ['team_passed'], finish: true },
+      ],
+    }],
+    rewards: { xp: 15, message: 'Decision made on the team.' },
+  },
+  {
+    // Friday morning: Monday's project supplies come due. What you did Mon–Wed decides the options.
+    id: 'project_day', kind: 'main', priority: 165, name: 'Project Day', emoji: '🖼️',
+    journalText: 'Friday: present your project in class. Did you get the supplies?',
+    storySetup: "Friday after class. Everyone is pinning up their posters.",
+    destination: 'university', paths: ['school'], repeat: 'weekly',
+    window: { days: [4], from: hm(12, 30), until: hm(15, 25) },
+    trigger: { type: 'time' },
+    requires: attendedToday,
+    steps: [{
+      id: 's1', place: 'university', waypoint: 'Ms Patel (Classroom)', speaker: 'Ms Patel', npcId: 'teacher',
+      lines: ['Projects up on the wall, please!', "Let's see what you've made."],
+      choices: [
+        { id: 'present', label: '🖼️ Present your poster', sublabel: 'You bought the supplies', cost: 0, minutes: 30, relationship: 1, consequence: 'Ms Patel gives you a merit. Planning ahead paid off.', flags: ['project_day_merit'], finish: true,
+          hideIf: s => !s.world.flags.includes('school_project_done') },
+        { id: 'rush', label: '🏫 Buy supplies at the school shop ($8)', sublabel: 'Twice the Bookshop price', category: 'shopping', cost: -8, minutes: 30, consequence: 'You scramble, pay double, and just about finish.', lesson: 'Last-minute buying almost always costs more.', flags: ['project_day_rushed'], finish: true,
+          hideIf: s => s.world.flags.includes('school_project_done') },
+        { id: 'borrow', label: '🤝 Borrow bits from Riley', sublabel: 'Free · but you owe her', cost: 0, minutes: 30, relationship: -1, consequence: "Riley helps, but it's clear you didn't plan. Ms Patel notices.", lesson: 'Not planning ahead costs you — in money, or in favours.', flags: ['project_day_borrowed'], finish: true,
+          hideIf: s => s.world.flags.includes('school_project_done') },
+      ],
+    }],
+    rewards: { xp: 20, message: 'Project presented.' },
+  },
+  {
+    // Friday after school: only if you paid on Tuesday. Paying for something and not using it is
+    // its own lesson.
+    id: 'team_game', kind: 'side', priority: 90, name: 'First Basketball Game', emoji: '🏀',
+    journalText: "Your first game is at the Community Gym, 4 PM. You paid $6 to be on the team.",
+    storySetup: 'Friday afternoon. Game day.',
+    destination: 'gym', paths: ['school'], repeat: 'weekly',
+    window: { days: [4], from: hm(15, 30), until: hm(17, 30) },
+    trigger: { type: 'time' },
+    requires: s => s.world.flags.includes('team_joined'),
+    steps: [{
+      id: 's1', place: 'gym', waypoint: 'Community Gym', speaker: 'Coach Rangi',
+      lines: ['There you are! Warm up, you start on the bench.', 'Team pizza after — $5 each if you want in.'],
+      choices: [
+        { id: 'pizza', label: '🍕 Play, then team pizza ($5)', sublabel: '2 hours · +10 energy back', category: 'food', cost: -5, minutes: 120, energyCost: 12, energyRestore: 10, social: true, consequence: 'You score twice, lose by one, and argue about it over pizza. Brilliant.', flags: ['team_played'], finish: true },
+        { id: 'play', label: '🏀 Play the game', sublabel: '1.5 hours · 12 energy', cost: 0, minutes: 90, energyCost: 12, social: true, consequence: 'You score twice. Coach says see you next week.', flags: ['team_played'], finish: true },
+      ],
+    }],
+    rewards: { xp: 25, message: 'Game played!' },
+    onExpire: { message: "You missed the game you paid $6 to play in.", flags: ['team_skipped'] },
+  },
+  {
+    // The other end of Jordan's loan (see jordan_loan in dailyMissions.ts). Whether he pays it all
+    // back is decided per save, so the same choice doesn't always turn out the same way.
+    id: 'jordan_payback', kind: 'side', priority: 60, name: 'Payback Day', emoji: '💸',
+    journalText: 'Jordan promised to pay back your $4 today.',
+    storySetup: 'Friday. Jordan owes you $4.',
+    paths: ['school'], repeat: 'weekly',
+    window: { days: [4], from: hm(17, 30), until: hm(21) },
+    trigger: { type: 'time' },
+    requires: s => s.world.flags.includes('lent_jordan'),
+    steps: [{
+      id: 's1', place: 'home', waypoint: 'Jordan', speaker: 'Jordan', npcId: 'jordan', remote: true, lines: [],
+      variants: [
+        {
+          lines: ["told u I'd pay u back 😎", 'sent $4 + I owe u a chocolate'],
+          choices: [{ id: 'thanks', label: '👍 Thanks!', sublabel: '+$4 back', category: 'refund', cost: 4, minutes: 1, relationship: 1, consequence: 'All $4 back, right on time.', lesson: 'A friend who pays back on time is a friend you can lend to again.', finish: true }],
+        },
+        {
+          lines: ['ok so… can I give u $2 now and $2 next week? 😬'],
+          choices: [
+            { id: 'ok', label: '🙂 Sure, $2 now', sublabel: '+$2, $2 still owed', category: 'refund', cost: 2, minutes: 1, consequence: 'Half back. The other half is a promise.', lesson: 'Lending to friends can mean waiting — or never seeing it again.', flags: ['jordan_owes_2'], finish: true },
+            { id: 'all', label: '😐 I kind of need it all', sublabel: '+$4 · a bit awkward', category: 'refund', cost: 4, minutes: 1, relationship: -1, consequence: 'Jordan sends it all. "my bad 😅"', lesson: "It's OK to ask for what you're owed.", finish: true },
+          ],
+        },
+      ],
+    }],
+    rewards: { xp: 10, message: 'Loan settled.' },
+  },
+  {
+    // Blueprint Saturday: the school fair — the goal Mum mentioned on Monday.
+    id: 'school_fair', kind: 'main', priority: 130, name: 'School Fair', emoji: '🎟️',
+    journalText: 'Saturday 10 AM – 2 PM at school. Tickets are $10.',
+    storySetup: "It's fair day. Music is coming from the school field.",
+    destination: 'university', paths: ['school'], repeat: 'weekly',
+    window: { days: [5], from: hm(10), until: hm(14) },
+    trigger: { type: 'time' },
+    steps: [{
+      id: 's1', place: 'university', waypoint: 'School fair', speaker: 'Ms Patel', npcId: 'teacher',
+      lines: ['Welcome to the fair!', "Tickets are $10 — that gets you into everything. Jordan and Riley are already inside."],
+      choices: [
+        { id: 'ticket', label: '🎟️ Buy a ticket ($10)', sublabel: 'Rides, games and friends', category: 'entertainment', cost: -10, minutes: 150, social: true, consequence: 'A brilliant day. You, Jordan and Riley end up at every stall.', flags: ['school_fair_attended'], finish: true, energyCost: 10 },
+        { id: 'skip', label: '🚶 Just look around', sublabel: 'Keep your money', cost: 0, minutes: 20, consequence: 'You watch from the gate for a while, then head off.', flags: ['school_fair_skipped'], finish: true },
+      ],
+    }],
+    rewards: { xp: 30, message: 'Fair day done.' },
+  },
+  {
     // MISSION 8 — Friday. Nothing here is scripted moralising: the actual numbers (what's left,
     // what got done, what didn't) come from real state, computed and shown by the store the moment
     // this completes (see GameStore.completeMission's friday_recap special-case).
-    id: 'friday_recap', kind: 'main', priority: 140, name: 'Made It to Friday', emoji: '📅',
-    journalText: 'Friday, after school: find Mum and see how the week actually went.',
-    storySetup: "It's Friday. The week you budgeted for Monday morning is almost over.",
+    id: 'friday_recap', kind: 'main', priority: 140, name: 'Sunday Night', emoji: '📅',
+    journalText: 'Sunday evening at home: sit down with Mum and see how the week actually went.',
+    storySetup: "It's Sunday. The week you budgeted on Monday morning is over.",
     destination: 'home', paths: ['school'], repeat: 'weekly',
-    // Always reachable: Friday after school through Sunday night, whenever you're home. Whatever
-    // happened (or didn't) this week, the recap reports it — it never waits on another mission.
-    window: { days: [4], from: hm(15, 30), until: hm(23), spanDays: 2 },
+    // Sunday from 3 PM, whenever you're home. Whatever happened (or didn't) this week, the recap
+    // reports it — it never waits on another mission.
+    window: { days: [6], from: hm(15), until: hm(23, 59) },
     trigger: { type: 'location', place: 'home' },
     steps: [{
       id: 's1', place: 'home', waypoint: 'Talk to Mum', speaker: 'Mum', npcId: 'mum',
-      lines: ["Well — you made it to Friday.", 'How did the money go?'],
+      lines: ['Well — that was a big week.', 'Did you manage what you set out to do?'],
       choices: [{ id: 'reflect', label: '💬 Look back on the week', sublabel: 'See how it went', cost: 0, minutes: 20, relationship: 2, consequence: 'Mum listens, and you both look at how the week actually went.', flags: ['level1_complete'], finish: true }],
     }],
-    rewards: { xp: 100, message: 'Week one down. Monday, the $35 starts again — see if you do anything differently.', flag: 'level1_complete' },
+    rewards: { xp: 100, message: 'Week done. Monday brings a new $20 and a new goal — see if you do anything differently.', flag: 'level1_complete' },
   },
 ];
 
 export function missionDefs(path: GameState['lifePath']): MissionDef[] {
-  return path === 'school' ? SCHOOL_MISSIONS : [];
+  return [...SCHOOL_MISSIONS, ...UNI_MISSIONS, ...DAILY_MISSIONS, ...UNI_DAILY].filter(d => d.paths.includes(path));
 }
 export const getDef = (defs: MissionDef[], id: string) => defs.find(d => d.id === id);
 
@@ -437,6 +661,7 @@ export function missionsOnMinute(s: GameState, defs: MissionDef[], emit: Emit, o
 
     if (rt.state !== 'locked') continue;
     if (!def.paths.includes(s.lifePath)) continue;
+    if (!offeredToday(s, def)) continue;
 
     // An obligation (a mission with `onExpire`) whose window came and went without the player ever
     // triggering it counts as missed, exactly like one they started and abandoned. Without this, a
@@ -468,7 +693,7 @@ export function missionsOnEvent(s: GameState, defs: MissionDef[], ev: GameEvent,
     const def = getDef(defs, rt.id);
     if (!def || !def.paths.includes(s.lifePath)) continue;
 
-    if (rt.state === 'locked' && windowOpen(def, s.minutes) && (!def.requires || def.requires(s))) {
+    if (rt.state === 'locked' && offeredToday(s, def) && windowOpen(def, s.minutes) && (!def.requires || def.requires(s))) {
       const t = def.trigger;
       if (t.type === 'location' && ev.type === 'entered_place' && ev.placeId === t.place) rt.triggered = true;
       if (t.type === 'interaction' && ev.type === 'talked_to' && ev.npcId === t.npcId) rt.triggered = true;
@@ -529,15 +754,42 @@ export function buildJournal(s: GameState, defs: MissionDef[]): Journal {
 }
 
 /** The mission whose destination the minimap should highlight (highest priority active, then available timed/main). */
+/**
+ * The one task the map arrow, minimap line and "NEXT" card point at.
+ *  - Only steps you have to WALK to count. Phone messages (remote steps) are answered from the phone
+ *    wherever you are, so an unanswered text ("found a wallet — hand it in at Services?") can no
+ *    longer drag the arrow away from the errand you actually accepted.
+ *  - Something you've already started (active) beats something merely on offer (available).
+ *  - Among started tasks: the one you're standing in right now, then the one due SOONEST. (Monday
+ *    used to point at Wednesday's Bookshop project while Mum's 7 PM grocery run was the urgent one.)
+ *  - Among offers: higher priority, then whichever runs out soonest.
+ *  - A face-to-face step follows the person: if Riley is at the Park, that's where it points.
+ */
 export function trackedMission(s: GameState, defs: MissionDef[]): { def: MissionDef; rt: MissionRuntime; placeId: string } | null {
+  const due = (x: { rt: MissionRuntime }) => x.rt.expiresAt ?? Infinity;
   const live = s.missions
     .map(rt => ({ rt, def: getDef(defs, rt.id)! }))
     .filter(x => x.def && (x.rt.state === 'active' || x.rt.state === 'available'))
-    .sort((a, b) => (b.rt.state === 'active' ? 1000 : 0) + b.def.priority - ((a.rt.state === 'active' ? 1000 : 0) + a.def.priority));
+    .map(x => ({ ...x, step: x.def.steps[Math.min(x.rt.stepIndex, x.def.steps.length - 1)] }))
+    .filter(x => x.step && !x.step.remote)
+    .sort((a, b) => {
+      const aActive = a.rt.state === 'active', bActive = b.rt.state === 'active';
+      if (aActive !== bActive) return aActive ? -1 : 1;
+      if (aActive) {
+        const aHere = a.step.place === s.player.place, bHere = b.step.place === s.player.place;
+        if (aHere !== bHere) return aHere ? -1 : 1;
+        return due(a) - due(b) || b.def.priority - a.def.priority;
+      }
+      return b.def.priority - a.def.priority || due(a) - due(b);
+    });
   const top = live[0];
   if (!top) return null;
-  const step = top.def.steps[Math.min(top.rt.stepIndex, top.def.steps.length - 1)];
-  return { def: top.def, rt: top.rt, placeId: top.rt.state === 'active' ? step.place : (top.def.destination ?? step.place) };
+  let placeId = top.step.place;
+  if (top.step.withNpc && top.step.npcId) {
+    const npcPlace = s.npcs[top.step.npcId]?.place;
+    if (npcPlace && npcPlace !== 'street') placeId = npcPlace;
+  }
+  return { def: top.def, rt: top.rt, placeId };
 }
 
 export { MIN_PER_DAY };

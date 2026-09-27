@@ -10,10 +10,12 @@
  *   1. Same-site only: requests must come from the MoniMate site itself (Origin header check).
  *   2. Size limits: message and context are capped before anything reaches the model.
  *   3. Rate limit: per IP address, per minute and per day.
- *   4. Login check: add after switching to Supabase Auth (see README-AUTH.md, section 5).
+ *   4. Login check: only signed-in MoniMate players (Supabase session) can use it.
  *
  * If ANTHROPIC_API_KEY isn't set, a friendly canned reply is returned so the game never breaks.
  */
+
+import { createClient } from '@/lib/supabase/server';
 
 export const runtime = 'nodejs';
 
@@ -25,6 +27,7 @@ const PER_DAY = 60;
 
 interface MentorContext {
   lifePath?: string;
+  highlights?: string[];
   day?: string;
   balance?: number;
   activeMissions?: string[];
@@ -36,6 +39,10 @@ interface MentorContext {
   birthdayOutcome?: string;
   unexpectedOutcome?: string;
   wentToArcade?: boolean;
+  goalName?: string;
+  goalAchieved?: boolean;
+  savings?: number;
+  busSpent?: number;
 }
 
 interface MentorRequestBody {
@@ -45,7 +52,7 @@ interface MentorRequestBody {
 }
 
 const MENTOR_PERSONA = `You are Kai, a warm, encouraging financial-literacy mentor character inside MoniMate, a
-pixel-art life-sim game that teaches teenagers money skills. You speak directly to the player in second person,
+pixel-art life-sim game that teaches young people money skills (school kids, uni students and new workers in New Zealand). You speak directly to the player in second person,
 in 2-4 short sentences, plain everyday language (no jargon, no bullet points, no markdown). You give concrete,
 practical money advice tied to what's actually happening in their game (their balance, their choices, their
 week) rather than generic platitudes. You're supportive, never preachy or condescending, and you never lecture
@@ -107,8 +114,14 @@ export async function POST(req: Request) {
   if (!isSameSite(req)) {
     return Response.json({ error: 'forbidden' }, { status: 403 });
   }
+  const supabase = await createClient();
+  const { data: auth } = await supabase.auth.getClaims();
+  if (!auth?.claims) {
+    return Response.json({ reply: 'Sign in to chat with Kai.', source: 'unauthorized' }, { status: 401 });
+  }
 
-  const wait = rateLimit(clientIp(req));
+  // Per player when signed in (can't dodge it by changing IP), per IP as a fallback.
+  const wait = rateLimit(typeof auth.claims.sub === 'string' ? auth.claims.sub : clientIp(req));
   if (wait > 0) {
     return Response.json(
       { reply: "Let's slow down a sec — I need a breather. Try me again in a minute.", source: 'rate_limited' },

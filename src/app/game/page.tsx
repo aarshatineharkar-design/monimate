@@ -1,17 +1,18 @@
 'use client';
 
 /**
- * MoniMate — Financial Life Simulator (slim page.tsx).
+ * MoniMate — the game page.
  *
- * All simulation logic lives in src/lib (clock/world/missions/store/render/loop). This component
- * only: (1) handles auth/path-select screens, (2) owns one GameStore + GameLoop per session,
- * (3) runs the canvas + input loop, (4) renders HUD/journal/dialogue/minimap from current state.
+ * All simulation logic lives in src/lib and src/game. This component: (1) loads the signed-in
+ * Supabase player and their newest save (src/proxy.ts already guarantees someone is signed in),
+ * (2) owns one GameStore + GameLoop, (3) runs the canvas + input loop, (4) renders the HUD, the
+ * phone and dialogue from current state.
  */
-import { useCallback, useEffect, useRef, useState } from 'react';
-import {
-  PlayerProfile, hashPassword, verifyPassword, loadAccounts, saveAccounts,
-  loadSession, saveSession, clearSession, loadGameSave, saveGame,
-} from '../../lib/auth';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import type { SupabaseClient } from '@supabase/supabase-js';
+import { createClient } from '../../lib/supabase/client';
+import { loadSave, writeSave, takeLegacySave, listSaves, deleteSave, type SaveSummary } from '../../lib/persistence/cloudSave';
+import { signOut } from '../login/actions';
 import { LIFE_PATHS, LifePath, LifePathConfig, getLifePath, makeInitialFinance, makeInitialGoals } from '../../lib/gameData';
 import { createInitialState, GameStore, LevelSummary } from '../../lib/store';
 import { GameLoop } from '../../lib/loop';
@@ -22,52 +23,103 @@ import {
   PLACES, TILE_PX, isOpen as placeIsOpen, groundSprite,
   CHAR_FRAME_W, CHAR_FRAME_H, CHAR_RUN_FRAMES, DIR_ORDER, facingToDir, characterSheet,
   getInterior, INTERIOR_TILE_PX, DECOR_PROPS, getNpcDef,
-  BUS_STOPS, BUS_ROUTE, busAtStop, nextBusAt, stopById, rideMinutes, getPlace,
+  BUS_STOPS, BUS_ROUTE, busAtStop, nextBusAt, stopById, rideMinutes, getPlace, type ShopItemDef,
 } from '../../lib/world';
 import { buildJournal, MissionChoice, MissionDef, trackedMission } from '../../lib/missions';
 import { dayToSummaryView, weekToSummaryView } from '../../lib/summary';
 import type { GameState, NpcRuntime } from '../../lib/types';
 import { formatDay, formatTime, parts } from '../../lib/clock';
-import { ATTEND_CLASS } from '../../game/content/school/mondayActivities';
+import { pathRules, pathText, placeName } from '../../lib/pathRules';
 import { LIFE_EVENTS } from '../../lib/lifeEvents';
-import { ACHIEVEMENTS, isUnlocked } from '../../lib/achievements';
+import Phone, { type PhoneApp } from '../../components/Phone';
 
 const MAP_W = 60, MAP_H = 44;
 
-/** Casual, non-mission chat lines — what an NPC says if you walk up and press E/ACT when they
- *  have no active mission step for you. Picked at random so talking to the same person twice in
- *  a row doesn't feel scripted-empty. */
-const NPC_IDLE_LINES: Record<string, string[]> = {
-  mum: [
-    "Don't forget — the $35 has to last till Friday.",
-    "How's the budget looking so far this week?",
-    "Love you, kiddo. Don't spend it all on snacks.",
-    "Let me know if you need to talk about money — no judgment.",
-  ],
-  jordan: [
-    "Hey! You coming to the arcade this week?",
-    "I heard the cafeteria's doing something new for lunch.",
-    "You seen Riley today? She's been stressed about her birthday thing.",
-    "I'm saving up for new headphones — slow going.",
-  ],
-  riley: [
-    "Hey! Thanks again for being a good friend.",
-    "This market stall smells incredible, you have to try it sometime.",
-    "I'm turning a year older soon, you know...",
-    "School's been a lot lately, honestly.",
-  ],
-  teacher: [
-    "Make sure that project gets handed in on time.",
-    "Attendance matters more than people think.",
-    "Let me know if you're stuck on anything.",
-  ],
-  shopkeeper: [
-    "Fresh stock just came in this morning.",
-    "Let me know if you can't find something.",
-  ],
-};
-function idleLineFor(npcId: string): string {
-  const pool = NPC_IDLE_LINES[npcId] ?? ["Hey."];
+/** Small talk when an NPC has nothing mission-related to say. Lines depend on the day, the time,
+ *  your money, your goal and how things stand with them — so chatting never feels canned. */
+function idleLineFor(npcId: string, store: GameStore): string {
+  const s = store.state, p = parts(s.minutes), cash = store.cash;
+  const flags = s.world.flags, rel = s.world.relationships;
+  const goal = store.weekGoalId();
+  const morning = p.hour < 12, evening = p.hour >= 17, weekend = p.dayOfWeek >= 5;
+  const lines: string[] = [];
+  const add = (cond: boolean, ...l: string[]) => { if (cond) lines.push(...l); };
+  switch (npcId) {
+    case 'mum':
+      add(morning && !weekend, 'Have a good day, love. Got everything?', "Don't forget — lunch doesn't buy itself.");
+      add(evening, 'How was school?', "Dinner's at seven.");
+      add(cash < 3, "Running low? I'll pay you to help around the house.", 'Money tight this week? Happens to everyone.');
+      add(cash > 15, "Look at you, still with money left. I'm impressed.");
+      add(goal === 'save_event', "How's the fair fund going?");
+      add(goal === 'buy_headphones', 'Those headphones… are they worth a whole week of lunches?');
+      add(s.finance.accounts.savings > 0, `$${s.finance.accounts.savings.toFixed(0)} in the piggy bank? That's my kid.`);
+      add(weekend, 'No school today — enjoy it.');
+      add(true, "Love you, kiddo.", 'Let me know if you need to talk about money — no judgment.');
+      break;
+    case 'jordan':
+      add(p.dayOfWeek === 3, 'Arcade later?? You in?');
+      add(p.dayOfWeek === 4, 'Weekend plans? The fair is Saturday!');
+      add(weekend, "Fair's actually good this year.");
+      add(cash < 3, "Broke too? Same. Payday can't come fast enough.");
+      add((rel.Jordan ?? 0) <= 0, '…hey.', 'Oh. Hi.');
+      add((rel.Jordan ?? 0) >= 4, "You're a legend, you know that?");
+      add(flags.includes('shared_game'), 'Pixel Racer is SO good. Your turn Saturday!');
+      add(true, "I'm saving up for new headphones — slow going.", 'You seen Riley today?');
+      break;
+    case 'riley':
+      add(p.dayOfWeek <= 3 && !flags.includes('birthday_resolved'), "My birthday's this week 👀", "You're still coming to my birthday thing?");
+      add(flags.includes('birthday_contributed'), 'Thanks again for chipping in for my birthday!');
+      add(flags.includes('birthday_declined'), 'Oh. Hi.');
+      add(goal === 'save_event', "Are you coming to the fair? I've saved $6 so far.");
+      add(weekend, 'The market has the best dumplings.');
+      add(true, "School's been a lot lately, honestly.", 'Have you done the maths homework?');
+      break;
+    case 'teacher':
+      add(!weekend && !store.hasDoneToday('at_school') && p.hour < 12, "Class is starting — find a seat.");
+      add(!weekend && store.hasDoneToday('at_school'), 'Good work today.');
+      add(!flags.includes('school_project_done') && p.dayOfWeek <= 2, 'Have you got your project supplies yet?');
+      add(weekend, 'Enjoying the fair? The raffle draws at one.');
+      add(true, 'Let me know if you are stuck on anything.');
+      break;
+    // ── University cast ──
+    case 'sam':
+      add(morning && !weekend, "Lecture at 10? I'm going back to sleep.", 'Did you take my milk? …Fine, it was old anyway.');
+      add(evening, "What's for dinner? Please say it's not noodles again.", 'Flat meeting on Sunday about the dishes 😤');
+      add(flags.includes('wk_rent_late') || flags.includes('wk_rent_owed'), 'So… about that rent.', "Not to be weird, but I'm still out of pocket for your rent.");
+      add(flags.includes('wk_rent_paid'), 'Cheers for paying rent on time. Honestly rare.');
+      add(flags.includes('wk_sky_yes'), 'Sky Sport was the best decision this flat has ever made 🏉');
+      add(flags.includes('wk_power_owed'), "Power's still $45 short, just saying.");
+      add(cash < 30, "Broke? The Psych department pays $20 for studies. Easy money.");
+      add(weekend, "Raglan's the best. Or the park. Anywhere but here.");
+      add(true, 'Flatting is just paying bills with friends.', "I'm cooking pasta again. It's always pasta.");
+      break;
+    case 'mei':
+      add(!weekend && p.hour < 12, "Did you do the reading? I did the reading. Twice.");
+      add(!flags.includes('wk_textbook_told') && p.dayOfWeek <= 1, 'Dr Hughes talks about the textbook after the first lecture — stay till the end!');
+      add(flags.includes('wk_club_joined'), 'See you at the club this week!');
+      add(flags.includes('wk_textbook_used'), "Second-hand textbook? Smart. I paid full price like a fool.");
+      add((rel.Mei ?? 0) >= 3, "Honestly, you're the best part of ECON101.");
+      add(weekend, 'The market has the best dumplings. Trust me.');
+      add(true, 'Supply and demand is just vibes with graphs.', 'The library is open till 8 if you need a quiet spot.');
+      break;
+    case 'lecturer':
+      add(!weekend && !store.hasDoneToday('at_school') && p.hour < 11, 'Lecture starts at ten — the Lecture Theatre, first door on the left.');
+      add(!flags.includes('wk_quiz_done') && p.dayOfWeek === 4, "Don't forget, Quiz 1 closes at midnight.");
+      add(true, 'Economics is really about choices: what you give up to get what you want.', 'Office hours are Thursdays. Nobody ever comes.');
+      break;
+    case 'leah':
+      add(flags.includes('wk_job_offer'), "Good to have you on the team! Rosters go out Sunday.");
+      add(flags.includes('wk_trial_offered') && !flags.includes('wk_job_offer'), 'See you Friday at 1 for your trial!');
+      add(flags.includes('wk_applied') && !flags.includes('wk_trial_offered'), 'Interviews are Wednesday afternoon — come by between 1 and 4:30.');
+      add(true, 'Flat white? $5.50. Staff get them free, just saying.', 'Busiest café near campus. We are always hiring.');
+      break;
+    case 'shopkeeper':
+      add(p.dayOfWeek === 3, 'Delivery day. My back is already sore.');
+      add(flags.includes('dairy_shift_done'), 'Best shelf-stocker I have had!');
+      add(true, 'Fresh bread came in this morning.', "Let me know if you can't find something.");
+      break;
+  }
+  const pool = lines.length ? lines : ['Hey.'];
   return pool[Math.floor(Math.random() * pool.length)];
 }
 
@@ -97,136 +149,200 @@ function getImg(src: string): HTMLImageElement | null {
   return img.complete && img.naturalWidth > 0 ? img : null;
 }
 
-type AuthScreen = 'login' | 'register' | 'path_select';
+/** The signed-in player, from Supabase Auth + the `profiles` table. */
+interface Player {
+  id: string;
+  email: string;
+  name: string;
+  lifePath: LifePath;
+  level: number;
+}
 
 export default function MoniMateGame() {
-  const [authScreen, setAuthScreen] = useState<AuthScreen>('login');
-  const [profile, setProfile] = useState<PlayerProfile | null>(null);
-  const [authEmail, setAuthEmail] = useState('');
-  const [authPassword, setAuthPassword] = useState('');
-  const [authName, setAuthName] = useState('');
-  const [authError, setAuthError] = useState('');
+  const supabase = useMemo(() => createClient(), []);
+  const [player, setPlayer] = useState<Player | null>(null);
+  const [choosingPath, setChoosingPath] = useState(false);
+  const [loadError, setLoadError] = useState('');
 
   useEffect(() => {
-    const email = loadSession();
-    if (!email) return;
-    const accounts = loadAccounts();
-    const acc = accounts[email];
-    if (acc) { setProfile(acc); }
-  }, []);
+    (async () => {
+      const { data: { user } } = await supabase.auth.getUser();
+      if (!user) { window.location.href = '/login?next=/game'; return; }
+      const { data: prof, error } = await supabase
+        .from('profiles').select('username, life_path, level').eq('id', user.id).maybeSingle();
+      if (error) setLoadError(`Couldn't load your profile (${error.message}). Your game still works; progress saves on this device.`);
+      setPlayer({
+        id: user.id,
+        email: user.email ?? '',
+        name: prof?.username ?? user.user_metadata?.username ?? (user.email ?? 'Player').split('@')[0],
+        lifePath: (prof?.life_path as LifePath | undefined) ?? 'school',
+        level: prof?.level ?? 1,
+      });
+    })();
+  }, [supabase]);
 
-  const login = () => {
-    const accounts = loadAccounts();
-    const acc = accounts[authEmail.trim().toLowerCase()];
-    if (!acc || !verifyPassword(authPassword, acc.passwordHash)) { setAuthError('Wrong email or password.'); return; }
-    saveSession(acc.email);
-    setProfile(acc);
+  const choosePath = async (path: LifePath) => {
+    if (!player) return;
+    setPlayer({ ...player, lifePath: path });
+    setChoosingPath(false);
+    await supabase.from('profiles').update({ life_path: path, updated_at: new Date().toISOString() }).eq('id', player.id);
   };
-  const register = () => {
-    const email = authEmail.trim().toLowerCase();
-    if (!email || !authPassword || !authName) { setAuthError('Fill in every field.'); return; }
-    const accounts = loadAccounts();
-    if (accounts[email]) { setAuthError('An account already exists for that email.'); return; }
-    const newProfile: PlayerProfile = {
-      name: authName, email, passwordHash: hashPassword(authPassword), lifePath: 'school',
-      avatar: '🧑', level: 1, xp: 0, achievements: [], createdAt: Date.now(),
-    };
-    accounts[email] = newProfile; saveAccounts(accounts); saveSession(email);
-    setProfile(newProfile);
-    setAuthScreen('path_select');
-  };
-  const choosePath = (path: LifePath) => {
-    if (!profile) return;
-    const updated = { ...profile, lifePath: path };
-    const accounts = loadAccounts(); accounts[profile.email] = updated; saveAccounts(accounts);
-    setProfile(updated);
-    setAuthScreen('login'); // clear the path_select screen so we actually drop into the game
-  };
-  const logout = () => { clearSession(); setProfile(null); setAuthScreen('login'); };
 
-  if (!profile) {
+  if (!player) return <LoadingScreen text="Loading your life…" />;
+  const currentPlayable = !!LIFE_PATHS.find(p => p.id === player.lifePath)?.available;
+  if (choosingPath || !currentPlayable) {
     return (
-      <AuthScreen
-        screen={authScreen} setScreen={setAuthScreen}
-        email={authEmail} setEmail={setAuthEmail}
-        password={authPassword} setPassword={setAuthPassword}
-        name={authName} setName={setAuthName}
-        error={authError} onLogin={login} onRegister={register}
+      <PathSelect
+        supabase={supabase} userId={player.id}
+        current={choosingPath && currentPlayable ? player.lifePath : null}
+        onChoose={choosePath}
+        onBack={choosingPath && currentPlayable ? () => setChoosingPath(false) : undefined}
       />
     );
   }
-  // profile exists but no life path confirmed yet (fresh registration) -> path select
-  if (authScreen === 'path_select' || !LIFE_PATHS.find(p => p.id === profile.lifePath)?.available) {
-    return <PathSelect onChoose={choosePath} />;
-  }
-
-  return <GameCanvas profile={profile} onLogout={logout} onChangePath={() => setAuthScreen('path_select')} />;
+  return (
+    <GameLoader
+      key={`${player.id}:${player.lifePath}`}
+      supabase={supabase} player={player} notice={loadError}
+      onChangePath={() => setChoosingPath(true)}
+    />
+  );
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// AUTH / PATH SELECT SCREENS
-// ─────────────────────────────────────────────────────────────────────────────
+/** Loads the newest save (cloud or this device), importing an old pre-Supabase save once. */
+function GameLoader({ supabase, player, notice, onChangePath }: { supabase: SupabaseClient; player: Player; notice: string; onChangePath: () => void }) {
+  const [initial, setInitial] = useState<{ state: GameState | null } | null>(null);
+  useEffect(() => {
+    let live = true;
+    (async () => {
+      const cloud = await loadSave(supabase, player.id, player.lifePath);
+      const state = cloud ?? (player.email ? takeLegacySave(player.email, player.lifePath) : null);
+      if (live) setInitial({ state });
+    })();
+    return () => { live = false; };
+  }, [supabase, player.id, player.email, player.lifePath]);
+  if (!initial) return <LoadingScreen text="Loading your save…" />;
+  return <GameCanvas supabase={supabase} player={player} initialState={initial.state} notice={notice} onChangePath={onChangePath} />;
+}
 
-function AuthScreen(props: {
-  screen: AuthScreen; setScreen: (s: AuthScreen) => void;
-  email: string; setEmail: (v: string) => void;
-  password: string; setPassword: (v: string) => void;
-  name: string; setName: (v: string) => void;
-  error: string; onLogin: () => void; onRegister: () => void;
-}) {
-  const isRegister = props.screen === 'register';
+function LoadingScreen({ text }: { text: string }) {
   return (
-    <div style={{ minHeight: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center', background: '#0d1117', color: '#e6edf3', fontFamily: 'monospace' }}>
-      <div style={{ width: 'min(320px, 92vw)', padding: 24, border: '1px solid #30363d', borderRadius: 10, background: '#161b22' }}>
-        <h1 style={{ fontSize: 20, marginBottom: 16 }}>💰 MoniMate</h1>
-        {isRegister && (
-          <input placeholder="Name" value={props.name} onChange={e => props.setName(e.target.value)}
-            style={inputStyle} />
+    <div style={{ minHeight: '100dvh', display: 'grid', placeItems: 'center', background: '#1a1a2e', color: '#f0c038', fontFamily: "'Press Start 2P', monospace", fontSize: 14 }}>
+      <div style={{ textAlign: 'center' }}>
+        <div style={{ fontSize: 40, marginBottom: 16, animation: 'mmPulse 1.2s ease-in-out infinite' }}>🐷</div>
+        {text}
+        <style>{'@keyframes mmPulse { 0%, 100% { transform: scale(1) } 50% { transform: scale(1.12) } }'}</style>
+      </div>
+    </div>
+  );
+}
+
+const btnStyle: React.CSSProperties = { width: '100%', padding: 10, background: '#3fb950', border: 'none', borderRadius: 6, color: '#0d1117', fontWeight: 700, cursor: 'pointer' };
+
+/** "Where are you up to?" — one card per life path. Each path keeps its own save, so a card shows
+ *  exactly where that life was left (week, day, time, money) and continues from there. */
+function PathSelect({ supabase, userId, current, onChoose, onBack }: {
+  supabase: SupabaseClient; userId: string; current: LifePath | null;
+  onChoose: (p: LifePath) => void; onBack?: () => void;
+}) {
+  const [saves, setSaves] = useState<Partial<Record<LifePath, SaveSummary>> | null>(null);
+  const [confirmReset, setConfirmReset] = useState<LifePath | null>(null);
+  useEffect(() => {
+    let live = true;
+    void listSaves(supabase, userId).then(r => { if (live) setSaves(r); });
+    return () => { live = false; };
+  }, [supabase, userId]);
+  const where = (sv: SaveSummary) => {
+    const p = parts(sv.minutes);
+    return `Week ${p.week} · ${DAY_SHORT[p.dayOfWeek]} ${formatTime(sv.minutes)}${sv.cash !== null ? ` · $${sv.cash.toFixed(2)}` : ''}`;
+  };
+  const reset = async (path: LifePath) => {
+    await deleteSave(supabase, userId, path);
+    setSaves(sv => { const next = { ...(sv ?? {}) }; delete next[path]; return next; });
+    setConfirmReset(null);
+  };
+  return (
+    <div style={ps.screen}>
+      <div style={ps.sky} aria-hidden />
+      <div style={ps.wrap}>
+        {onBack && current && (
+          <button style={ps.back} onClick={onBack}>← Back to {LIFE_PATHS.find(p => p.id === current)?.name}</button>
         )}
-        <input placeholder="Email" value={props.email} onChange={e => props.setEmail(e.target.value)} style={inputStyle} />
-        <input placeholder="Password" type="password" value={props.password} onChange={e => props.setPassword(e.target.value)} style={inputStyle} />
-        {props.error && <div style={{ color: '#ff6060', fontSize: 12, marginBottom: 8 }}>{props.error}</div>}
-        <button onClick={isRegister ? props.onRegister : props.onLogin} style={btnStyle}>
-          {isRegister ? 'Create account' : 'Log in'}
-        </button>
-        <div style={{ marginTop: 10, fontSize: 12, textAlign: 'center' }}>
-          <a style={{ color: '#60b8ff', cursor: 'pointer' }} onClick={() => props.setScreen(isRegister ? 'login' : 'register')}>
-            {isRegister ? 'Already have an account? Log in' : "New here? Create an account"}
-          </a>
+        <h1 style={ps.title}>{current ? 'SWITCH LIFE' : 'CHOOSE YOUR LIFE'}</h1>
+        <p style={ps.sub}>Every life keeps its own save. Switch whenever you like — each one waits exactly where you left it.</p>
+        <div style={ps.grid}>
+          {LIFE_PATHS.map(p => {
+            const sv = saves?.[p.id];
+            const here = p.id === current;
+            return (
+              <div key={p.id} style={{ ...ps.card, borderColor: p.available ? p.color : '#30363d', opacity: p.available ? 1 : 0.5 }}>
+                {here && <div style={{ ...ps.badge, background: p.color, color: '#0d1117' }}>YOU ARE HERE</div>}
+                {!p.available && <div style={ps.badge}>COMING SOON</div>}
+                <div style={{ fontSize: 34 }}>{p.emoji}</div>
+                <div style={ps.name}>{p.name}</div>
+                <div style={ps.tagline}>{p.tagline}</div>
+                <div style={ps.desc}>{p.description}</div>
+                {p.available && (
+                  <div style={ps.level}>LEVEL 1 · {p.levelNames[0].toUpperCase()}</div>
+                )}
+                {p.available && (
+                  <>
+                    <button style={{ ...ps.cta, background: p.color }} onClick={() => (here && onBack ? onBack() : onChoose(p.id))}>
+                      {sv ? `▶ ${here ? 'KEEP PLAYING' : 'CONTINUE'}` : '✦ START THIS LIFE'}
+                    </button>
+                    <div style={ps.progress}>{saves === null ? 'Checking your saves…' : sv ? where(sv) : 'New game'}</div>
+                    {sv && !here && (confirmReset === p.id ? (
+                      <div style={ps.confirm}>
+                        Start {p.name} over? This deletes that save.
+                        <div style={{ display: 'flex', gap: 8, marginTop: 6 }}>
+                          <button style={ps.dangerBtn} onClick={() => reset(p.id)}>Yes, start over</button>
+                          <button style={ps.ghostBtn} onClick={() => setConfirmReset(null)}>Cancel</button>
+                        </div>
+                      </div>
+                    ) : (
+                      <button style={ps.link} onClick={() => setConfirmReset(p.id)}>Start over</button>
+                    ))}
+                  </>
+                )}
+              </div>
+            );
+          })}
         </div>
       </div>
     </div>
   );
 }
-const inputStyle: React.CSSProperties = { width: '100%', padding: 8, marginBottom: 8, background: '#0d1117', border: '1px solid #30363d', color: '#e6edf3', borderRadius: 6 };
-const btnStyle: React.CSSProperties = { width: '100%', padding: 10, background: '#3fb950', border: 'none', borderRadius: 6, color: '#0d1117', fontWeight: 700, cursor: 'pointer' };
-
-function PathSelect({ onChoose }: { onChoose: (p: LifePath) => void }) {
-  return (
-    <div style={{ minHeight: '100vh', background: '#0d1117', color: '#e6edf3', display: 'flex', flexDirection: 'column', alignItems: 'center', padding: 32, fontFamily: 'monospace' }}>
-      <h1 style={{ marginBottom: 24 }}>Choose your life path</h1>
-      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: 16, width: '100%', maxWidth: 700 }}>
-        {LIFE_PATHS.map(p => (
-          <div key={p.id} onClick={() => p.available && onChoose(p.id)} aria-disabled={!p.available}
-            style={{ cursor: p.available ? 'pointer' : 'not-allowed', border: `2px solid ${p.color}`, borderRadius: 10, padding: 16, background: '#161b22', opacity: p.available ? 1 : 0.45, position: 'relative' }}>
-            {!p.available && (
-              <div style={{ position: 'absolute', top: 10, right: 10, fontSize: 10, padding: '2px 6px', borderRadius: 4, background: '#30363d', letterSpacing: 0.5 }}>COMING SOON</div>
-            )}
-            <div style={{ fontSize: 28 }}>{p.emoji}</div>
-            <div style={{ fontWeight: 700, margin: '6px 0' }}>{p.name}</div>
-            <div style={{ fontSize: 13, opacity: 0.8 }}>{p.tagline}</div>
-          </div>
-        ))}
-      </div>
-    </div>
-  );
-}
+const DAY_SHORT = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+const ps: Record<string, React.CSSProperties> = {
+  screen: { position: 'relative', minHeight: '100dvh', background: '#1a1a2e', color: '#e6edf3', overflowX: 'hidden', fontFamily: "'VT323', monospace" },
+  sky: { position: 'absolute', inset: 0, background: 'linear-gradient(#2b2d6e 0%, #6b4a8a 55%, #f0a060 100%)', opacity: 0.45 },
+  wrap: { position: 'relative', maxWidth: 1040, margin: '0 auto', padding: '28px 16px 40px' },
+  back: { fontFamily: "'Press Start 2P', monospace", fontSize: 10, background: '#14161c', color: '#ffd23f', border: '3px solid #000', boxShadow: '3px 3px 0 #000', padding: '8px 10px', cursor: 'pointer', marginBottom: 18 },
+  title: { fontFamily: "'Press Start 2P', monospace", fontSize: 22, color: '#f0c038', textShadow: '3px 3px 0 #000', margin: '0 0 8px', textAlign: 'center' },
+  sub: { fontSize: 22, textAlign: 'center', margin: '0 auto 22px', maxWidth: 620, color: '#cfd8e3' },
+  grid: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: 16 },
+  card: { position: 'relative', background: '#14161c', border: '4px solid', boxShadow: '6px 6px 0 #000', padding: '18px 14px 14px', display: 'flex', flexDirection: 'column', gap: 6 },
+  badge: { position: 'absolute', top: 8, right: 8, fontFamily: "'Press Start 2P', monospace", fontSize: 7, padding: '4px 6px', background: '#30363d', color: '#e6edf3' },
+  name: { fontFamily: "'Press Start 2P', monospace", fontSize: 11, color: '#fff', marginTop: 2 },
+  tagline: { fontSize: 20, color: '#ffd23f' },
+  desc: { fontSize: 18, color: '#aeb8c6', lineHeight: 1.05, flex: 1 },
+  level: { fontFamily: "'Press Start 2P', monospace", fontSize: 7, color: '#7cfc00', marginTop: 4 },
+  cta: { fontFamily: "'Press Start 2P', monospace", fontSize: 10, color: '#0d1117', border: '3px solid #000', boxShadow: '3px 3px 0 #000', padding: '10px 6px', cursor: 'pointer', marginTop: 6 },
+  progress: { fontSize: 18, color: '#cfd8e3', textAlign: 'center' },
+  link: { background: 'none', border: 'none', color: '#8b949e', textDecoration: 'underline', cursor: 'pointer', fontFamily: "'VT323', monospace", fontSize: 17, alignSelf: 'center' },
+  confirm: { fontSize: 17, color: '#ffa0a0', background: '#2a1416', padding: 8, border: '2px solid #5a2328' },
+  dangerBtn: { flex: 1, fontFamily: "'VT323', monospace", fontSize: 17, background: '#ff6b6b', color: '#0d1117', border: '2px solid #000', cursor: 'pointer' },
+  ghostBtn: { flex: 1, fontFamily: "'VT323', monospace", fontSize: 17, background: '#30363d', color: '#e6edf3', border: '2px solid #000', cursor: 'pointer' },
+};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // GAME CANVAS — the actual simulation
 // ─────────────────────────────────────────────────────────────────────────────
 
-function GameCanvas({ profile, onLogout, onChangePath }: { profile: PlayerProfile; onLogout: () => void; onChangePath: () => void }) {
+function GameCanvas({ supabase, player, initialState, notice, onChangePath }: {
+  supabase: SupabaseClient; player: Player; initialState: GameState | null; notice: string; onChangePath: () => void;
+}) {
+  const profile = player; // name, lifePath, level
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const keysRef = useRef<Set<string>>(new Set());
   const rafRef = useRef<number>(0);
@@ -243,17 +359,21 @@ function GameCanvas({ profile, onLogout, onChangePath }: { profile: PlayerProfil
     if (dialogueLines && voiceOn) speakLine(dialogueLines.npc, dialogueLines.text);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [dialogueLines]);
-  const [showJournal, setShowJournal] = useState(false);
-  const [showPhone, setShowPhone] = useState(false);
-  const [showMentor, setShowMentor] = useState(false);
-  const [showRelationships, setShowRelationships] = useState(false);
-  const [achievementToast, setAchievementToast] = useState<{ id: string; name: string; emoji: string } | null>(null);
-  // Step 26: a lightweight, self-dismissing notification when store.takeOffers() reports a genuinely
-  // new mission — mirrors the existing achievementToast pattern exactly (same drain-a-queue,
-  // auto-timeout shape) rather than inventing a second notification mechanism.
-  const [missionToast, setMissionToast] = useState<{ id: string; name: string; emoji: string } | null>(null);
-  const missionToastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const toastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // The phone (null = closed). Journal, wallet, relationships, Kai and settings all live in it.
+  const [phoneApp, setPhoneApp] = useState<PhoneApp | null>(null);
+  const phoneOpenRef = useRef(false);
+  phoneOpenRef.current = phoneApp !== null;
+  // One notification queue for everything (achievements, new messages, results, notices).
+  const [toasts, setToasts] = useState<Toast[]>([]);
+  const pushToast = useCallback((t: Omit<Toast, 'key'>) => {
+    const key = Math.random().toString(36).slice(2);
+    setToasts(q => [...q.slice(-2), { ...t, key }]);
+    setTimeout(() => setToasts(q => q.filter(x => x.key !== key)), t.ms ?? 3800);
+  }, []);
+  const seenInboxRef = useRef<Set<string>>(new Set());
+  const [showPiggy, setShowPiggy] = useState(false);
+  const [dayCard, setDayCard] = useState<ReturnType<GameStore['todaySummary']> | null>(null);
+  const [transition, setTransition] = useState<{ title: string; sub: string; moon: boolean } | null>(null);
   const [boardingAt, setBoardingAt] = useState<string | null>(null); // stopId whose destination picker is open
   // Attend Class: a message when it can't happen (e.g. too tired), shown until dismissed.
   const [classFailure, setClassFailure] = useState<string | null>(null);
@@ -272,10 +392,6 @@ function GameCanvas({ profile, onLogout, onChangePath }: { profile: PlayerProfil
   const [helpParentsProgress, setHelpParentsProgress] = useState(0);
   // Balance/energy when the chore starts, so the toast reports the real change.
   const helpParentsSnapshotRef = useRef<{ balance: number; energy: number } | null>(null);
-  // Generic, reusable "what just happened" feedback toast — not specific to Help Parents. Any future
-  // activity can reuse this exact shape (icon + short lines) rather than inventing its own popup.
-  const [activityToast, setActivityToast] = useState<{ icon: string; lines: string[] } | null>(null);
-  const activityToastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [isTouch, setIsTouch] = useState(false);
   const [voiceOn, setVoiceOn] = useState(true);
   const [skipSignal, setSkipSignal] = useState(0); // bumped by the touch "SKIP" button to fast-forward dialogue
@@ -311,25 +427,39 @@ function GameCanvas({ profile, onLogout, onChangePath }: { profile: PlayerProfil
   const pressKey = useCallback((k: string) => keysRef.current.add(k), []);
   const releaseKey = useCallback((k: string) => keysRef.current.delete(k), []);
 
-  // Create the store once, hydrating from a save if one exists.
+  // Create the store once, from the loaded save if there is one. Older saves are upgraded by
+  // GameStore.hydrate (lib/saveMigration.ts); anything unreadable starts a fresh game.
   if (!storeRef.current) {
-    const config: LifePathConfig = getLifePath(profile.lifePath);
-    const saved = loadGameSave(profile.email, profile.lifePath);
-    // Saves from older versions are upgraded by GameStore.hydrate (see lib/saveMigration.ts);
-    // anything unreadable starts a fresh game rather than crashing.
-    const restored = saved && saved.lifePath === profile.lifePath ? GameStore.hydrate(JSON.stringify(saved)) : null;
-    storeRef.current = restored ?? new GameStore(createInitialState(profile.lifePath, makeInitialFinance(config), makeInitialGoals(config)));
+    const config: LifePathConfig = getLifePath(player.lifePath);
+    const restored = initialState && initialState.lifePath === player.lifePath ? GameStore.hydrate(JSON.stringify(initialState)) : null;
+    storeRef.current = restored ?? new GameStore(createInitialState(player.lifePath, makeInitialFinance(config), makeInitialGoals(config)));
     loopRef.current = new GameLoop(storeRef.current);
     storeRef.current.subscribe(() => forceTick(t => t + 1));
   }
   const store = storeRef.current!;
   const loop = loopRef.current!;
+  const rules = store.rules;
+  const stopName = (id: string) => pathText(store.state.lifePath, stopById(id).name);
 
-  // Autosave every 10s and on unmount.
+  // Saving: every 30 s, when the tab is hidden, at the end of every day, and on leaving the page.
+  // writeSave() writes this device first (instant) and then the cloud (best effort).
+  const save = useCallback(() => { void writeSave(supabase, player.id, store.state); }, [supabase, player.id, store]);
   useEffect(() => {
-    const id = setInterval(() => saveGame(profile.email, profile.lifePath, store.state), 10_000);
-    return () => { clearInterval(id); saveGame(profile.email, profile.lifePath, store.state); };
-  }, [profile.email, profile.lifePath, store]);
+    const id = setInterval(save, 30_000);
+    const onHide = () => { if (document.visibilityState === 'hidden') save(); };
+    document.addEventListener('visibilitychange', onHide);
+    const offEvent = store.onEvent(e => { if (e.type === 'day_end' || e.type === 'week_end') save(); });
+    return () => { clearInterval(id); document.removeEventListener('visibilitychange', onHide); offEvent(); save(); };
+  }, [save, store]);
+  const logout = async () => { await writeSave(supabase, player.id, store.state); await signOut(); };
+  useEffect(() => { if (notice) pushToast({ icon: '⚠️', lines: [notice], ms: 8000 }); }, [notice, pushToast]);
+
+  // Blueprint day loop: WAKE UP -> PHONE. The very first time, the phone opens by itself on Mum's message.
+  useEffect(() => {
+    if (store.state.world.flags.includes('phone_intro') || store.phoneInbox().length === 0) return;
+    store.state.world.flags.push('phone_intro');
+    setPhoneApp('messages');
+  }, [store]);
 
   // Help Mum progress bar: fills over ~1.2 real seconds, then store.helpParents() applies the real
   // time/energy/money change once.
@@ -351,9 +481,11 @@ function GameCanvas({ profile, onLogout, onChangePath }: { profile: PlayerProfil
 
   // Switching life paths: force a save under the CURRENT path's key first, so
   // nothing from this session is lost, then hand control back to path select.
-  const handleChangePath = () => {
-    if (!window.confirm('Switch life paths? Your progress on this path is saved and will be here if you come back to it.')) return;
-    saveGame(profile.email, profile.lifePath, store.state);
+  const [confirmSwitch, setConfirmSwitch] = useState(false);
+  const handleChangePath = () => { setPhoneApp(null); setConfirmSwitch(true); store.setPaused(true); };
+  const switchPath = async () => {
+    store.setPaused(false);
+    await writeSave(supabase, player.id, store.state);
     onChangePath();
   };
 
@@ -365,11 +497,13 @@ function GameCanvas({ profile, onLogout, onChangePath }: { profile: PlayerProfil
   useEffect(() => {
     const down = (e: KeyboardEvent) => {
       const key = e.key.toLowerCase();
+      if ((e.target as HTMLElement)?.tagName === 'INPUT') return;
       keysRef.current.add(key);
+      if (phoneOpenRef.current) return; // the phone has the keyboard (its own Esc/back handling)
       if (key === 'escape' && store.state.player.scene !== 'outdoor' && store.state.player.scene !== 'bus') loop.exit();
       if (key === 'e') { if (!tryStartHelpParentsActivity()) handleInteract(); }
-      if (key === 'j') setShowJournal(s => !s);
-      if (key === 'p') setShowPhone(s => !s);
+      if (key === 'j') setPhoneApp(a => (a === 'today' ? null : 'today'));
+      if (key === 'p') setPhoneApp(a => (a ? null : 'home'));
     };
     const up = (e: KeyboardEvent) => keysRef.current.delete(e.key.toLowerCase());
     window.addEventListener('keydown', down);
@@ -381,9 +515,9 @@ function GameCanvas({ profile, onLogout, onChangePath }: { profile: PlayerProfil
   const handleInteract = useCallback(() => {
     const npc = store.npcNearPlayer();
     if (npc) store.talkTo(npc.id);
-    const step = store.actionableStep();
+    const step = store.actionableStep('inPerson');
     if (step) return; // handled by the main mission DialoguePanel (driven by `actionable`, not this state)
-    if (npc) { setDialogueLines({ npc: getNpcDef(npc.id)?.name ?? npc.id, text: idleLineFor(npc.id) }); return; }
+    if (npc) { setDialogueLines({ npc: getNpcDef(npc.id)?.name ?? npc.id, text: idleLineFor(npc.id, store) }); return; }
     // Phase 10: walk-up-and-buy shopping (Rule 27) — no dropdown, just interact with what's in reach.
     // Step 28: when this item is also a grocery-list need for the active shopping mission, the same
     // real purchase doubles as "physical pickup" — reusing the existing buy path rather than a second
@@ -413,7 +547,7 @@ function GameCanvas({ profile, onLogout, onChangePath }: { profile: PlayerProfil
       else {
         const next = nextBusAt(stopId, store.state.minutes);
         setDialogueLines({
-          npc: stopById(stopId).name,
+          npc: stopName(stopId),
           text: next ? `Next bus at ${formatTime(next.arrivesAt)}.` : 'No more buses running today.',
         });
       }
@@ -440,7 +574,7 @@ function GameCanvas({ profile, onLogout, onChangePath }: { profile: PlayerProfil
     if (classResolvingRef.current) return; // already handling a click for this prompt
     classResolvingRef.current = true;
     try {
-      if (store.getEnergy().current < ATTEND_CLASS.energyCost) {
+      if (store.getEnergy().current < (store.rules.study?.energy ?? 0)) {
         setClassFailure("You're too exhausted to focus. Get some rest first.");
         return;
       }
@@ -449,9 +583,8 @@ function GameCanvas({ profile, onLogout, onChangePath }: { profile: PlayerProfil
       const outcome = store.attendClass(); // records attendance (a saved daily mark) on success
       if (!outcome.ok) { setClassFailure(outcome.message ?? 'That didn\'t work.'); return; }
       setClassFailure(null);
-      setActivityToast({ icon: '📚', lines: ['Class done', `${formatTime(before)} → ${formatTime(store.state.minutes)} · -${outcome.energyConsumed} energy`] });
-      if (activityToastTimerRef.current) clearTimeout(activityToastTimerRef.current);
-      activityToastTimerRef.current = setTimeout(() => setActivityToast(null), 4000);
+      const noun = store.rules.study?.noun ?? 'class';
+      pushToast({ icon: '📚', lines: [`${noun[0].toUpperCase()}${noun.slice(1)} done`, `${formatTime(before)} → ${formatTime(store.state.minutes)} · -${outcome.energyConsumed} energy`] });
     } finally {
       classResolvingRef.current = false;
     }
@@ -477,15 +610,8 @@ function GameCanvas({ profile, onLogout, onChangePath }: { profile: PlayerProfil
       const after = { balance: store.cash, energy: store.getEnergy().current };
       const moneyDelta = before ? after.balance - before.balance : outcome.amountEarned;
       const energyDelta = before ? before.energy - after.energy : outcome.energyConsumed;
-      setActivityToast({
-        icon: '🧹',
-        lines: [
-          'Helped around the house',
-          `${moneyDelta > 0 ? '+' : ''}$${moneyDelta.toFixed(2)} · -${energyDelta.toFixed(0)} energy · Mum +1`,
-        ],
-      });
-      if (activityToastTimerRef.current) clearTimeout(activityToastTimerRef.current);
-      activityToastTimerRef.current = setTimeout(() => setActivityToast(null), 4000);
+      pushToast({ icon: '🧹', lines: ['Helped around the house',
+          `${moneyDelta > 0 ? '+' : ''}$${moneyDelta.toFixed(2)} · -${energyDelta.toFixed(0)} energy · Mum +1`,] });
     } finally {
       helpParentsResolvingRef.current = false;
     }
@@ -500,9 +626,7 @@ function GameCanvas({ profile, onLogout, onChangePath }: { profile: PlayerProfil
     store.adjustRelationship('Mum', -1);
     store.markDoneToday('declined_parents');
     setHelpParentsPhaseBoth(null);
-    setActivityToast({ icon: '🙁', lines: ["Mum looks a little disappointed, but doesn't push it.", 'Mum -1'] });
-    if (activityToastTimerRef.current) clearTimeout(activityToastTimerRef.current);
-    activityToastTimerRef.current = setTimeout(() => setActivityToast(null), 4000);
+    pushToast({ icon: '🙁', lines: ["Mum looks a little disappointed, but doesn't push it.", 'Mum -1'] });
   }, [store, setHelpParentsPhaseBoth]);
 
   // Main loop.
@@ -512,7 +636,8 @@ function GameCanvas({ profile, onLogout, onChangePath }: { profile: PlayerProfil
     const ctx = canvas.getContext('2d')!;
 
     const frame = (ts: number) => {
-      const input: MoveInput = {
+      const frozen = phoneOpenRef.current;
+      const input: MoveInput = frozen ? { up: false, down: false, left: false, right: false } : {
         up: keysRef.current.has('w') || keysRef.current.has('arrowup'),
         down: keysRef.current.has('s') || keysRef.current.has('arrowdown'),
         left: keysRef.current.has('a') || keysRef.current.has('arrowleft'),
@@ -520,22 +645,18 @@ function GameCanvas({ profile, onLogout, onChangePath }: { profile: PlayerProfil
       };
       loop.frame(ts, input, { w: canvas.width, h: canvas.height }, { worldW: MAP_W * TILE_PX, worldH: MAP_H * TILE_PX });
       draw(ctx, canvas.width, canvas.height, store, loop);
-      const newToasts = store.takeAchievementToasts();
-      if (newToasts.length) {
-        setAchievementToast(newToasts[0]);
-        if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
-        toastTimerRef.current = setTimeout(() => setAchievementToast(null), 4000);
+      for (const t of store.takeAchievementToasts()) pushToast({ icon: t.emoji, label: 'ACHIEVEMENT UNLOCKED', lines: [t.name], tone: 'gold' });
+      for (const n of store.takeNotices()) pushToast({ icon: 'ℹ️', lines: [n], ms: 5000 });
+      // In-person objectives get a small "new objective" card; phone messages get a notification.
+      for (const d of store.takeOffers()) {
+        if (!d.steps[0]?.remote) pushToast({ icon: d.emoji, label: 'NEW OBJECTIVE', lines: [d.name], tone: 'blue' });
       }
-      // Step 26: store.takeOffers() already existed (mirrors takeAchievementToasts()) but had no
-      // consumer — it drains store.offerQueue and self-clears, so each call only ever returns
-      // missions that became available since the last drain, never the same one twice.
-      const notices = store.takeNotices();
-      if (notices.length) setDialogueLines({ text: notices[notices.length - 1] });
-      const newOffers = store.takeOffers();
-      if (newOffers.length) {
-        setMissionToast({ id: newOffers[0].id, name: newOffers[0].name, emoji: newOffers[0].emoji });
-        if (missionToastTimerRef.current) clearTimeout(missionToastTimerRef.current);
-        missionToastTimerRef.current = setTimeout(() => setMissionToast(null), 4000);
+      for (const m of store.phoneInbox()) {
+        const k = `${m.def.id}:${m.rt.stepIndex}:${parts(store.state.minutes).day}`;
+        if (seenInboxRef.current.has(k)) continue;
+        seenInboxRef.current.add(k);
+        pushToast({ icon: '📱', label: m.step.speaker ?? m.def.name, lines: [m.step.lines[0] ?? m.def.journalText], tone: 'green', onClick: () => setPhoneApp('messages'), ms: 6000 });
+        if (typeof navigator !== 'undefined' && navigator.vibrate) navigator.vibrate(80);
       }
       rafRef.current = requestAnimationFrame(frame);
     };
@@ -551,10 +672,12 @@ function GameCanvas({ profile, onLogout, onChangePath }: { profile: PlayerProfil
   // calls internally) purely to read its mission name for the new Objective HUD card — no new
   // tracking/priority logic, just a second read of the same authoritative pick.
   const objective = trackedMission(s, store.defs);
+  const goal = store.goalStatus();
   const journal = buildJournal(s, store.defs);
   const daySummary = store.pendingDaySummary ? dayToSummaryView(store.pendingDaySummary, store.defs) : null;
   const weekSummary = store.pendingWeekSummary ? weekToSummaryView(store.pendingWeekSummary) : null;
-  const actionable = store.actionableStep();
+  const actionable = store.actionableStep('inPerson');
+  const inbox = store.phoneInbox();
   const nearbyItem = store.nearbyShopItem();
   const shopping = store.shoppingProgress();
   const nearStopId = s.player.scene === 'outdoor' ? store.playerNearBusStop() : null;
@@ -577,13 +700,34 @@ function GameCanvas({ profile, onLogout, onChangePath }: { profile: PlayerProfil
     profile.lifePath === 'school' &&
     s.player.place === 'home' &&
     s.npcs.mum?.place === 'home' && !s.npcs.mum?.moving &&
+    clockParts.minuteOfDay >= 6 * 60 + 30 && clockParts.minuteOfDay < 21 * 60 && // not at midnight
     !store.hasDoneToday('helped_parents') &&
     !store.hasDoneToday('declined_parents');
   const busArrived = nearStopId ? busAtStop(nearStopId, s.minutes) : null;
+  // "That's everything for today": once nothing is left and no other panel is open.
+  const dayDoneNow = !dayCard && !transition && !actionable && !lifeEvent && !boardingAt && !daySummary
+    && !weekSummary && !store.pendingLevelSummary && helpParentsPhase === null && store.dayComplete();
+  useEffect(() => {
+    if (!dayDoneNow) return;
+    store.markDayDoneShown();
+    setDayCard(store.todaySummary());
+  }, [dayDoneNow, store]);
+  /** Fade out, run `during` behind the curtain, fade back in. */
+  const playTransition = (title: string, sub: string, during: () => void, moon = true) => {
+    setDayCard(null);
+    setTransition({ title, sub, moon });
+    store.setPaused(true);
+    setTimeout(() => {
+      during();
+      store.setPaused(false);
+      setTimeout(() => setTransition(null), 1300);
+    }, 1700);
+  };
   const nextBus = nearStopId && !busArrived ? nextBusAt(nearStopId, s.minutes) : null;
 
   return (
     <div style={{ position: 'relative', width: '100%', height: '100dvh', background: '#000', overflow: 'hidden' }}>
+      <style>{TRANSITION_CSS}</style>
       <canvas
         ref={canvasRef} width={canvasSize.w} height={canvasSize.h}
         style={{ position: 'absolute', inset: 0, width: '100%', height: '100%', imageRendering: 'pixelated', touchAction: 'none' }}
@@ -624,64 +768,69 @@ function GameCanvas({ profile, onLogout, onChangePath }: { profile: PlayerProfil
         </>
       )}
 
-      {/* HUD */}
-      <div style={hud.bar}>
-        <span style={{ color: '#7cfc00' }}>💰 ${store.cash.toFixed(2)}</span>
-        <span style={{ color: '#ffe066' }}>⚡ {Math.round(s.energy.current)}</span>
-        <span style={{ color: '#ffd700' }}>{day} {time}</span>
-        <span style={{ color: '#aaffaa' }}>{profile.name} · Lv{profile.level}</span>
-        <div style={hud.btnGroup}>
-          <button style={hud.smallBtn} onClick={() => setShowJournal(v => !v)}>📔 Journal{!isTouch && ' (J)'}</button>
-          <button style={hud.smallBtn} onClick={() => setShowPhone(v => !v)}>📱 Wallet{!isTouch && ' (P)'}</button>
-          <button style={hud.smallBtn} onClick={() => setShowRelationships(v => !v)}>❤️ Relations</button>
-          <button style={hud.smallBtn} onClick={() => setShowMentor(v => !v)}>🧑‍🏫 Mentor</button>
-          <button style={hud.smallBtn} onClick={() => { setVoiceOn(v => { if (v) stopSpeaking(); return !v; }); }}>{voiceOn ? '🔊 Voice' : '🔇 Voice'}</button>
-          <button style={hud.smallBtn} onClick={handleChangePath}>🔀 Path</button>
-          <button style={hud.smallBtn} onClick={onLogout}>Log out</button>
+      {/* HUD — blueprint section 20: time + objective top-left, money/energy/goal top-right, the
+          phone bottom-right. Everything else lives in the phone. */}
+      <div style={hud.topLeft}>
+        <div style={hud.clock}>{day.slice(0, 3)} <b>{time}</b></div>
+        <div style={hud.objective}>
+          {inbox.length > 0 ? (
+            <button style={hud.objectiveBtn} onClick={() => setPhoneApp('messages')}>
+              <div style={hud.objectiveLabel}>📱 NEW MESSAGE{inbox.length > 1 ? `S (${inbox.length})` : ''}</div>
+              <div style={hud.objectiveName}>Reply to {inbox[0].step.speaker ?? inbox[0].def.name}</div>
+            </button>
+          ) : objective ? (
+            <>
+              <div style={hud.objectiveLabel}>🎯 NEXT</div>
+              <div style={hud.objectiveName}>{objectiveNpcName ? `${objective.def.name} — ${objectiveNpcName}` : objective.def.name}</div>
+              {waypoint && (
+                <div style={hud.objectiveLocation}>
+                  {waypoint.here ? `📍 You're at the ${waypoint.label}` : `${waypoint.arrow} ${waypoint.label} · ${waypoint.metres}m`}
+                </div>
+              )}
+            </>
+          ) : (
+            <div style={hud.objectiveLabel}>🎯 {rules.freeTimeHint}</div>
+          )}
         </div>
       </div>
 
-      {/* Step 26 — Objective HUD: the "what should I care about right now?" layer, so the player
-          doesn't have to open the Journal just to see the current objective. Reads the same
-          trackedMission()/waypointReadout() data the minimap already used internally — no new
-          mission-tracking logic, this only renders what already existed. */}
-      <div style={hud.objective}>
-        {objective ? (
-          <>
-            <div style={hud.objectiveLabel}>🎯 NEXT</div>
-            <div style={hud.objectiveName}>
-              {/* Step 28: when the current step's target is an NPC (e.g. "Find Mum"), name them
-                  directly instead of just the mission title — closing the "told to find someone
-                  I can't identify" gap. Purely a label change; waypoint targeting is unchanged. */}
-              {objectiveNpcName ? `${objective.def.name} — ${objectiveNpcName}` : objective.def.name}
+      <div style={hud.topRight}>
+        <div style={hud.money}>💰 ${store.cash.toFixed(2)}</div>
+        <div style={hud.energyRow} title={store.exhausted ? 'Exhausted — eat or sleep' : 'Energy'}>
+          <span>⚡</span>
+          <div style={hud.energyTrack}>
+            <div style={{ ...hud.energyFill, width: `${Math.round((s.energy.current / s.energy.max) * 100)}%`, background: store.exhausted ? '#ff6060' : '#ffd23f' }} />
+          </div>
+        </div>
+        {goal && (
+          <button style={hud.goalChip} title={goal.detail} onClick={() => setPhoneApp('goals')}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', gap: 8 }}>
+              <span>{goal.def.emoji} {goal.def.name}</span>
+              <span style={{ color: goal.achieved ? '#7cfc00' : '#ffd23f' }}>{goal.achieved ? '✓' : goal.def.target ? `${Math.round(goal.progress * 100)}%` : ''}</span>
             </div>
-            {waypoint && <div style={hud.objectiveLocation}>{waypoint.arrow} {waypoint.label} · {waypoint.metres}m</div>}
-          </>
-        ) : (
-          <div style={hud.objectiveLabel}>🎯 NO ACTIVE OBJECTIVE</div>
+            <div style={hud.phoneBarTrack}><div style={{ ...hud.phoneBarFill, width: `${Math.round(goal.progress * 100)}%`, background: goal.achieved ? '#7cfc00' : '#ffd23f' }} /></div>
+            <div style={{ fontSize: 10, opacity: 0.75, marginTop: 3, textAlign: 'left' }}>{goal.detail}</div>
+          </button>
         )}
       </div>
 
-      {/* Step 26 — Relationship HUD: compact, toggled panel (not a permanent fixture) surfacing the
-          existing world.relationships values. Reads whatever NPCs are actually in that object —
-          nothing hardcoded, nothing invented, no change to how relationship values are computed. */}
-      {showRelationships && (
-        <div style={hud.relationships}>
-          <div style={{ fontWeight: 700, marginBottom: 6 }}>❤️ Relationships</div>
-          {Object.entries(s.world.relationships).length === 0 ? (
-            <div style={{ fontSize: 12, opacity: 0.7 }}>No relationships yet.</div>
-          ) : (
-            Object.entries(s.world.relationships).map(([name, value]) => (
-              <div key={name} style={hud.phoneLine}>
-                <span>{name}</span>
-                <span style={{ color: value > 0 ? '#7cfc00' : value < 0 ? '#ff8080' : '#ccc' }}>
-                  {value > 0 ? '+' : ''}{value}
-                </span>
-              </div>
-            ))
-          )}
-        </div>
-      )}
+      <button style={hud.phoneBtn} onClick={() => setPhoneApp(a => (a ? null : 'home'))} aria-label="Phone">
+        📱{inbox.length > 0 && <span style={hud.phoneBadge}>{inbox.length}</span>}
+        {!isTouch && <span style={hud.phoneKey}>P</span>}
+      </button>
+
+      {/* Notifications: one queue, newest at the bottom, tap a message to open it */}
+      <div style={hud.toastStack}>
+        {toasts.map(t => (
+          <div key={t.key} onClick={t.onClick} style={{ ...hud.toast, borderColor: TOAST_COLORS[t.tone ?? 'plain'], cursor: t.onClick ? 'pointer' : 'default' }}>
+            <span style={{ fontSize: 22 }}>{t.icon}</span>
+            <div style={{ minWidth: 0 }}>
+              {t.label && <div style={{ fontSize: 10, opacity: 0.75, letterSpacing: 0.5 }}>{t.label}</div>}
+              {t.lines.map((l, i) => <div key={i} style={i === 0 ? { fontWeight: 700 } : { fontSize: 12, opacity: 0.85 }}>{l}</div>)}
+            </div>
+          </div>
+        ))}
+      </div>
 
       {!isTouch && s.player.scene !== 'outdoor' && s.player.scene !== 'bus' && (
         <div style={hud.exitHint}>Press ESC to go outside</div>
@@ -740,7 +889,7 @@ function GameCanvas({ profile, onLogout, onChangePath }: { profile: PlayerProfil
       {nearStopId && !actionable && !nearbyItem && (
         <div style={hud.buyPrompt}>
           <div style={{ fontSize: 11, opacity: 0.8, marginBottom: 2 }}>
-            🚏 {stopById(nearStopId).name} · {BUS_ROUTE.name} · Fare ${BUS_ROUTE.fare.toFixed(2)}
+            🚏 {stopName(nearStopId)} · {BUS_ROUTE.name} · Fare ${BUS_ROUTE.fare.toFixed(2)}
           </div>
           {busArrived
             ? `E: Board the bus — $${BUS_ROUTE.fare.toFixed(2)} · -1 energy`
@@ -756,17 +905,17 @@ function GameCanvas({ profile, onLogout, onChangePath }: { profile: PlayerProfil
           existing ride/fare/energy validation in boardBus()/finishRide(). */}
       {s.ride && (
         <div style={hud.busRideBanner}>
-          🚌 On the bus to {stopById(s.ride.toStop).name} — arriving in {Math.max(0, Math.ceil(s.ride.endsAt - s.minutes))}m
+          🚌 On the bus to {stopName(s.ride.toStop)} — arriving in {Math.max(0, Math.ceil(s.ride.endsAt - s.minutes))}m
         </div>
       )}
 
       {/* Destination picker once you've boarded a standing bus */}
       {boardingAt && (
         <DialoguePanel
-          speaker={`${stopById(boardingAt).name} — Route 1`}
+          speaker={`${stopName(boardingAt)} — Route 1`}
           lines={['Where to?']}
           choices={Object.values(BUS_STOPS).filter(st => st.id !== boardingAt).map(st => ({
-            id: st.id, label: st.name, sublabel: `~${rideMinutes(boardingAt, st.id)} min · $${BUS_ROUTE.fare.toFixed(2)} · -1 energy`,
+            id: st.id, label: pathText(s.lifePath, st.name), sublabel: `~${rideMinutes(boardingAt, st.id)} min · $${BUS_ROUTE.fare.toFixed(2)} · -1 energy`,
             cost: 0, minutes: 0, consequence: '',
           }))}
           onChoose={(c) => {
@@ -775,7 +924,7 @@ function GameCanvas({ profile, onLogout, onChangePath }: { profile: PlayerProfil
             setBoardingAt(null);
             // Surface a real failure (fare/energy/bus already gone) instead of silently doing
             // nothing — this is exactly the "no travel graphics" symptom when boardBus() refuses.
-            if (!result.ok) setDialogueLines({ npc: stopById(boardingAt).name, text: result.reason ?? "Couldn't board the bus." });
+            if (!result.ok) setDialogueLines({ npc: stopName(boardingAt), text: result.reason ?? "Couldn't board the bus." });
           }}
           voiceOn={voiceOn}
         />
@@ -788,12 +937,14 @@ function GameCanvas({ profile, onLogout, onChangePath }: { profile: PlayerProfil
           a genuine duplicate-state risk, not a stylistic preference. */}
 
       {/* Step 8: Attend Class prompt — same priority pattern as the other contextual panels above. */}
-      {classEligible && !actionable && !lifeEvent && !boardingAt && !classFailure && (
+      {classEligible && rules.study && !actionable && !lifeEvent && !boardingAt && !classFailure && (
         <DialoguePanel
-          speaker="Ms Patel"
-          lines={[clockParts.minuteOfDay < 8 * 60 + 30 ? "You're early! Grab a seat — the bell goes at 8:30." : 'Take your seat — class is starting.']}
+          speaker={rules.study.teacher}
+          lines={[clockParts.minuteOfDay < rules.study.bell
+            ? `You're early! Grab a seat — we start at ${formatTime(clockParts.day * 1440 + rules.study.bell)}.`
+            : `Take your seat — the ${rules.study.noun} is starting.`]}
           choices={[
-            { id: 'attend', label: '📚 Attend class', sublabel: `4 hours · ${ATTEND_CLASS.energyCost} energy`, cost: 0, minutes: 0, consequence: '' },
+            { id: 'attend', label: `📚 Attend ${rules.study.noun}`, sublabel: `${rules.study.minutes / 60} hours · ${rules.study.energy} energy`, cost: 0, minutes: 0, consequence: '' },
           ]}
           balance={store.cash}
           voiceOn={voiceOn}
@@ -805,7 +956,7 @@ function GameCanvas({ profile, onLogout, onChangePath }: { profile: PlayerProfil
           to dismiss. Does NOT mark class complete or advance the day on its own. */}
       {classFailure && (
         <div style={hud.dialogue} onClick={() => setClassFailure(null)}>
-          <div style={{ fontWeight: 700, color: '#ffd700', marginBottom: 4 }}>Ms Patel</div>
+          <div style={{ fontWeight: 700, color: '#ffd700', marginBottom: 4 }}>{rules.study?.teacher}</div>
           <div>{classFailure}</div>
         </div>
       )}
@@ -814,8 +965,8 @@ function GameCanvas({ profile, onLogout, onChangePath }: { profile: PlayerProfil
       {!actionable && !nearbyItem && !lifeEvent && !boardingAt && (classStatus === 'go_to_classroom' || classStatus === 'too_late') && (
         <div style={hud.buyPrompt}>
           {classStatus === 'go_to_classroom'
-            ? '🔔 Class is in the Classroom — first door on the left of the hallway'
-            : "🔔 Too late for class today — you'll be marked absent"}
+            ? `🔔 ${rules.study?.roomHint}`
+            : `🔔 Too late for the ${rules.study?.noun} today — you'll be marked absent`}
         </div>
       )}
 
@@ -890,63 +1041,13 @@ function GameCanvas({ profile, onLogout, onChangePath }: { profile: PlayerProfil
         />
       )}
 
-      {/* Journal */}
-      {showJournal && (
-        <JournalPanel journal={journal} onClose={() => setShowJournal(false)} />
-      )}
-
-      {/* Phone / wallet dashboard */}
-      {showPhone && (
-        <PhoneDashboard state={s} onClose={() => setShowPhone(false)} />
-      )}
-
-      {/* AI Mentor chat */}
-      {showMentor && (
-        <MentorPanel
-          context={{ lifePath: profile.lifePath, day, balance: store.cash, activeMissions: journal.active.map(a => a.name) }}
-          onClose={() => setShowMentor(false)}
-          voiceOn={voiceOn}
+      {/* The phone */}
+      {phoneApp && (
+        <Phone
+          store={store} app={phoneApp} setApp={setPhoneApp} onClose={() => setPhoneApp(null)}
+          voiceOn={voiceOn} setVoiceOn={v => { if (!v) stopSpeaking(); setVoiceOn(v); }}
+          onChangePath={handleChangePath} onLogout={logout} playerName={profile.name}
         />
-      )}
-
-      {/* Achievement toast */}
-      {achievementToast && (
-        <div style={hud.achievementToast}>
-          <span style={{ fontSize: 22 }}>{achievementToast.emoji}</span>
-          <div>
-            <div style={{ fontSize: 10, opacity: 0.75, letterSpacing: 0.5 }}>ACHIEVEMENT UNLOCKED</div>
-            <div style={{ fontWeight: 700 }}>{achievementToast.name}</div>
-          </div>
-        </div>
-      )}
-
-      {/* Step 26 — mission-availability toast: same shape as the achievement toast above (a
-          non-blocking overlay that self-dismisses after 4s), fed by store.takeOffers(), which
-          already existed and already de-duplicates/self-clears — so this never repeats for a
-          mission that simply remains available. */}
-      {missionToast && (
-        <div style={hud.missionToast}>
-          <span style={{ fontSize: 22 }}>{missionToast.emoji}</span>
-          <div>
-            <div style={{ fontSize: 10, opacity: 0.75, letterSpacing: 0.5 }}>NEW OBJECTIVE</div>
-            <div style={{ fontWeight: 700 }}>{missionToast.name}</div>
-          </div>
-        </div>
-      )}
-
-      {/* Step 27 — generic activity/consequence-feedback toast (reusable beyond Help Parents: any
-          future accepted/declined activity can call setActivityToast with its own icon/lines rather
-          than each one inventing its own popup). Same non-blocking, self-dismissing shape as the
-          achievement/mission toasts above. */}
-      {activityToast && (
-        <div style={hud.activityToast}>
-          <span style={{ fontSize: 22 }}>{activityToast.icon}</span>
-          <div>
-            {activityToast.lines.map((line, i) => (
-              <div key={i} style={i === 0 ? { fontWeight: 700 } : { fontSize: 12, opacity: 0.85 }}>{line}</div>
-            ))}
-          </div>
-        </div>
       )}
 
       {/* Life event (small, optional, day-to-day decision — separate from scheduled missions) */}
@@ -964,13 +1065,57 @@ function GameCanvas({ profile, onLogout, onChangePath }: { profile: PlayerProfil
         />
       )}
 
+      {/* All done for today */}
+      {dayCard && (
+        <div style={hud.modalBackdrop}>
+          <div style={{ ...hud.modal, width: 'min(380px, 92vw)', textAlign: 'center', animation: 'mmPop 260ms ease-out' }}>
+            <div style={{ fontSize: 40 }}>✅</div>
+            <h2 style={{ margin: '4px 0' }}>That's everything for today!</h2>
+            <div style={{ opacity: 0.7, fontSize: 13, marginBottom: 12 }}>{day} · {time}</div>
+            <div style={{ textAlign: 'left', background: '#0d1117', borderRadius: 8, padding: '10px 12px', marginBottom: 10, maxHeight: 180, overflowY: 'auto' }}>
+              {dayCard.done.map((t, i) => <div key={'d' + i} style={{ fontSize: 13, marginBottom: 3 }}>✓ {t.emoji} {t.name}</div>)}
+              {dayCard.missed.map((t, i) => <div key={'m' + i} style={{ fontSize: 13, marginBottom: 3, color: '#ff8080' }}>✗ {t.emoji} {t.name}</div>)}
+              {dayCard.done.length + dayCard.missed.length === 0 && <div style={{ fontSize: 13, opacity: 0.7 }}>A quiet day.</div>}
+            </div>
+            <div style={{ fontSize: 13, marginBottom: 14 }}>
+              <span style={{ color: '#7cfc00' }}>+${dayCard.earned.toFixed(2)}</span> earned · <span style={{ color: '#ff8080' }}>-${dayCard.spent.toFixed(2)}</span> spent · 💰 ${store.cash.toFixed(2)} left
+            </div>
+            {s.player.place === 'home' ? (
+              <>
+                <button style={btnStyle} onClick={() => playTransition('Goodnight…', `${day} is done. See you tomorrow.`, () => store.sleep(false))}>🛏️ Sleep till tomorrow</button>
+                <button style={{ ...hud.smallBtn, marginTop: 8, width: '100%', padding: 8 }} onClick={() => setDayCard(null)}>Stay up a bit</button>
+              </>
+            ) : (
+              <>
+                <button style={btnStyle} onClick={() => playTransition('Heading home…', '', () => {
+                  const mins = store.goHome();
+                  setTransition({ title: 'Home sweet home', sub: `${mins} min walk · everything's done for today`, moon: true });
+                })}>🏠 Head home</button>
+                <button style={{ ...hud.smallBtn, marginTop: 8, width: '100%', padding: 8 }} onClick={() => setDayCard(null)}>Keep exploring</button>
+              </>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* Scene transition: night sky, a little runner, fade in/out */}
+      {transition && (
+        <div style={hud.transition}>
+          {transition.moon && <div className="mm-moon" />}
+          <div className="mm-stars" />
+          <div className="mm-runner" />
+          <div style={{ fontFamily: "'Press Start 2P', monospace", fontSize: 18, color: '#ffd23f', textShadow: '3px 3px 0 #000', marginBottom: 12 }}>{transition.title}</div>
+          <div style={{ fontFamily: 'monospace', fontSize: 13, color: '#cfd8e3' }}>{transition.sub}</div>
+        </div>
+      )}
+
       {/* Day / week summaries */}
       {daySummary && (
         <SummaryModal title={daySummary.title} lines={[daySummary.moneyLine, daySummary.spentLine, daySummary.schoolLine, daySummary.missionsLine, daySummary.timeLine].filter(Boolean) as string[]}
           onClose={() => store.dismissDaySummary()} />
       )}
       {!daySummary && weekSummary && (
-        <SummaryModal title={weekSummary.title} lines={[weekSummary.income, weekSummary.spending, weekSummary.savings, weekSummary.missions, weekSummary.social, weekSummary.school, ...weekSummary.decisions]}
+        <SummaryModal title={weekSummary.title} lines={[weekSummary.income, weekSummary.spending, weekSummary.savings, weekSummary.missions, weekSummary.social, weekSummary.school.replace('School', rules.study?.noun === 'lecture' ? 'Lectures' : 'School'), ...weekSummary.decisions]}
           onClose={() => store.dismissWeekSummary()} />
       )}
 
@@ -979,10 +1124,32 @@ function GameCanvas({ profile, onLogout, onChangePath }: { profile: PlayerProfil
         <LevelSummaryModal summary={store.pendingLevelSummary} onClose={() => store.dismissLevelSummary()} />
       )}
 
+      {/* Switch life path: everything on this path is saved first, then the path picker opens. */}
+      {confirmSwitch && (
+        <div style={hud.modalBackdrop}>
+          <div style={{ ...hud.modal, width: 'min(360px, 92vw)', textAlign: 'center', animation: 'mmPop 220ms ease-out' }}>
+            <div style={{ fontSize: 38 }}>🔀</div>
+            <h2 style={{ margin: '4px 0 6px' }}>Switch life path?</h2>
+            <div style={{ fontSize: 13, opacity: 0.85, marginBottom: 14 }}>
+              Your {getLifePath(player.lifePath).name} life is saved right here — {day}, {time}, ${store.cash.toFixed(2)}.
+              Come back any time and carry on.
+            </div>
+            <button style={btnStyle} onClick={() => { void switchPath(); }}>🔀 Choose another life</button>
+            <button style={{ ...hud.smallBtn, marginTop: 8, width: '100%', padding: 8 }} onClick={() => { setConfirmSwitch(false); store.setPaused(false); }}>Keep playing</button>
+          </div>
+        </div>
+      )}
+
       {/* Sleep button (only shown at home, outdoor scene excluded) */}
       {s.player.place === 'home' && (
-        <button style={hud.sleepBtn} onClick={() => store.sleep(false)}>🛏️ Go to sleep</button>
+        <div style={hud.homeBtns}>
+          <button style={{ ...hud.sleepBtn, position: 'static' }} onClick={() => store.sleep(false)}>🛏️ Go to sleep</button>
+          {rules.savings.atHome
+            ? <button style={{ ...hud.sleepBtn, position: 'static', background: '#f0a0c0' }} onClick={() => setShowPiggy(true)}>{rules.savings.emoji} {rules.savings.name} · ${s.finance.accounts.savings.toFixed(2)}</button>
+            : <button style={{ ...hud.sleepBtn, position: 'static', background: '#79c0ff' }} onClick={() => setPhoneApp('bank')}>{rules.savings.emoji} Savings · ${s.finance.accounts.savings.toFixed(2)}</button>}
+        </div>
       )}
+      {showPiggy && s.player.place === 'home' && <PiggyBank store={store} onClose={() => setShowPiggy(false)} />}
     </div>
   );
 }
@@ -1016,6 +1183,11 @@ function DialoguePanel({ speaker, lines, choices, onChoose, balance, voiceOn, sk
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [key, shown, voiceOn]);
   const atEnd = shown >= lines.length;
+  // Choices appear right where the player was clicking to advance; ignore clicks on them for a
+  // moment so a fast click-through can't pick an option by accident.
+  const choicesShownAt = useRef(0);
+  useEffect(() => { if (atEnd) choicesShownAt.current = performance.now(); }, [atEnd, key]);
+  const choiceReady = () => performance.now() - choicesShownAt.current > 350;
   return (
     <div style={hud.dialogue} onClick={() => { if (!atEnd) setShown(n => n + 1); }}>
       {speaker && <div style={{ fontWeight: 700, color: '#ffd700', marginBottom: 4 }}>{speaker}</div>}
@@ -1030,7 +1202,7 @@ function DialoguePanel({ speaker, lines, choices, onChoose, balance, voiceOn, sk
                 key={c.id}
                 style={{ ...hud.choiceBtn, ...(affordable ? {} : hud.choiceBtnDisabled) }}
                 disabled={!affordable}
-                onClick={() => affordable && onChoose(c)}
+                onClick={(e) => { e.stopPropagation(); if (affordable && choiceReady()) onChoose(c); }}
               >
                 <div>{c.label}{!affordable && <span style={{ color: '#ff8080', fontWeight: 400 }}> — can't afford</span>}</div>
                 <div style={{ fontSize: 11, opacity: 0.7 }}>{c.sublabel}</div>
@@ -1043,204 +1215,30 @@ function DialoguePanel({ speaker, lines, choices, onChoose, balance, voiceOn, sk
   );
 }
 
-function JournalPanel({ journal, onClose }: { journal: ReturnType<typeof buildJournal>; onClose: () => void }) {
-  const section = (title: string, entries: typeof journal.active) => entries.length > 0 && (
-    <div style={{ marginBottom: 12 }}>
-      <div style={{ fontWeight: 700, marginBottom: 4 }}>{title}</div>
-      {entries.map(e => (
-        <div key={e.id} style={{ fontSize: 13, marginBottom: 4 }}>{e.emoji} {e.name} — {e.text}</div>
-      ))}
-    </div>
-  );
-  return (
-    <div style={hud.journal}>
-      <button style={{ float: 'right', ...hud.smallBtn }} onClick={onClose}>Close</button>
-      <h3>Mission Journal</h3>
-      {section('ACTIVE', journal.active)}
-      {section('OPTIONAL', journal.optional)}
-      {journal.upcoming.length > 0 && (
-        <div style={{ marginBottom: 12 }}>
-          <div style={{ fontWeight: 700, marginBottom: 4, opacity: 0.75 }}>UPCOMING THIS WEEK</div>
-          {journal.upcoming.map(e => (
-            <div key={e.id} style={{ fontSize: 12, marginBottom: 4, opacity: 0.6 }}>{e.emoji} {e.name} — {e.text}</div>
-          ))}
-        </div>
-      )}
-      {section('COMPLETED TODAY', journal.completed)}
-      {section('MISSED', journal.missed)}
-      {journal.active.length + journal.optional.length === 0 && <div style={{ opacity: 0.6 }}>Nothing pending right now.</div>}
-    </div>
-  );
-}
-
-/** AI Mentor chat — a small in-game chat window backed by src/app/api/mentor/route.ts. */
-interface MentorMsg { from: 'you' | 'kai'; text: string }
-function MentorPanel({ context, onClose, voiceOn }: {
-  context: { lifePath: string; day: string; balance: number; activeMissions: string[] };
-  onClose: () => void;
-  voiceOn?: boolean;
-}) {
-  const greeting = "Hey, I'm Kai — your money mentor. Ask me anything about budgeting, saving, or what to do this week.";
-  const [msgs, setMsgs] = useState<MentorMsg[]>([{ from: 'kai', text: greeting }]);
-  const [input, setInput] = useState('');
-  const [sending, setSending] = useState(false);
-  useEffect(() => { if (voiceOn) speakLine('Kai', greeting); /* eslint-disable-next-line react-hooks/exhaustive-deps */ }, []);
-
-  const send = async () => {
-    const text = input.trim();
-    if (!text || sending) return;
-    setInput('');
-    setMsgs(m => [...m, { from: 'you', text }]);
-    setSending(true);
-    const reply = await askMentorChat(text, context);
-    setMsgs(m => [...m, { from: 'kai', text: reply }]);
-    if (voiceOn) speakLine('Kai', reply);
-    setSending(false);
-  };
-
-  return (
-    <div style={hud.modalBackdrop}>
-      <div style={{ ...hud.modal, width: 'min(380px, 92vw)', display: 'flex', flexDirection: 'column', maxHeight: '70vh' }}>
-        <h3 style={{ margin: '0 0 10px' }}>🧑‍🏫 Kai — Money Mentor</h3>
-        <div style={{ flex: 1, overflowY: 'auto', marginBottom: 10, paddingRight: 4 }}>
-          {msgs.map((m, i) => (
-            <div key={i} style={{
-              marginBottom: 8, padding: '8px 10px', borderRadius: 8, fontSize: 13, lineHeight: 1.4,
-              background: m.from === 'you' ? '#1f6feb22' : '#0d1117',
-              marginLeft: m.from === 'you' ? 30 : 0, marginRight: m.from === 'you' ? 0 : 30,
-            }}>
-              {m.text}
-            </div>
-          ))}
-          {sending && <div style={{ fontSize: 12, opacity: 0.6 }}>Kai is thinking…</div>}
-        </div>
-        <div style={{ display: 'flex', gap: 6 }}>
-          <input
-            value={input} onChange={e => setInput(e.target.value)}
-            onKeyDown={e => { if (e.key === 'Enter') send(); }}
-            placeholder="Ask Kai something…" style={{ ...inputStyle, marginBottom: 0, flex: 1 }}
-          />
-          <button style={{ ...btnStyle, width: 'auto', padding: '0 14px' }} onClick={send} disabled={sending}>Send</button>
-        </div>
-        <button style={{ ...hud.smallBtn, marginTop: 10, alignSelf: 'flex-end' }} onClick={onClose}>Close</button>
-      </div>
-    </div>
-  );
-}
-
-/** Phone/wallet dashboard — reads straight off the one FinancialState (accounts, recurring
- *  expenses, transaction ledger) and GoalState. The spending breakdown covers the last 7 days. */
-function PhoneDashboard({ state, onClose }: { state: GameState; onClose: () => void }) {
-  const f = state.finance;
-  const cash = f.accounts.cash;
-  const weekCutoff = state.minutes - 7 * 24 * 60;
-  const spending = f.transactions.recent.filter(t => t.timestamp >= weekCutoff && t.amount < 0 && t.type !== 'transfer');
-
-  const byCategory = new Map<string, number>();
-  for (const t of spending) byCategory.set(t.category, (byCategory.get(t.category) ?? 0) + -t.amount);
-  const spendRows = Array.from(byCategory.entries()).sort((a, b) => b[1] - a[1]);
-  const maxSpend = spendRows.length ? spendRows[0][1] : 1;
-  const weekSpent = spendRows.reduce((sum, [, v]) => sum + v, 0);
-
-  const recent = f.transactions.recent.slice(-12).reverse();
-  const owed = f.debt.loans.reduce((sum, l) => sum + l.principal, 0);
-  const daysUntil = (at: number) => Math.max(0, Math.ceil((at - state.minutes) / (24 * 60)));
-  const CATEGORY_EMOJI: Record<string, string> = {
-    food: '🍎', shopping: '🛒', transport: '🚌', housing: '🏠', entertainment: '🕹️', gift: '🎁',
-    income: '💵', mission_reward: '🎯', life_event: '🍀', transfer: '🐷', subscription: '📄',
-  };
-
+/** The piggy bank at home: move cash into savings so it isn't spent by accident, and back out
+ *  when you need it. Every move is a pair of transfers in the ledger. */
+function PiggyBank({ store, onClose }: { store: GameStore; onClose: () => void }) {
+  const f = store.state.finance.accounts;
+  const [, redraw] = useState(0);
+  const move = (fn: () => boolean) => { fn(); redraw(n => n + 1); };
+  const goal = store.goalStatus();
   return (
     <div style={hud.modalBackdrop} onClick={onClose}>
-      <div style={hud.phone} onClick={e => e.stopPropagation()}>
-        <button style={{ float: 'right', ...hud.smallBtn }} onClick={onClose}>Close</button>
-        <h3 style={{ margin: '0 0 12px' }}>📱 Wallet</h3>
-
-        <div style={hud.phoneBalance}>
-          <div style={{ fontSize: 26, fontWeight: 700, color: '#7cfc00' }}>${cash.toFixed(2)}</div>
-          <div style={{ fontSize: 11, opacity: 0.7 }}>Cash</div>
-        </div>
-        <div style={{ display: 'flex', gap: 10, marginBottom: 14, fontSize: 12 }}>
-          <div style={hud.phoneStat}>Savings<br /><b>${f.accounts.savings.toFixed(2)}</b></div>
-          <div style={hud.phoneStat}>Emergency<br /><b>${f.accounts.emergencyFund.toFixed(2)}</b></div>
-          <div style={hud.phoneStat}>Owed<br /><b style={{ color: owed > 0 ? '#ff8080' : undefined }}>${owed.toFixed(2)}</b></div>
-        </div>
-
-        {/* Bills and pay */}
-        {(f.expenses.recurring.length > 0 || f.income.job) && (
-          <div style={hud.phoneSection}>
-            <div style={hud.phoneSectionTitle}>UPCOMING</div>
-            {f.expenses.recurring.map(b => (
-              <div key={b.id} style={hud.phoneLine}><span>{b.category === 'housing' ? '🏠' : '📄'} {b.name} — ${b.amount.toFixed(2)}</span><span>in {daysUntil(b.nextDueAt)}d</span></div>
-            ))}
-            {f.income.job && (
-              <div style={hud.phoneLine}><span>💼 {f.income.job.name} pay</span><span>${(f.income.job.payPerHour * f.income.job.hoursPerWeek).toFixed(2)}/wk</span></div>
-            )}
-          </div>
+      <div style={{ ...hud.modal, width: 'min(320px, 92vw)', textAlign: 'center' }} onClick={e => e.stopPropagation()}>
+        <div style={{ fontSize: 44 }}>🐷</div>
+        <h3 style={{ margin: '4px 0 2px' }}>Piggy bank</h3>
+        <div style={{ fontSize: 28, fontWeight: 700, color: '#f0a0c0' }}>${f.savings.toFixed(2)}</div>
+        <div style={{ fontSize: 12, opacity: 0.7, marginBottom: 12 }}>Cash in your pocket: ${f.cash.toFixed(2)}</div>
+        {goal?.def.id === 'save_event' && !goal.achieved && (
+          <div style={{ fontSize: 12, color: '#ffd23f', marginBottom: 10 }}>🎟️ Fair goal: $10 saved by Saturday</div>
         )}
-
-        {/* Goals */}
-        {state.goals.active.length > 0 && (
-          <div style={hud.phoneSection}>
-            <div style={hud.phoneSectionTitle}>GOALS</div>
-            {state.goals.active.map(g => {
-              const pct = g.kind === 'financial' ? Math.min(100, Math.round((g.saved / Math.max(1, g.target)) * 100)) : g.completed ? 100 : 0;
-              return (
-                <div key={g.id} style={{ marginBottom: 8 }}>
-                  <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 12 }}>
-                    <span>{g.kind === 'financial' ? g.name : g.description}</span>
-                    {g.kind === 'financial' && <span>${g.saved.toFixed(0)} / ${g.target.toFixed(0)}</span>}
-                  </div>
-                  <div style={hud.phoneBarTrack}><div style={{ ...hud.phoneBarFill, width: `${pct}%` }} /></div>
-                </div>
-              );
-            })}
-          </div>
-        )}
-
-        {/* Spending breakdown (last 7 days) */}
-        <div style={hud.phoneSection}>
-          <div style={hud.phoneSectionTitle}>SPENT THIS WEEK — ${weekSpent.toFixed(2)}</div>
-          {spendRows.length === 0 && <div style={{ fontSize: 12, opacity: 0.6 }}>Nothing spent yet.</div>}
-          {spendRows.map(([cat, amt]) => (
-            <div key={cat} style={{ marginBottom: 6 }}>
-              <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 12 }}>
-                <span>{CATEGORY_EMOJI[cat] ?? '💳'} {cat.replace('_', ' ')}</span><span>${amt.toFixed(2)}</span>
-              </div>
-              <div style={hud.phoneBarTrack}><div style={{ ...hud.phoneBarFill, width: `${Math.round((amt / maxSpend) * 100)}%`, background: '#ffab40' }} /></div>
-            </div>
-          ))}
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
+          <button style={hud.choiceBtn} disabled={f.cash < 1} onClick={() => move(() => store.moveToSavings(1))}>Save $1</button>
+          <button style={hud.choiceBtn} disabled={f.cash < 5} onClick={() => move(() => store.moveToSavings(5))}>Save $5</button>
+          <button style={hud.choiceBtn} disabled={f.savings < 1} onClick={() => move(() => store.takeFromSavings(1))}>Take $1</button>
+          <button style={hud.choiceBtn} disabled={f.savings <= 0} onClick={() => move(() => store.takeFromSavings(f.savings))}>Take it all</button>
         </div>
-
-        {/* Recent transactions */}
-        <div style={hud.phoneSection}>
-          <div style={hud.phoneSectionTitle}>RECENT</div>
-          {recent.length === 0 && <div style={{ fontSize: 12, opacity: 0.6 }}>No transactions yet.</div>}
-          {recent.map(e => (
-            <div key={e.id} style={hud.phoneLine}>
-              <span>{CATEGORY_EMOJI[e.category] ?? '💳'} {e.description}</span>
-              <span style={{ color: e.amount < 0 ? '#ff8080' : '#7cfc00' }}>
-                {e.amount < 0 ? '-' : '+'}${Math.abs(e.amount).toFixed(2)}
-              </span>
-            </div>
-          ))}
-        </div>
-
-        {/* Achievements */}
-        <div style={hud.phoneSection}>
-          <div style={hud.phoneSectionTitle}>
-            ACHIEVEMENTS — {ACHIEVEMENTS.filter(a => isUnlocked(state, a.id)).length}/{ACHIEVEMENTS.length}
-          </div>
-          {ACHIEVEMENTS.map(a => {
-            const unlocked = isUnlocked(state, a.id);
-            return (
-              <div key={a.id} style={{ ...hud.phoneLine, opacity: unlocked ? 1 : 0.4 }}>
-                <span>{unlocked ? a.emoji : '🔒'} {a.name}</span>
-                <span style={{ fontSize: 10, opacity: 0.7, maxWidth: 150, textAlign: 'right' }}>{a.description}</span>
-              </div>
-            );
-          })}
-        </div>
+        <button style={{ ...btnStyle, marginTop: 14 }} onClick={onClose}>Done</button>
       </div>
     </div>
   );
@@ -1266,10 +1264,12 @@ function LevelSummaryModal({ summary: sm, onClose }: { summary: LevelSummary; on
     let live = true;
     setMentorTake(null);
     askMentorWeeklyRecap({
+      lifePath: sm.path, highlights: sm.highlights.map(h => h.text),
       startBalance: sm.startBalance, endBalance: sm.endBalance,
       daysAttended: sm.daysAttended, daysTotal: sm.daysTotal,
       schoolProjectDone: sm.schoolProjectDone, birthdayOutcome: sm.birthdayOutcome,
       unexpectedOutcome: sm.unexpectedOutcome, wentToArcade: sm.wentToArcade,
+      goalName: sm.goal?.name, goalAchieved: sm.goal?.achieved, savings: sm.savings, busSpent: sm.busSpent,
     }).then(reply => { if (live) setMentorTake(reply); });
     return () => { live = false; };
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -1279,34 +1279,54 @@ function LevelSummaryModal({ summary: sm, onClose }: { summary: LevelSummary; on
     : sm.birthdayOutcome === 'partial' ? '~ Paid Riley part of what you promised'
     : "✗ Didn't come through for Riley's birthday";
   const projectLine = sm.schoolProjectDone ? '✓ Got the school project supplies in time' : "✗ Never got the school project supplies";
-  const unexpectedLine = sm.unexpectedOutcome === 'paid' ? '⚡ Paid to top up the bus card'
-    : sm.unexpectedOutcome === 'walked' ? '⚡ Walked it off instead of paying'
-    : null;
+  const unexpectedLine = sm.unexpectedKind === 'bus'
+    ? (sm.unexpectedOutcome === 'paid' ? '⚡ Paid $3 to top up the bus card' : '⚡ Walked home instead of topping up the bus card')
+    : sm.unexpectedKind === 'shoe'
+      ? (sm.unexpectedOutcome === 'paid' ? '👟 Paid $4 to fix your shoe' : '👟 Taped your shoe instead of paying')
+      : null;
   return (
     <div style={hud.modalBackdrop}>
       <div style={{ ...hud.modal, width: 'min(400px, 92vw)' }}>
-        <h2 style={{ marginBottom: 4 }}>📅 Made It Through the Week</h2>
-        <div style={{ opacity: 0.7, fontSize: 13, marginBottom: 16 }}>Here's how the week actually went.</div>
+        <h2 style={{ marginBottom: 4 }}>📅 Your Week</h2>
+        <div style={{ opacity: 0.7, fontSize: 13, marginBottom: 12 }}>Here's how the week actually went.</div>
+        {sm.goal && (
+          <div style={{ padding: '10px 12px', borderRadius: 8, marginBottom: 12, background: sm.goal.achieved ? '#12351c' : '#3a1c1c', border: `1px solid ${sm.goal.achieved ? '#3fb950' : '#ff8080'}` }}>
+            <div style={{ fontSize: 11, opacity: 0.7 }}>YOUR GOAL</div>
+            <div style={{ fontWeight: 700 }}>{sm.goal.emoji} {sm.goal.name} — {sm.goal.achieved ? 'DONE ✓' : 'NOT THIS TIME'}</div>
+            <div style={{ fontSize: 12, opacity: 0.8 }}>{sm.goal.detail}</div>
+          </div>
+        )}
         <div style={{ display: 'flex', justifyContent: 'space-between', background: '#0d1117', borderRadius: 8, padding: '10px 14px', marginBottom: 14 }}>
           <div><div style={{ fontSize: 11, opacity: 0.6 }}>STARTED WITH</div><div style={{ fontSize: 18, fontWeight: 700 }}>${sm.startBalance.toFixed(2)}</div></div>
           <div style={{ fontSize: 20, opacity: 0.5, alignSelf: 'center' }}>→</div>
           <div><div style={{ fontSize: 11, opacity: 0.6 }}>ENDED WITH</div><div style={{ fontSize: 18, fontWeight: 700, color: net >= 0 ? '#7cfc00' : '#ff8080' }}>${sm.endBalance.toFixed(2)}</div></div>
         </div>
+        <div style={{ marginBottom: 6 }}>💵 Earned ${sm.earned.toFixed(2)} · Spent ${sm.spent.toFixed(2)}{sm.savings > 0 ? ` · ${pathRules(sm.path).savings.emoji} $${sm.savings.toFixed(2)} saved` : ''}</div>
+        {sm.path !== 'school' ? (
+          sm.highlights.map((h, i) => (
+            <div key={i} style={{ marginBottom: 6, color: h.tone === 'good' ? '#aef0a0' : h.tone === 'bad' ? '#ffa0a0' : undefined }}>
+              {h.icon} {h.text}
+            </div>
+          ))
+        ) : (<>
         <div style={{ marginBottom: 6 }}>🏫 School: {sm.daysAttended}/{sm.daysTotal} days attended</div>
         <div style={{ marginBottom: 6 }}>{projectLine}</div>
         <div style={{ marginBottom: 6 }}>{birthdayLine}</div>
         {unexpectedLine && <div style={{ marginBottom: 6 }}>{unexpectedLine}</div>}
         <div style={{ marginBottom: 6 }}>{sm.wentToArcade ? '🕹️ Made it to the arcade with friends' : '🕹️ Skipped the arcade this week'}</div>
+        {sm.dairyShift && <div style={{ marginBottom: 6 }}>📦 Worked a shift at the Dairy (+$8)</div>}
+        <div style={{ marginBottom: 6 }}>{sm.fairAttended ? '🎟️ Went to the school fair' : '🎟️ Missed the school fair'}</div>
         <div style={{ marginBottom: 6 }}>
           {sm.busRides > 0
             ? `🚌 ${sm.busRides} bus ride${sm.busRides === 1 ? '' : 's'} — $${sm.busSpent.toFixed(2)} spent on the bus`
             : '🚶 Walked everywhere — $0 on fares'}
         </div>
+        </>)}
         <div style={{ marginTop: 14, padding: '10px 12px', background: '#0d1117', borderRadius: 8, borderLeft: '3px solid #60b8ff' }}>
           <div style={{ fontSize: 11, opacity: 0.6, marginBottom: 4 }}>🧑‍🏫 KAI'S TAKE</div>
           <div style={{ fontSize: 13, lineHeight: 1.4 }}>{mentorTake ?? 'Thinking it over…'}</div>
         </div>
-        <button style={{ ...btnStyle, marginTop: 16 }} onClick={onClose}>Start next week</button>
+        <button style={{ ...btnStyle, marginTop: 16 }} onClick={onClose}>Back to Sunday</button>
       </div>
     </div>
   );
@@ -1370,8 +1390,9 @@ function draw(ctx: CanvasRenderingContext2D, cw: number, ch: number, store: Game
     ctx.font = `bold ${Math.round(TILE_PX * 0.22)}px sans-serif`;
     ctx.textAlign = 'center';
     ctx.fillStyle = '#fff'; ctx.strokeStyle = '#000'; ctx.lineWidth = 2;
-    ctx.strokeText(p.name, x + w / 2, y + h + TILE_PX * 0.3);
-    ctx.fillText(p.name, x + w / 2, y + h + TILE_PX * 0.3);
+    const label = placeName(s.lifePath, p.id, p.name);
+    ctx.strokeText(label, x + w / 2, y + h + TILE_PX * 0.3);
+    ctx.fillText(label, x + w / 2, y + h + TILE_PX * 0.3);
   }
 
   // This step — Part 2: a real, visible bus stop (a sign at the stop tile) rather than an invisible
@@ -1396,8 +1417,8 @@ function draw(ctx: CanvasRenderingContext2D, cw: number, ch: number, store: Game
     ctx.fillText('🚏', x, y - TILE_PX * 0.9);
     ctx.font = `bold ${Math.round(TILE_PX * 0.16)}px monospace`;
     ctx.fillStyle = '#fff'; ctx.strokeStyle = '#000'; ctx.lineWidth = 2;
-    ctx.strokeText(stop.name, x, y + TILE_PX * 0.35);
-    ctx.fillText(stop.name, x, y + TILE_PX * 0.35);
+    ctx.strokeText(pathText(s.lifePath, stop.name), x, y + TILE_PX * 0.35);
+    ctx.fillText(pathText(s.lifePath, stop.name), x, y + TILE_PX * 0.35);
     if (arrived) {
       // a plain rectangle "bus" (Rule 50: no supplied bus sprite) parked just beside the sign —
       // present the moment busAtStop() is true, gone the moment it isn't, so the world always
@@ -1525,26 +1546,8 @@ function drawInterior(ctx: CanvasRenderingContext2D, cw: number, ch: number, sto
     ctx.font = `${Math.round(T * 0.28)}px monospace`;
     ctx.textAlign = 'center';
     ctx.fillStyle = '#fff'; ctx.strokeStyle = '#000'; ctx.lineWidth = 2;
-    ctx.strokeText(link.label, link.tile.x * T, link.tile.y * T - T * 0.4);
-    ctx.fillText(link.label, link.tile.x * T, link.tile.y * T - T * 0.4);
-  }
-
-  // shop products (Phase 10) — a real price tag at each product's spot on the shelf, not a menu
-  if (interior.shopItems) {
-    for (const item of interior.shopItems) {
-      const x = item.tx * T, y = item.ty * T;
-      ctx.fillStyle = 'rgba(255,255,255,0.9)';
-      ctx.strokeStyle = '#333'; ctx.lineWidth = 1;
-      const w = T * 0.62, h = T * 0.32;
-      ctx.fillRect(x - w / 2, y - h / 2, w, h);
-      ctx.strokeRect(x - w / 2, y - h / 2, w, h);
-      ctx.font = `bold ${Math.round(T * 0.16)}px monospace`;
-      ctx.textAlign = 'center';
-      ctx.fillStyle = '#222';
-      ctx.fillText(item.name, x, y - T * 0.02);
-      ctx.fillStyle = '#0a7a3a';
-      ctx.fillText(`$${item.price.toFixed(2)}`, x, y + T * 0.14);
-    }
+    ctx.strokeText(pathText(s.lifePath, link.label), link.tile.x * T, link.tile.y * T - T * 0.4);
+    ctx.fillText(pathText(s.lifePath, link.label), link.tile.x * T, link.tile.y * T - T * 0.4);
   }
 
   // furniture (Y-sorted with the player below)
@@ -1619,6 +1622,22 @@ function drawInterior(ctx: CanvasRenderingContext2D, cw: number, ch: number, sto
       }
     },
   });
+  // Shop products: a price card with the product's icon, sitting on the front edge of its shelf.
+  // Sorted just after the furniture it sits on (so the shelf never hides it) but before a player
+  // standing in front of it. The item in reach is outlined; items on the active shopping list glow.
+  if (interior.shopItems) {
+    const nearId = store.nearbyShopItem()?.id;
+    const list = store.shoppingProgress();
+    const tagPulse = 0.55 + Math.sin(performance.now() / 260) * 0.25;
+    for (const item of interior.shopItems) {
+      const under = interior.furniture.filter(f => item.tx >= f.tx - 0.3 && item.tx <= f.tx + f.tw + 0.3 && item.ty >= f.ty - 0.3 && item.ty <= f.ty + f.th + 0.3);
+      const sortY = Math.max(item.ty, ...under.map(f => f.ty + f.th)) * T + 0.5;
+      const needIdx = list ? list.need.findIndex(p => item.id.startsWith(p)) : -1;
+      const wanted = needIdx >= 0 && !list!.covered[needIdx];
+      drawables.push({ y: sortY, draw: () => drawPriceTag(ctx, item, T, item.id === nearId, wanted ? tagPulse : 0) });
+    }
+  }
+
   drawables.sort((a, b) => a.y - b.y);
   for (const d of drawables) d.draw();
 
@@ -1627,7 +1646,43 @@ function drawInterior(ctx: CanvasRenderingContext2D, cw: number, ch: number, sto
   ctx.fillStyle = '#fff';
   ctx.font = 'bold 14px monospace';
   ctx.textAlign = 'center';
-  ctx.fillText(interior.name.toUpperCase(), cw / 2, oy - 16);
+  ctx.fillText(pathText(s.lifePath, interior.name).toUpperCase(), cw / 2, oy - 16);
+}
+
+/** One product's shelf tag: icon on the left, name and price on the right. */
+function drawPriceTag(ctx: CanvasRenderingContext2D, item: ShopItemDef, T: number, near: boolean, glow: number) {
+  const x = item.tx * T, y = item.ty * T;
+  const w = T * 0.94, h = T * 0.5, left = x - w / 2, top = y - h / 2;
+  if (glow > 0) {
+    ctx.fillStyle = `rgba(124,252,0,${glow * 0.55})`;
+    ctx.fillRect(left - 4, top - 4, w + 8, h + 8);
+  }
+  ctx.fillStyle = 'rgba(0,0,0,0.35)';
+  ctx.fillRect(left + 2, top + 3, w, h);                      // drop shadow
+  ctx.fillStyle = near ? '#fff7cf' : '#fdfdf8';
+  ctx.fillRect(left, top, w, h);
+  ctx.lineWidth = near ? 2.5 : 1;
+  ctx.strokeStyle = near ? '#f0c038' : '#3a3a3a';
+  ctx.strokeRect(left, top, w, h);
+  ctx.textBaseline = 'middle';
+  ctx.textAlign = 'center';
+  ctx.font = `${Math.round(T * 0.26)}px sans-serif`;
+  ctx.fillText(item.icon ?? '🏷️', left + T * 0.17, y + 1);
+  ctx.textAlign = 'left';
+  ctx.fillStyle = '#1e1e1e';
+  // Shrink long names (e.g. "Poster Board") until they fit inside the card.
+  const avail = w - T * 0.36;
+  let size = T * 0.135;
+  ctx.font = `bold ${size}px monospace`;
+  while (ctx.measureText(item.name).width > avail && size > T * 0.085) {
+    size -= 0.5;
+    ctx.font = `bold ${size}px monospace`;
+  }
+  ctx.fillText(item.name, left + T * 0.33, y - h * 0.2, avail);
+  ctx.fillStyle = '#0a7a3a';
+  ctx.font = `bold ${Math.round(T * 0.15)}px monospace`;
+  ctx.fillText(`$${item.price.toFixed(2)}`, left + T * 0.33, y + h * 0.22);
+  ctx.textBaseline = 'alphabetic';
 }
 
 /** Phase 14: a real "riding the bus" screen — no matching bus-interior sprite was supplied in the
@@ -1675,7 +1730,7 @@ function drawBusRide(ctx: CanvasRenderingContext2D, cw: number, ch: number, stor
   ctx.fillText(`${BUS_ROUTE.name}`, cx, panelY - 34);
   ctx.font = '14px monospace';
   ctx.fillStyle = '#cfd8e3';
-  ctx.fillText(`${from.name} → ${to.name}`, cx, panelY - 12);
+  ctx.fillText(`${pathText(s.lifePath, from.name)} → ${pathText(s.lifePath, to.name)}`, cx, panelY - 12);
 
   // progress bar with the two stop names anchored at each end
   const barY = panelY + 220, barW = panelW;
@@ -1686,8 +1741,8 @@ function drawBusRide(ctx: CanvasRenderingContext2D, cw: number, ch: number, stor
   ctx.beginPath(); ctx.arc(cx - barW / 2 + barW * pct, barY + 5, 7, 0, Math.PI * 2); ctx.fill();
   ctx.font = '12px monospace';
   ctx.fillStyle = '#9aa4b2';
-  ctx.textAlign = 'left'; ctx.fillText(from.name, cx - barW / 2, barY + 26);
-  ctx.textAlign = 'right'; ctx.fillText(to.name, cx + barW / 2, barY + 26);
+  ctx.textAlign = 'left'; ctx.fillText(pathText(s.lifePath, from.name), cx - barW / 2, barY + 26);
+  ctx.textAlign = 'right'; ctx.fillText(pathText(s.lifePath, to.name), cx + barW / 2, barY + 26);
 
   const remaining = Math.max(0, Math.ceil(ride.endsAt - s.minutes));
   ctx.textAlign = 'center';
@@ -1699,32 +1754,79 @@ function drawBusRide(ctx: CanvasRenderingContext2D, cw: number, ch: number, stor
   ctx.fillText(ride.fare > 0 ? `Fare paid: $${ride.fare.toFixed(2)}` : 'Riding on your bus pass', cx, barY + 72);
 }
 
+interface Toast {
+  key: string;
+  icon: string;
+  label?: string;
+  lines: string[];
+  tone?: 'plain' | 'gold' | 'blue' | 'green';
+  ms?: number;
+  onClick?: () => void;
+}
+const TOAST_COLORS: Record<NonNullable<Toast['tone']>, string> = { plain: '#555', gold: '#ffd23f', blue: '#7cc7ff', green: '#3fb950' };
+
+/** Keyframes for the go-home / goodnight transition. The runner uses the player's real run sheet
+ *  (6 frames × 16px per direction; "right" is the 4th direction), scaled 4×. */
+const TRANSITION_CSS = `
+@keyframes mmFade { 0% { opacity: 0 } 15% { opacity: 1 } 85% { opacity: 1 } 100% { opacity: 0 } }
+@keyframes mmPop { from { transform: scale(0.85); opacity: 0 } to { transform: scale(1); opacity: 1 } }
+@keyframes mmPhoneUp { from { transform: translateY(40px); opacity: 0 } to { transform: translateY(0); opacity: 1 } }
+@keyframes mmToastIn { from { transform: translateY(-12px); opacity: 0 } to { transform: translateY(0); opacity: 1 } }
+@keyframes mmPulse { 0%, 100% { transform: scale(1) } 50% { transform: scale(1.08) } }
+@keyframes mmRunFrames { from { background-position: -1152px 0 } to { background-position: -1536px 0 } }
+@keyframes mmRunAcross { from { left: -80px } to { left: 100% } }
+@keyframes mmTwinkle { 0%, 100% { opacity: .35 } 50% { opacity: 1 } }
+.mm-runner { position: absolute; bottom: 22%; width: 64px; height: 128px; image-rendering: pixelated;
+  background: url(/characters/adam/run.png) 0 0 / 1536px 128px no-repeat;
+  animation: mmRunFrames .54s steps(6) infinite, mmRunAcross 3s linear forwards; }
+.mm-moon { position: absolute; top: 12%; right: 16%; width: 56px; height: 56px; border-radius: 50%;
+  background: #fdf4c4; box-shadow: 0 0 40px 8px rgba(253,244,196,.35); }
+.mm-stars { position: absolute; inset: 0; animation: mmTwinkle 1.6s ease-in-out infinite;
+  background-image: radial-gradient(2px 2px at 10% 20%, #fff, transparent), radial-gradient(2px 2px at 30% 10%, #fff, transparent),
+    radial-gradient(2px 2px at 55% 25%, #fff, transparent), radial-gradient(2px 2px at 75% 8%, #fff, transparent),
+    radial-gradient(2px 2px at 88% 30%, #fff, transparent), radial-gradient(2px 2px at 20% 40%, #fff, transparent); }
+`;
+
 const hud: Record<string, React.CSSProperties> = {
-  bar: {
-    position: 'absolute', top: 0, left: 0, right: 0, minHeight: 38, background: 'rgba(0,0,0,0.75)',
-    display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 8, rowGap: 4, padding: '4px 10px', color: '#fff',
-    fontFamily: 'monospace', fontSize: 13, zIndex: 10,
+  transition: {
+    position: 'absolute', inset: 0, zIndex: 60, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center',
+    background: 'linear-gradient(#0b1030 0%, #1b1f4a 60%, #2c2350 100%)', overflow: 'hidden', animation: 'mmFade 3s ease-in-out forwards',
   },
-  btnGroup: { marginLeft: 'auto', display: 'flex', flexWrap: 'wrap', gap: 6 },
+  topLeft: { position: 'absolute', top: 12, left: 12, zIndex: 10, fontFamily: 'monospace', color: '#fff', textShadow: '0 1px 2px #000', maxWidth: 260 },
+  clock: { display: 'inline-block', background: 'rgba(10,10,20,0.75)', border: '1px solid #444', borderRadius: 8, padding: '4px 10px', fontSize: 13, color: '#ffd23f', marginBottom: 8 },
+  objectiveBtn: { background: 'rgba(18,53,28,0.9)', border: '1px solid #3fb950', borderRadius: 8, padding: '6px 10px', color: '#fff', textAlign: 'left', cursor: 'pointer', fontFamily: 'monospace', animation: 'mmPulse 1.6s ease-in-out infinite' },
+  topRight: { position: 'absolute', top: 12, right: 12, zIndex: 10, display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 6, fontFamily: 'monospace' },
+  money: { background: 'rgba(10,10,20,0.75)', border: '1px solid #444', borderRadius: 8, padding: '4px 12px', fontSize: 18, fontWeight: 700, color: '#7cfc00', textShadow: '0 1px 2px #000' },
+  energyRow: { display: 'flex', alignItems: 'center', gap: 6, background: 'rgba(10,10,20,0.75)', border: '1px solid #444', borderRadius: 8, padding: '4px 10px' },
+  energyTrack: { width: 110, height: 8, background: '#2a2d36', borderRadius: 4, overflow: 'hidden' },
+  energyFill: { height: '100%', borderRadius: 4, transition: 'width 300ms' },
+  phoneBtn: {
+    position: 'absolute', right: 24, bottom: 206, width: 58, height: 58, borderRadius: 16, zIndex: 26, fontSize: 28,
+    background: 'linear-gradient(#2a2d36, #14161c)', border: '2px solid #555', color: '#fff', cursor: 'pointer', boxShadow: '0 4px 14px rgba(0,0,0,0.5)',
+  },
+  phoneBadge: { position: 'absolute', top: -6, right: -6, minWidth: 22, height: 22, borderRadius: 11, background: '#f85149', fontSize: 12, fontWeight: 700, display: 'flex', alignItems: 'center', justifyContent: 'center', fontFamily: 'monospace', animation: 'mmPulse 1.2s ease-in-out infinite' },
+  phoneKey: { position: 'absolute', bottom: -18, left: 0, right: 0, fontSize: 10, fontFamily: 'monospace', opacity: 0.7, textShadow: '0 1px 2px #000' },
+  toastStack: { position: 'absolute', top: 12, left: '50%', transform: 'translateX(-50%)', zIndex: 40, display: 'flex', flexDirection: 'column', gap: 6, width: 'min(380px, 60vw)' },
+  toast: {
+    display: 'flex', alignItems: 'center', gap: 10, background: 'rgba(20,16,30,0.95)', border: '1px solid', borderRadius: 10,
+    padding: '8px 14px', color: '#fff', fontFamily: 'monospace', fontSize: 13, animation: 'mmToastIn 220ms ease-out', boxShadow: '0 4px 20px rgba(0,0,0,0.4)',
+  },
   smallBtn: { background: '#222', color: '#fff', border: '1px solid #444', borderRadius: 4, padding: '4px 8px', cursor: 'pointer', fontSize: 12 },
-  waypoint: { position: 'absolute', top: 44, left: 12, color: '#ffd23f', fontFamily: 'monospace', fontSize: 13, textShadow: '0 1px 2px #000', zIndex: 10 },
   // Step 26: compact "what should I care about right now?" card — deliberately small (no border/
   // background box beyond a soft shadow) so it reads as part of the game HUD, not a debug panel.
-  objective: {
-    position: 'absolute', top: 44, left: 12, zIndex: 10, fontFamily: 'monospace',
-    textShadow: '0 1px 2px #000', maxWidth: 220,
-  },
+  objective: { fontFamily: 'monospace', textShadow: '0 1px 2px #000', maxWidth: 240 },
   objectiveLabel: { fontSize: 11, color: '#ffd23f', letterSpacing: 0.5, opacity: 0.9 },
   objectiveName: { fontSize: 14, color: '#fff', fontWeight: 700, marginTop: 1 },
   objectiveLocation: { fontSize: 12, color: '#ffd23f', marginTop: 1 },
-  relationships: {
-    position: 'absolute', top: 48, right: 12, width: 'min(200px, 60vw)',
-    background: 'rgba(10,10,20,0.92)', border: '1px solid #444', borderRadius: 10, padding: 12,
-    color: '#fff', fontFamily: 'monospace', zIndex: 20,
-  },
   exitHint: { position: 'absolute', bottom: 12, left: 12, color: '#fff', fontFamily: 'monospace', fontSize: 12, background: 'rgba(0,0,0,0.6)', padding: '6px 10px', borderRadius: 6, zIndex: 10 },
   buyPrompt: { position: 'absolute', bottom: 12, left: '50%', transform: 'translateX(-50%)', color: '#ffd700', fontFamily: 'monospace', fontSize: 13, background: 'rgba(0,0,0,0.75)', padding: '8px 14px', borderRadius: 8, zIndex: 10 },
   sleepBtn: { position: 'absolute', bottom: 12, left: 12, ...btnStyle, width: 'auto', padding: '8px 14px', zIndex: 10 },
+  homeBtns: { position: 'absolute', bottom: 48, left: 12, display: 'flex', gap: 8, zIndex: 10 },
+  goalChip: {
+    width: 'min(230px, 55vw)', cursor: 'pointer', textAlign: 'left',
+    background: 'rgba(10,10,20,0.8)', border: '1px solid #444', borderRadius: 8, padding: '6px 10px',
+    color: '#fff', fontFamily: 'monospace', fontSize: 12,
+  },
   dialogue: {
     position: 'absolute', bottom: 16, left: '50%', transform: 'translateX(-50%)', width: 'min(480px, 92vw)',
     background: 'rgba(10,10,20,0.92)', border: '1px solid #444', borderRadius: 10, padding: 16,
@@ -1732,13 +1834,8 @@ const hud: Record<string, React.CSSProperties> = {
   },
   choiceBtn: { textAlign: 'left', background: '#1c2440', border: '1px solid #3a4a7a', borderRadius: 6, color: '#fff', padding: '8px 10px', cursor: 'pointer' },
   choiceBtnDisabled: { opacity: 0.45, cursor: 'not-allowed' },
-  journal: {
-    position: 'absolute', top: 48, right: 12, width: 'min(280px, 90vw)', maxHeight: '60vh', overflowY: 'auto',
-    background: 'rgba(10,10,20,0.92)', border: '1px solid #444', borderRadius: 10, padding: 14,
-    color: '#fff', fontFamily: 'monospace', zIndex: 20,
-  },
   shoppingList: {
-    position: 'absolute', top: 48, left: 12, width: 'min(200px, 55vw)',
+    position: 'absolute', top: 132, left: 12, width: 'min(200px, 55vw)',
     background: 'rgba(10,10,20,0.92)', border: '1px solid #444', borderRadius: 10, padding: 12,
     color: '#fff', fontFamily: 'monospace', zIndex: 15,
   },
@@ -1764,44 +1861,8 @@ const hud: Record<string, React.CSSProperties> = {
   },
   modalBackdrop: { position: 'absolute', inset: 0, background: 'rgba(0,0,0,0.7)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 30 },
   modal: { width: 'min(360px, 92vw)', maxHeight: '85vh', overflowY: 'auto', background: '#161b22', border: '1px solid #30363d', borderRadius: 10, padding: 24, color: '#fff', fontFamily: 'monospace' },
-  phone: {
-    width: 'min(320px, 92vw)', maxHeight: '85vh', overflowY: 'auto', background: '#14161c',
-    border: '3px solid #2a2d36', borderRadius: 22, padding: 18,
-    color: '#fff', fontFamily: 'monospace', boxShadow: '0 10px 40px rgba(0,0,0,0.6)',
-  },
-  phoneBalance: { textAlign: 'center', background: '#1c1f27', borderRadius: 12, padding: '12px 8px', marginBottom: 12 },
-  phoneStat: { flex: 1, background: '#1c1f27', borderRadius: 8, padding: '6px 8px', textAlign: 'center' },
-  phoneSection: { background: '#1a1c23', borderRadius: 10, padding: '10px 12px', marginBottom: 10 },
-  phoneSectionTitle: { fontSize: 11, opacity: 0.6, marginBottom: 6, letterSpacing: 0.5 },
-  phoneLine: { display: 'flex', justifyContent: 'space-between', fontSize: 12, marginBottom: 5, gap: 8 },
   phoneBarTrack: { height: 6, background: '#2a2d36', borderRadius: 4, overflow: 'hidden' },
   phoneBarFill: { height: '100%', background: '#3fb950', borderRadius: 4 },
-  achievementToast: {
-    position: 'absolute', top: 48, left: '50%', transform: 'translateX(-50%)',
-    display: 'flex', alignItems: 'center', gap: 10,
-    background: 'rgba(20,16,30,0.95)', border: '1px solid #ffd23f', borderRadius: 10,
-    padding: '8px 16px', color: '#fff', fontFamily: 'monospace', zIndex: 40,
-    boxShadow: '0 4px 20px rgba(255,210,63,0.25)',
-  },
-  // Step 26: same shape as achievementToast, positioned lower so the (rare) case of both firing at
-  // once stacks rather than overlaps. Non-blocking overlay — it never intercepts input or pauses
-  // the game, and self-dismisses via the same setTimeout pattern.
-  missionToast: {
-    position: 'absolute', top: 96, left: '50%', transform: 'translateX(-50%)',
-    display: 'flex', alignItems: 'center', gap: 10,
-    background: 'rgba(20,16,30,0.95)', border: '1px solid #7cc7ff', borderRadius: 10,
-    padding: '8px 16px', color: '#fff', fontFamily: 'monospace', zIndex: 40,
-    boxShadow: '0 4px 20px rgba(124,199,255,0.25)',
-  },
-  // Step 27: a third toast slot, stacked below the other two so all three can never overlap even
-  // in the (very rare) case they all fire close together.
-  activityToast: {
-    position: 'absolute', top: 144, left: '50%', transform: 'translateX(-50%)',
-    display: 'flex', alignItems: 'center', gap: 10,
-    background: 'rgba(20,16,30,0.95)', border: '1px solid #7cfc00', borderRadius: 10,
-    padding: '8px 16px', color: '#fff', fontFamily: 'monospace', zIndex: 40,
-    boxShadow: '0 4px 20px rgba(124,252,0,0.2)',
-  },
   // Step 27 — the reusable short activity sequence overlay (Help Parents today; any future
   // Level 1-2 activity per the Step 27 audit can reuse this same box+progress-bar shape).
   // Deliberately small and non-blocking-looking (no full-screen backdrop) — an overlay, not a modal.

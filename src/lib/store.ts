@@ -15,28 +15,49 @@ import type { ActivityDef } from '../game/types/activity';
 import { FinanceSystem } from '../game/systems/financeSystem';
 import { EnergySystem } from '../game/systems/energySystem';
 import { ActivitySystem, type ActivityClock, type ActivityPlayer } from '../game/systems/activitySystem';
-import { ATTEND_CLASS } from '../game/content/school/mondayActivities';
 import { HELP_PARENTS } from '../game/content/schoolActivities';
 import { migrateSave } from './saveMigration';
+import { getWeekGoal, type LifePath, type WeekGoalDef } from './gameData';
+import { pathRules, type PathRules } from './pathRules';
+import { didWeeklyShop } from './content/university';
+
+/** Small deterministic RNG (mulberry32), so a given save + day always rolls the same tasks. */
+function seededRandom(seed: number): () => number {
+  let a = seed >>> 0;
+  return () => {
+    a = (a + 0x6D2B79F5) >>> 0;
+    let t = a;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+function hashString(str: string): number {
+  let h = 2166136261;
+  for (let i = 0; i < str.length; i++) { h ^= str.charCodeAt(i); h = Math.imul(h, 16777619); }
+  return h >>> 0;
+}
 import {
   Emit, MissionChoice, MissionDef, getDef, initialMissionRuntime, markKey, hasMark,
-  missionDefs, missionsOnDayStart, missionsOnEvent, missionsOnMinute, missionWindowOpen,
+  missionDefs, missionsOnDayStart, missionsOnEvent, missionsOnMinute, missionWindowOpen, offeredToday,
 } from './missions';
+import type { MissionStep } from './missions';
+import { DAILY_POOLS } from './dailyMissions';
 import type {
   ActivityTag, DayRecord, GameEvent, GameState, MissionRuntime, NpcRuntime, PlaceId, SceneId, WeekRecord,
 } from './types';
 import { ACHIEVEMENTS, checkAchievements } from './achievements';
 import { LIFE_EVENTS, rollLifeEvent } from './lifeEvents';
 import {
-  BIKE_MIN_PER_TILE, BUS_ROUTE, BUS_STOPS, NPCS, TILE_PX, WALK_MIN_PER_TILE, busAtStop,
+  BIKE_MIN_PER_TILE, BUS_ROUTE, BUS_STOPS, NPCS, TILE_PX, WALK_MIN_PER_TILE, busAtStop, distanceTiles,
   doorTile, getPlace, isOpen, closedReason, npcPlaceAt, rideMinutes, routeTiles, stopById, tileToPx,
-  getInterior, INTERIOR_TILE_PX, PLACE_INTERIOR_SCENE, npcRoomAt,
+  getInterior, INTERIOR_TILE_PX, PLACE_INTERIOR_SCENE, npcRoomAt, interiorBlocked,
 } from './world';
 import type { ShopItemDef } from './world';
 
 export const BASE_MINUTES_PER_SECOND = TIME_SCALE;
 const RIDE_REAL_SECONDS = 6;          // a bus trip plays out over ~6 real seconds
-const SCHOOL_END = hm(15, 30);
+const SCHOOL_END = hm(15, 30);         // anyone who never made it to class/lectures is absent from here
 const PASS_OUT_AT = hm(2, 0);         // stay up past 2 AM and you fall asleep where you are
 const WAKE_AT = hm(7, 0);
 
@@ -64,7 +85,7 @@ export function createInitialState(
     finance,
     goals,
     energy: { current: 100, max: 100, recoveryPerHourAsleep: 12.5 },
-    world: { flags: [], relationships: { Mum: 3, Jordan: 2, Riley: 1 }, dailyMarks: [], busPass: null, hasBike: false },
+    world: { flags: [`seed:${Math.floor(Math.random() * 1e9)}`], relationships: { ...pathRules(lifePath).relationships }, dailyMarks: [], busPass: null, hasBike: false },
     missions: initialMissionRuntime(defs),
     npcs: {},
     today: emptyDay(0, finance.accounts.cash),
@@ -90,7 +111,42 @@ export interface LevelSummary {
   /** Real bus use this week, straight from the travel log and the ledger. */
   busRides: number;
   busSpent: number;
+  /** The goal picked on Monday, and whether it happened. */
+  goal: { id: string; emoji: string; name: string; achieved: boolean; detail: string } | null;
+  unexpectedKind: 'bus' | 'shoe' | null;
+  fairAttended: boolean;
+  dairyShift: boolean;
+  savings: number;
+  earned: number;
+  spent: number;
+  /** which path's week this was, and that path's own story beats (University etc.) as ready-made
+   *  lines — the School recap keeps its dedicated fields above. */
+  path: LifePath;
+  highlights: RecapLine[];
 }
+export interface RecapLine { icon: string; text: string; tone: 'good' | 'bad' | 'neutral' }
+
+/** Live status of this week's goal, for the HUD bar and the Sunday recap. */
+export interface GoalStatus {
+  def: WeekGoalDef;
+  achieved: boolean;
+  /** 0..1 for the HUD bar */
+  progress: number;
+  detail: string;
+}
+
+/** Flags that describe one week. Cleared when the next week's pocket money arrives, so last
+ *  week's arcade trip can't count toward this week's goal. */
+const WEEK_FLAG_PREFIXES = [
+  'wk_', // every path's newer content marks its week-only flags with this prefix
+  'goal:', 'friends_base:', 'birthday_', 'unexpected_', 'school_project_', 'school_fair_', 'dairy_shift_',
+  'errand_', 'arcade_visit', 'park_alternative', 'bought_', 'late_to_school', 'ate_home_lunch', 'skipped_lunch',
+  'did_homework', 'got_pocket_money', 'week_started', 'on_time', 'pocket_money_done', 'birthday_resolved',
+  'team_', 'lent_jordan', 'jordan_owes_', 'project_day_', 'baked_cookies', 'fell_for_scam', 'spotted_scam',
+];
+/** Energy lost per game-hour of free play (activities like class carry their own costs). */
+const ENERGY_DRAIN_PER_HOUR = 3;
+const LOW_ENERGY = 15;
 
 /** Result of running an ActivityDef against the live game (Attend Class, Help Parents, …). */
 export interface ActivityOutcome {
@@ -104,8 +160,6 @@ export interface ActivityOutcome {
 
 /** Status of today's lesson for the Attend Class prompt. */
 export type ClassStatus = 'ready' | 'go_to_classroom' | 'too_late' | 'done';
-const CLASS_BELL = hm(8, 30);
-const LAST_CLASS_START = hm(11, 30);
 
 export class GameStore {
   state: GameState;
@@ -142,8 +196,18 @@ export class GameStore {
   /** One-line notices for the HUD (e.g. "Closed — opens at 7:30 AM"), drained by takeNotices(). */
   private noticeQueue: string[] = [];
 
+  /** This path's rules (goals, cast, timetable, week start/recap) — see pathRules.ts. */
+  readonly rules: PathRules;
+  /** The NPCs who exist on this path. */
+  private cast: typeof NPCS;
+
   constructor(state: GameState) {
     this.state = state;
+    this.rules = pathRules(state.lifePath);
+    this.cast = NPCS.filter(n => this.rules.cast.includes(n.id));
+    // A save can be written while a menu had the clock paused (e.g. the "switch life path?" prompt);
+    // a freshly loaded game always starts running.
+    state.paused = false;
     if (state.currentActivity === undefined) state.currentActivity = null;
     this.money = new FinanceSystem(state.finance, tx => this.onTransaction(tx));
     this.energySys = new EnergySystem(state.energy);
@@ -169,6 +233,12 @@ export class GameStore {
       }
     }
     this.defs = missionDefs(state.lifePath);
+    // Saves from before a mission existed get a fresh runtime for it.
+    for (const def of this.defs) {
+      if (!state.missions.some(m => m.id === def.id)) state.missions.push({ id: def.id, state: 'locked', stepIndex: 0 });
+    }
+    if (!state.world.flags.some(f => f.startsWith('seed:'))) state.world.flags.push(`seed:${Math.floor(Math.random() * 1e9)}`);
+    this.rollDailyPool();
     // A save made while a mission had more steps than it does now points past its last step;
     // clamp it so the mission can still finish instead of silently hanging until it expires.
     for (const rt of state.missions) {
@@ -224,6 +294,7 @@ export class GameStore {
       minutes = dtSec * BASE_MINUTES_PER_SECOND * s.timeMultiplier;
     }
     this.advance(Math.min(minutes, 5), true);
+    if (!s.ride) this.drainEnergy(Math.min(minutes, 5) * ENERGY_DRAIN_PER_HOUR / 60);
     this.stepNpcs(minutes);
     if (s.ride && s.minutes >= s.ride.endsAt - 1e-6) this.finishRide();
     this.touch();
@@ -252,8 +323,9 @@ export class GameStore {
 
     if (p.minuteOfDay === 0) {
       this.emit({ type: 'day_start', day: p.day, minutes: s.minutes });
-      s.world.dailyMarks = s.world.dailyMarks.filter(m => Number(m.split(':')[1]) >= p.day - 1);
+      s.world.dailyMarks = s.world.dailyMarks.filter(m => Number(m.split(':').pop()) >= p.day - 1);
       missionsOnDayStart(s, this.defs, p.day);
+      this.rollDailyPool();
       // one small optional life event may land today, on top of the scripted mission schedule
       if (!s.pendingLifeEvent) {
         const ev = rollLifeEvent(s);
@@ -262,7 +334,7 @@ export class GameStore {
     }
 
     // school ends: anyone who never arrived is marked absent
-    if (s.lifePath === 'school' && p.dayOfWeek < 5 && p.minuteOfDay === SCHOOL_END && s.today.schoolAttended === null) {
+    if (this.rules.study && p.dayOfWeek < 5 && p.minuteOfDay === SCHOOL_END && s.today.schoolAttended === null) {
       s.today.schoolAttended = false;
       this.emit({ type: 'school_missed', day: p.day });
     }
@@ -290,6 +362,9 @@ export class GameStore {
   private economyOnMinute(p: ReturnType<typeof parts>) {
     const s = this.state, f = s.finance;
     if (p.minuteOfDay !== hm(9)) return;
+    if (p.dayOfWeek === 5 && this.weekGoalId() === 'save_event' && f.accounts.savings > 0 && f.accounts.cash < 10) {
+      this.pushNotice('Fair day! Take your savings out of the piggy bank before you head to school.');
+    }
     const job = f.income.job;
     if (p.dayOfWeek === 3 && job) {
       this.earn(job.payPerHour * job.hoursPerWeek, 'income', `${job.name} pay`, job.location);
@@ -326,12 +401,12 @@ export class GameStore {
   /** Piggy bank: move cash into savings (and back). Recorded as a linked pair of transfers. */
   moveToSavings(amount: number): boolean {
     if (!(amount > 0) || !this.money.canAfford('cash', amount)) return false;
-    this.money.transfer('cash', 'savings', amount, this.state.minutes, 'Into the piggy bank');
+    this.money.transfer('cash', 'savings', amount, this.state.minutes, this.rules.savings.atHome ? 'Into the piggy bank' : 'Into savings');
     return true;
   }
   takeFromSavings(amount: number): boolean {
     if (!(amount > 0) || !this.money.canAfford('savings', amount)) return false;
-    this.money.transfer('savings', 'cash', amount, this.state.minutes, 'Out of the piggy bank');
+    this.money.transfer('savings', 'cash', amount, this.state.minutes, this.rules.savings.atHome ? 'Out of the piggy bank' : 'Out of savings');
     return true;
   }
   /** Transactions since a game minute (e.g. this week), newest last. */
@@ -346,6 +421,7 @@ export class GameStore {
       else s.today.earned += tx.amount;
     }
     if (tx.amount < 0 && tx.type === 'expense') this.emit({ type: 'purchase', amount: -tx.amount, category: tx.category, label: tx.description });
+    this.syncGoals();
     this.touch();
   }
 
@@ -365,6 +441,246 @@ export class GameStore {
     this.touch();
   }
 
+  /** Being awake and on the move slowly tires you out. Warns once when you get low. */
+  private drainEnergy(amount: number) {
+    if (!(amount > 0)) return;
+    const before = this.state.energy.current;
+    this.energySys.consume(Math.min(amount, before));
+    if (before >= LOW_ENERGY && this.state.energy.current < LOW_ENERGY) {
+      this.pushNotice("You're exhausted — you'll move slower until you eat or sleep.");
+    }
+  }
+  get exhausted(): boolean { return this.state.energy.current < LOW_ENERGY; }
+
+  // ══ DAILY VARIETY ════════════════════════════════════════════════════════
+  get seed(): number {
+    return Number(this.state.world.flags.find(f => f.startsWith('seed:'))?.slice(5) ?? 1);
+  }
+  /** A number in [0,1) that's the same every time for this save + day + key, and different otherwise. */
+  private dayRandom(key: string): () => number {
+    return seededRandom(hashString(`${this.seed}|${parts(this.state.minutes).day}|${key}`));
+  }
+  /** Pick today's side tasks from each pool (once per day). */
+  rollDailyPool() {
+    const s = this.state, p = parts(s.minutes);
+    if (hasMark(s, 'pool_rolled')) return;
+    s.world.dailyMarks.push(markKey('pool_rolled', p.day));
+    // Nothing repeats within a week: every task offered this week is remembered (seen:<week>:<id>)
+    // and only comes back once its pool has run out of fresh ones.
+    const week = Math.floor(p.day / 7);
+    s.world.flags = s.world.flags.filter(f => !f.startsWith('seen:') || f.startsWith(`seen:${week}:`));
+    const seen = new Set(s.world.flags.filter(f => f.startsWith(`seen:${week}:`)).map(f => f.split(':')[2]));
+    for (const [pool, cfg] of Object.entries(DAILY_POOLS)) {
+      const rnd = this.dayRandom(`pool:${pool}`);
+      const candidates = this.defs.filter(d => d.pool === pool && d.paths.includes(s.lifePath)
+        && d.window.days.includes(p.dayOfWeek) && (!d.requires || d.requires(s)));
+      const fresh = candidates.filter(d => !seen.has(d.id)), repeats = candidates.filter(d => seen.has(d.id));
+      for (let i = 0; i < cfg.count; i++) {
+        const bag = fresh.length ? fresh : repeats;
+        if (!bag.length) break;
+        const pick = bag.splice(Math.floor(rnd() * bag.length), 1)[0];
+        if (rnd() < cfg.chance) {
+          s.world.dailyMarks.push(markKey(`pool:${pick.id}`, p.day));
+          s.world.flags.push(`seen:${week}:${pick.id}`);
+        }
+      }
+    }
+  }
+  /** The ids of today's rolled side tasks. */
+  todaysPool(): string[] {
+    const day = parts(this.state.minutes).day;
+    return this.state.world.dailyMarks.filter(m => m.startsWith('pool:') && m.endsWith(`:${day}`)).map(m => m.split(':')[1]);
+  }
+  /** The step as the player sees it today: the day's variant (if any), minus options hidden right now. */
+  stepFor(def: MissionDef, rt: MissionRuntime): MissionStep | undefined {
+    const base = def.steps[rt.stepIndex];
+    if (!base) return undefined;
+    let step: MissionStep = base;
+    if (base.variants?.length) {
+      const v = base.variants[Math.floor(this.dayRandom(`variant:${def.id}:${base.id}`)() * base.variants.length)];
+      step = { ...base, ...v, speaker: v.speaker ?? base.speaker, npcId: v.npcId ?? base.npcId, choices: v.choices ?? base.choices };
+    }
+    if (step.choices?.some(c => c.hideIf)) step = { ...step, choices: step.choices.filter(c => !c.hideIf || !c.hideIf(this.state)) };
+    return step;
+  }
+  private applyEffect(effect: NonNullable<MissionChoice['effect']>) {
+    const s = this.state, p = parts(s.minutes);
+    if (effect === 'bus_pass_week') s.world.busPass = { validUntil: at(p.day - p.dayOfWeek + 7, 0, 0) };
+    if (effect === 'subscribe_streambox' && !s.finance.expenses.recurring.some(r => r.id === 'streambox')) {
+      s.finance.expenses.recurring.push({ id: 'streambox', category: 'subscription', name: 'StreamBox', amount: 5, periodDays: 30, nextDueAt: s.minutes + 30 * MIN_PER_DAY });
+    }
+    if (effect === 'no_packed_lunch_today') s.world.dailyMarks.push(markKey('no_packed_lunch', p.day));
+    if (effect === 'student_loan_draw') {
+      // StudyLink living costs are borrowed: the payment adds to what you owe on your student loan.
+      const loan = s.finance.debt.loans.find(l => l.kind === 'student');
+      if (loan) loan.principal += 316;
+    }
+    if (effect === 'subscribe_sky' && !s.finance.expenses.recurring.some(r => r.id === 'sky_split')) {
+      s.finance.expenses.recurring.push({ id: 'sky_split', category: 'subscription', name: 'Sky Sport (flat split)', amount: 8, periodDays: 30, nextDueAt: s.minutes + 30 * MIN_PER_DAY });
+    }
+    if (effect === 'bnpl_headphones') {
+      // Three more $35 instalments still to pay: shown as money owed in the Bank app.
+      s.finance.debt.loans.push({ id: `paylater_${s.minutes}`, kind: 'other', principal: 105, apr: 0, paymentPerPeriod: 35, periodDays: 14, nextDueAt: s.minutes + 14 * MIN_PER_DAY });
+    }
+    if (effect === 'save_5_matched' && this.moveToSavings(5)) {
+      // Mum's "interest": $1 on top of every $5 saved, straight into the piggy bank.
+      this.earn(1, 'interest', 'Mum\'s savings bonus');
+      this.moveToSavings(1);
+    }
+  }
+
+  // ══ END OF DAY ═══════════════════════════════════════════════════════════
+  /** Missions that are still to come or still open today (so the day isn't "done" yet). */
+  pendingToday(): MissionDef[] {
+    const s = this.state, p = parts(s.minutes);
+    const out: MissionDef[] = [];
+    for (const rt of s.missions) {
+      const def = this.def(rt.id);
+      if (!def || !def.paths.includes(s.lifePath)) continue;
+      if (rt.state === 'available' || rt.state === 'active') { out.push(def); continue; }
+      if (rt.state !== 'locked' || !offeredToday(s, def)) continue;
+      if (def.requires && !def.requires(s)) continue;
+      // Will its window still be open at some point later today?
+      for (let m = p.minuteOfDay; m < MIN_PER_DAY; m += 10) {
+        if (missionWindowOpen(def, at(p.day, 0, m))) { out.push(def); break; }
+      }
+    }
+    return out;
+  }
+  /** True once today's school day is over and nothing is left to do or still coming today. */
+  dayComplete(): boolean {
+    const s = this.state, p = parts(s.minutes);
+    if (s.sleeping || s.ride || hasMark(s, 'day_done')) return false;
+    if (p.minuteOfDay < (p.dayOfWeek < 5 ? hm(15, 45) : hm(13))) return false;
+    return this.pendingToday().length === 0;
+  }
+  markDayDoneShown() { this.markDoneToday('day_done'); }
+  /** What happened today, for the "all done" card. */
+  todaySummary() {
+    const s = this.state, name = (id: string) => this.def(id)?.name ?? id, emoji = (id: string) => this.def(id)?.emoji ?? '•';
+    return {
+      done: s.today.missionsCompleted.map(id => ({ id, name: name(id), emoji: emoji(id) })),
+      // Only real misses: obligations, main/timed story beats, or side tasks you said yes to and then
+      // didn't do. An offer you simply ignored (an ad, a text) isn't a failure.
+      missed: s.today.missionsMissed
+        .filter(id => { const d = this.def(id); return !!d?.onExpire || d?.kind === 'main' || d?.kind === 'timed' || (!!d?.pool && (this.runtime(id)?.stepIndex ?? 0) > 0); })
+        .map(id => ({ id, name: name(id), emoji: emoji(id) })),
+      earned: s.today.earned, spent: s.today.spent,
+    };
+  }
+  /** Walk home (the clock runs for the walk) and step inside. Returns the minutes it took. */
+  goHome(): number {
+    const s = this.state;
+    if (s.player.place === 'home') return 0;
+    if (s.player.scene !== 'outdoor') this.exitPlace();
+    const from = { x: s.player.x / TILE_PX, y: s.player.y / TILE_PX };
+    const minutes = Math.max(3, Math.round(distanceTiles(from, doorTile('home')) * WALK_MIN_PER_TILE));
+    this.advance(minutes);
+    this.enterPlace('home');
+    return minutes;
+  }
+
+  // ══ WEEK GOAL ════════════════════════════════════════════════════════════
+  weekGoalId(): string | null {
+    const f = this.state.world.flags.find(x => x.startsWith('goal:'));
+    return f ? f.slice(5) : null;
+  }
+  /** Set this week's goal (from the Monday phone prompt). */
+  setWeekGoal(id: string) {
+    const def = getWeekGoal(id);
+    if (!def) return;
+    const s = this.state;
+    s.goals.completed.push(...s.goals.active);
+    s.goals.active = [def.target
+      ? { id: def.id, kind: 'financial', name: def.name, target: def.target, saved: 0 }
+      : { id: def.id, kind: 'personal', description: def.name, completed: false }];
+    s.world.flags = s.world.flags.filter(f => !f.startsWith('goal:') && !f.startsWith('friends_base:'));
+    s.world.flags.push(`goal:${id}`);
+    if (id === 'friends') {
+      const r = s.world.relationships;
+      s.world.flags.push(`friends_base:${r.Jordan ?? 0}:${r.Riley ?? 0}`);
+    }
+    if (id === 'uni_social') {
+      const r = s.world.relationships;
+      s.world.flags.push(`friends_base:${r.Sam ?? 0}:${r.Mei ?? 0}`);
+    }
+    this.syncGoals();
+    this.touch(true);
+  }
+  goalStatus(): GoalStatus | null {
+    const id = this.weekGoalId();
+    const def = id ? getWeekGoal(id) : undefined;
+    if (!def) return null;
+    const s = this.state, flags = s.world.flags;
+    const cash = s.finance.accounts.cash, saved = s.finance.accounts.savings;
+    const money = (n: number) => `$${n.toFixed(2).replace(/\.00$/, '')}`;
+    switch (def.id) {
+      case 'save_event': {
+        const achieved = flags.includes('school_fair_attended');
+        return { def, achieved, progress: achieved ? 1 : Math.min(1, saved / 10),
+          detail: achieved ? 'Went to the fair' : `🐷 ${money(saved)} / $10 saved for Saturday` };
+      }
+      case 'arcade': {
+        const achieved = flags.includes('arcade_visit');
+        return { def, achieved, progress: achieved ? 1 : 0,
+          detail: achieved ? 'Went to the arcade' : `Thursday after school · $8 · you have ${money(cash + saved)}` };
+      }
+      case 'buy_headphones': {
+        // Progress = what's been put aside in the piggy bank, not what happens to be in your pocket.
+        const achieved = flags.includes('bought_headphones');
+        return { def, achieved, progress: achieved ? 1 : Math.min(1, saved / 15),
+          detail: achieved ? 'Bought them!' : `🐷 ${money(Math.min(saved, 15))} / $15 saved · Mall` };
+      }
+      case 'friends': {
+        // Judged on Sunday; until then it shows whether you're still on track.
+        const base = flags.find(f => f.startsWith('friends_base:'))?.split(':').map(Number) ?? [0, 0, 0];
+        const j = s.world.relationships.Jordan ?? 0, r = s.world.relationships.Riley ?? 0;
+        const onTrack = j >= base[1] && r >= base[2] && !flags.includes('birthday_declined');
+        const judged = !!this.pendingLevelSummary || this.runtime(this.rules.recap)?.state === 'completed';
+        return { def, achieved: judged && onTrack, progress: onTrack ? (judged ? 1 : 0.5) : 0,
+          detail: `${onTrack ? 'On track' : 'Someone feels let down'} · Jordan ❤${j} · Riley ❤${r}` };
+      }
+      // ── University ──
+      case 'uni_buffer': {
+        const achieved = saved >= 150;
+        return { def, achieved, progress: Math.min(1, saved / 150),
+          detail: achieved ? `${money(saved)} tucked away` : `🏦 ${money(saved)} / $150 in savings` };
+      }
+      case 'uni_job': {
+        const achieved = flags.includes('wk_job_offer');
+        const stage = achieved ? 1 : flags.includes('wk_trial_offered') ? 0.66 : flags.includes('wk_applied') ? 0.33 : 0;
+        return { def, achieved, progress: stage,
+          detail: achieved ? 'Hired at the Café!' : stage >= 0.66 ? 'Trial shift Friday at the Café' : stage > 0 ? 'Applied — interview Wednesday' : 'Job ads go up on Tuesday' };
+      }
+      case 'uni_ready': {
+        const book = ['wk_textbook_new', 'wk_textbook_used', 'wk_textbook_library'].some(f => flags.includes(f));
+        const achieved = book && flags.includes('wk_quiz_done');
+        return { def, achieved, progress: achieved ? 1 : book ? 0.5 : 0,
+          detail: achieved ? 'Quiz done, textbook sorted' : book ? "Textbook sorted · Friday's quiz to go" : 'Sort the textbook by Wednesday' };
+      }
+      case 'uni_social': {
+        const base = flags.find(f => f.startsWith('friends_base:'))?.split(':').map(Number) ?? [0, 0, 0];
+        const sam = s.world.relationships.Sam ?? 0, mei = s.world.relationships.Mei ?? 0;
+        const club = flags.includes('wk_club_joined');
+        const onTrack = sam >= base[1] && mei >= 1 && club;
+        const judged = !!this.pendingLevelSummary || this.runtime(this.rules.recap)?.state === 'completed';
+        const progress = (club ? 0.5 : 0) + (mei >= 1 ? 0.25 : 0) + (sam >= base[1] ? 0.25 : 0);
+        return { def, achieved: judged && onTrack, progress: judged && onTrack ? 1 : Math.min(0.9, progress),
+          detail: `${club ? 'In a club' : 'No club yet'} · Sam ❤${sam} · Mei ❤${mei}` };
+      }
+    }
+    return null;
+  }
+  /** Mirror goal progress into GoalState, so the saved state and the phone agree. */
+  private syncGoals() {
+    const st = this.goalStatus();
+    for (const g of this.state.goals.active) {
+      if (!st || g.id !== st.def.id) continue;
+      if (g.kind === 'financial') g.saved = Math.round(st.progress * g.target * 100) / 100;
+      else g.completed = st.achieved;
+    }
+  }
+
   // ══ ACTIVITIES ═══════════════════════════════════════════════════════════
   /** Run a timed activity (class, chores, …) through ActivitySystem against the live game: it
    *  checks place/energy/money first, then moves the real clock, energy and ledger. */
@@ -379,7 +695,12 @@ export class GameStore {
   }
   /** Sit through a lesson. Attendance is recorded only if the lesson actually happened. */
   attendClass(): ActivityOutcome {
-    const out = this.runActivity(ATTEND_CLASS);
+    const study = this.rules.study;
+    if (!study) return { ok: false, reason: 'no_class', message: 'No classes on this path.', minutesAdvanced: 0, energyConsumed: 0, amountEarned: 0 };
+    const out = this.runActivity({
+      id: 'attend_class', name: `Attend ${study.noun}`, category: 'study',
+      timeCostMinutes: study.minutes, energyCost: study.energy, requirement: { place: 'university' },
+    });
     if (out.ok) this.markSchoolAttended();
     return out;
   }
@@ -429,16 +750,17 @@ export class GameStore {
   /** What the Attend Class prompt should say right now, or null when school isn't relevant. */
   classStatus(): ClassStatus | null {
     const s = this.state, p = parts(s.minutes);
-    if (s.lifePath !== 'school' || p.dayOfWeek > 4 || s.player.place !== 'university') return null;
+    const study = this.rules.study;
+    if (!study || p.dayOfWeek > 4 || s.player.place !== 'university') return null;
     if (hasMark(s, 'at_school')) return 'done';
-    if (p.minuteOfDay > LAST_CLASS_START) return 'too_late';
+    if (p.minuteOfDay > study.lastStart) return 'too_late';
     if (s.player.scene !== 'interior_school_classroom') return 'go_to_classroom';
     return 'ready';
   }
   /** Arrived early? Sit down and wait for the 8:30 bell (the clock really moves). */
   waitForBell() {
-    const p = parts(this.state.minutes);
-    if (p.minuteOfDay < CLASS_BELL) this.advance(CLASS_BELL - p.minuteOfDay);
+    const p = parts(this.state.minutes), bell = this.rules.study?.bell;
+    if (bell !== undefined && p.minuteOfDay < bell) this.advance(bell - p.minuteOfDay);
   }
 
   // ══ RELATIONSHIPS (Step 27) ══════════════════════════════════════════════
@@ -497,6 +819,7 @@ export class GameStore {
     if (!this.spend(item.price, isFood ? 'food' : 'shopping', `${item.brand ? item.brand + ' ' : ''}${item.name}`, s.player.place ?? undefined)) {
       return { ok: false, reason: "You can't afford that." };
     }
+    if (item.flag && !s.world.flags.includes(item.flag)) s.world.flags.push(item.flag);
     // Credit this purchase toward any active mission whose current step is a shopping list for
     // the place you're standing in (Phase: mission <-> real-purchase integration).
     for (const rt of s.missions) {
@@ -636,7 +959,7 @@ export class GameStore {
   // ══ NPCs ═════════════════════════════════════════════════════════════════
   private initNpcs(snap: boolean) {
     const s = this.state;
-    for (const def of NPCS) {
+    for (const def of this.cast) {
       const placeId = npcPlaceAt(def, s.minutes);
       const t = tileToPx(this.npcSpot(def.id, placeId));
       const cur = s.npcs[def.id];
@@ -648,7 +971,7 @@ export class GameStore {
   /** slight per-NPC offset so nobody stacks on the same door tile */
   private npcSpot(npcId: string, placeId: string) {
     const d = doorTile(placeId);
-    const i = NPCS.findIndex(n => n.id === npcId);
+    const i = this.cast.findIndex(n => n.id === npcId);
     return { x: d.x + ((i % 3) - 1) * 0.7, y: d.y + (placeId === 'park' ? (i % 2) * 1.2 : 0.2) };
   }
   private npcOutside(npcId: string, placeId: string, moving: boolean): boolean {
@@ -661,7 +984,7 @@ export class GameStore {
 
   private updateNpcTargets() {
     const s = this.state;
-    for (const def of NPCS) {
+    for (const def of this.cast) {
       const npc = s.npcs[def.id];
       const placeId = npcPlaceAt(def, s.minutes);
       if (placeId === npc.place) continue;
@@ -676,7 +999,7 @@ export class GameStore {
 
   private stepNpcs(gameMinutes: number) {
     const s = this.state;
-    for (const def of NPCS) {
+    for (const def of this.cast) {
       const npc: NpcRuntime = s.npcs[def.id];
       if (npc.moving && npc.path.length) {
         let budget = def.speedTilesPerMin * gameMinutes * TILE_PX;
@@ -705,11 +1028,17 @@ export class GameStore {
       return !room || room === pl.scene;
     });
     const T = INTERIOR_TILE_PX;
-    return here.map((npc, i) => ({
-      npc,
-      x: (interior.widthTiles / 2 + (i - (here.length - 1) / 2) * 1.4) * T,
-      y: Math.min(interior.heightTiles - 1.5, 1.4) * T,
-    }));
+    return here.map((npc, i) => {
+      const tx = interior.widthTiles / 2 + (i - (here.length - 1) / 2) * 1.4;
+      // Stand in the first clear spot down from the back wall — never inside (or hidden behind) a
+      // desk or shelf, so the lecturer stands in front of their desk rather than behind it.
+      let ty = Math.min(interior.heightTiles - 1.5, 1.4);
+      for (const cand of [1.4, 2.6, 3.8, 5.0]) {
+        if (cand > interior.heightTiles - 1) break;
+        if (!interiorBlocked(interior, tx, cand) && !interiorBlocked(interior, tx, cand - 0.5)) { ty = cand; break; }
+      }
+      return { npc, x: tx * T, y: ty * T };
+    });
   }
 
   /** The closest NPC in talking range: outdoors a visible NPC within ~1.4 tiles, indoors within ~1.8. */
@@ -851,15 +1180,16 @@ export class GameStore {
    * was waiting on. Auto-starting it here — one single call site, not a change to the trigger/window
    * logic in missions.ts — is what makes an NPC-triggered moment begin talking the instant the
    * player is in front of them, instead of requiring a separate, nonexistent "accept mission" UI. */
-  actionableStep(): { def: MissionDef; rt: MissionRuntime; step: NonNullable<ReturnType<GameStore['currentStep']>> } | null {
+  actionableStep(mode: 'all' | 'inPerson' = 'all'): { def: MissionDef; rt: MissionRuntime; step: MissionStep } | null {
     const s = this.state;
     // Highest priority first, so e.g. a story beat beats a daily lunch prompt in the same room.
     const live = s.missions
       .filter(rt => rt.state === 'active' || rt.state === 'available')
       .sort((a, b) => (this.def(b.id)?.priority ?? 0) - (this.def(a.id)?.priority ?? 0));
     for (const rt of live) {
-      const def = this.def(rt.id)!, step = def.steps[rt.stepIndex];
+      const def = this.def(rt.id)!, step = this.stepFor(def, rt);
       if (!step || step.completeOnArrival || step.awaitsPurchase) continue;
+      if (mode === 'inPerson' && step.remote) continue; // phone messages live in the Messages app
       const reachable = step.remote
         || (step.withNpc && step.npcId ? this.npcPresent(step.npcId) : s.player.place === step.place);
       if (reachable) {
@@ -870,12 +1200,51 @@ export class GameStore {
     return null;
   }
 
+  /** Messages waiting for a reply on the phone (remote steps), highest priority first. */
+  phoneInbox(): { def: MissionDef; rt: MissionRuntime; step: MissionStep }[] {
+    const out: { def: MissionDef; rt: MissionRuntime; step: MissionStep }[] = [];
+    for (const rt of this.state.missions) {
+      if (rt.state !== 'active' && rt.state !== 'available') continue;
+      const def = this.def(rt.id);
+      const step = def && this.stepFor(def, rt);
+      if (def && step?.remote && step.choices?.length) out.push({ def, rt, step });
+    }
+    return out.sort((a, b) => b.def.priority - a.def.priority);
+  }
+  /** Today's answered phone messages, newest first: who wrote, what they said, what you replied. */
+  messageHistory(): { id: string; from: string; emoji: string; text: string; reply: string; result: string; at: number }[] {
+    const s = this.state, today = parts(s.minutes).day;
+    const out: { id: string; from: string; emoji: string; text: string; reply: string; result: string; at: number }[] = [];
+    for (const rt of s.missions) {
+      const def = this.def(rt.id);
+      if (!def || rt.finishedAt === undefined || parts(rt.finishedAt).day !== today) continue;
+      const step = def.steps.find(st => st.remote);
+      if (!step) continue;
+      const choice = step.choices?.find(c => c.id === rt.outcome) ?? def.steps.flatMap(st => st.choices ?? []).find(c => c.id === rt.outcome);
+      out.push({
+        id: def.id, from: step.speaker ?? def.name, emoji: def.emoji, text: step.lines[0] ?? def.journalText,
+        reply: choice?.label ?? (rt.state === 'expired' ? 'No reply' : ''), result: choice?.consequence ?? (rt.state === 'expired' ? def.onExpire?.message ?? 'Missed.' : ''),
+        at: rt.finishedAt,
+      });
+    }
+    return out.sort((a, b) => b.at - a.at);
+  }
+  /** Cancel a subscription (removes the recurring charge). */
+  cancelSubscription(id: string): boolean {
+    const f = this.state.finance, before = f.expenses.recurring.length;
+    f.expenses.recurring = f.expenses.recurring.filter(r => !(r.id === id && r.category === 'subscription'));
+    if (f.expenses.recurring.length === before) return false;
+    if (id === 'streambox' && !this.state.world.flags.includes('cancelled_streambox')) this.state.world.flags.push('cancelled_streambox');
+    this.touch(true);
+    return true;
+  }
+
   /** Apply a dialogue choice. Returns false (changing nothing) if the player can't afford it. */
   applyChoice(missionId: string, choice: MissionChoice): boolean {
     const s = this.state;
     const rt = this.runtime(missionId), def = this.def(missionId);
     if (!rt || !def) return false;
-    const step = def.steps[rt.stepIndex];
+    const step = this.stepFor(def, rt) ?? def.steps[rt.stepIndex];
     const label = choice.label.replace(/^\P{L}+/u, '').replace(/\s*\(.*\)$/, '') || def.name;
     const source = step?.npcId ?? step?.place;
 
@@ -889,6 +1258,9 @@ export class GameStore {
     // clamps at 0 and no-ops for amount <= 0, so a choice with no/zero energyCost, or one whose cost
     // exceeds current Energy, still applies normally with no new failure path.
     this.consumeEnergy(choice.energyCost ?? 0);
+    this.restoreEnergy(choice.energyRestore ?? 0);
+    if (choice.setsGoal) this.setWeekGoal(choice.setsGoal);
+    if (choice.effect) this.applyEffect(choice.effect);
 
     for (const f of choice.flags ?? []) if (!s.world.flags.includes(f)) s.world.flags.push(f);
     if (choice.relationship && step.speaker) {
@@ -898,10 +1270,17 @@ export class GameStore {
     if (choice.social) s.today.socialActivities += 1;
     rt.outcome = choice.id;
 
+    // Started in time = can't expire underneath you: a 3-hour trial shift begun at 1:20 must not be
+    // marked "missed" at 3:30 halfway through it. Leave a little time for a follow-up step, too.
+    if (choice.minutes > 0 && rt.expiresAt !== undefined) {
+      const busyUntil = s.minutes + choice.minutes + (choice.finish ? 1 : 30);
+      if (rt.expiresAt < busyUntil) rt.expiresAt = busyUntil;
+    }
     if (choice.minutes > 0) this.advance(choice.minutes);
 
     if (choice.finish) this.completeMission(rt, def, choice.id);
     else { rt.stepIndex = Math.min(rt.stepIndex + 1, def.steps.length - 1); this.touch(true); }
+    this.syncGoals();
     return true;
   }
 
@@ -916,13 +1295,20 @@ export class GameStore {
     this.emit({ type: 'mission_completed', missionId: def.id });
 
     // "Make It to Friday" story hooks — real numbers, not scripted ones.
-    if (def.id === 'pocket_money') {
+    if (def.id === this.rules.weekStart) {
+      // A new week: last week's story flags and goal no longer count.
+      s.world.flags = s.world.flags.filter(f => f === 'got_pocket_money' || f === 'week_started' || f === 'pocket_money_done'
+        || !WEEK_FLAG_PREFIXES.some(p => f.startsWith(p)));
+      if (!s.world.flags.includes('pocket_money_done')) s.world.flags.push('pocket_money_done');
       this.weekStartBalance = s.finance.accounts.cash;
       // survives a reload mid-week, since the instance field above doesn't persist with the save
       s.world.flags = s.world.flags.filter(f => !f.startsWith('wk_start_balance:'));
       s.world.flags.push(`wk_start_balance:${s.finance.accounts.cash}`);
     }
-    if (def.id === 'friday_recap') this.buildLevelSummary(s);
+    if (def.id === this.rules.recap) {
+      this.buildLevelSummary(s);
+      if (this.pendingLevelSummary?.goal?.achieved && !s.world.flags.includes('week_goal_met')) s.world.flags.push('week_goal_met');
+    }
 
     // story triggers: anything waiting on this mission can now open
     this.evaluateMissions();
@@ -952,10 +1338,58 @@ export class GameStore {
       schoolProjectDone: s.world.flags.includes('school_project_done'),
       birthdayOutcome, unexpectedOutcome,
       wentToArcade: s.world.flags.includes('arcade_visit'),
+      goal: (() => {
+        const g = this.goalStatus();
+        return g ? { id: g.def.id, emoji: g.def.emoji, name: g.def.name, achieved: g.achieved, detail: g.detail } : null;
+      })(),
+      unexpectedKind: this.runtime('unexpected_event')?.state === 'completed' ? 'bus'
+        : this.runtime('unexpected_shoe')?.state === 'completed' ? 'shoe' : null,
+      fairAttended: s.world.flags.includes('school_fair_attended'),
+      dairyShift: s.world.flags.includes('dairy_shift_done'),
+      savings: s.finance.accounts.savings,
+      earned: [...s.weekDays, s.today].reduce((n, d) => n + d.earned, 0),
+      spent: [...s.weekDays, s.today].reduce((n, d) => n + d.spent, 0),
       busRides: [...s.weekDays, s.today].reduce((n, d) => n + d.travel.filter(t => t === 'bus').length, 0),
       busSpent: this.transactionsSince(at(parts(s.minutes).day - parts(s.minutes).dayOfWeek, 0, 0))
         .filter(t => t.category === 'transport' && t.amount < 0).reduce((sum, t) => sum - t.amount, 0),
+      path: s.lifePath,
+      highlights: s.lifePath === 'university' ? this.universityHighlights(daysAttended, daysTotal) : [],
     };
+  }
+
+  /** The University week's story, read back off what actually happened. */
+  private universityHighlights(daysAttended: number, daysTotal: number): RecapLine[] {
+    const f = this.state.world.flags, has = (x: string) => f.includes(x);
+    const out: RecapLine[] = [];
+    const line = (icon: string, text: string, tone: RecapLine['tone']) => out.push({ icon, text, tone });
+    if (has('wk_rent_paid')) line('🏠', 'Paid the $200 rent on time', 'good');
+    else if (has('wk_rent_rest_paid')) line('🏠', 'Paid rent in two halves — sorted by Friday', 'neutral');
+    else line('🏠', "Rent wasn't paid in full — Sam had to cover you", 'bad');
+    line('🎓', `Lectures: ${daysAttended}/${Math.max(daysTotal, 5)} attended`, daysAttended >= 4 ? 'good' : daysAttended >= 2 ? 'neutral' : 'bad');
+    if (has('wk_textbook_used')) line('📕', 'Second-hand textbook for $45 (saved $75)', 'good');
+    else if (has('wk_textbook_library')) line('📕', 'Used the library copy — free', 'good');
+    else if (has('wk_textbook_new')) line('📕', 'Bought the textbook new for $120', 'neutral');
+    else line('📕', 'Never got the textbook', 'bad');
+    if (didWeeklyShop(this.state)) line('🛒', 'Did a proper weekly shop', 'good');
+    else line('🛒', 'Skipped the weekly shop — lived on takeaways and noodles', 'bad');
+    if (has('wk_job_offer')) {
+      line('💼', 'Landed the part-time job at the Café', 'good');
+      if (has('wk_taxcode_msl')) line('🧾', 'Picked the right tax code (M SL)', 'good');
+      else if (has('wk_taxcode_nd')) line('🧾', 'No tax code given — 45% taken in tax until it\'s fixed', 'bad');
+      else if (has('wk_taxcode_m')) line('🧾', 'Picked M instead of M SL — you may owe student loan later', 'bad');
+    } else if (has('wk_applied')) line('💼', "Applied for the Café job, but it didn't work out", 'neutral');
+    else line('💼', "Didn't look for work this week", 'neutral');
+    if (has('wk_club_tramping')) line('🥾', 'Joined the Tramping Club', 'good');
+    else if (has('wk_club_boardgames')) line('🎲', 'Joined the Board Games Club', 'good');
+    if (has('wk_power_owed')) line('⚡', 'Still owe the flat $45 for power', 'bad');
+    else if (has('wk_power_paid')) line('⚡', has('wk_sky_yes') ? 'Paid your power share — and split Sky Sport ($8/month)' : 'Paid your $45 power share', has('wk_sky_yes') ? 'neutral' : 'good');
+    if (has('wk_charger_official')) line('🔌', 'Bought the official charger ($89)', 'neutral');
+    else if (has('wk_charger_generic')) line('🔌', 'Generic charger for $25 and borrowed Mei\'s meanwhile', 'good');
+    else if (has('wk_charger_library')) line('🔌', 'Used the library computers instead of buying a charger', 'good');
+    if (has('wk_quiz_done')) line('💻', 'Handed in the ECON101 quiz', 'good');
+    else line('💻', 'Missed the ECON101 quiz', 'bad');
+    if (has('wk_raglan')) line('🏖️', 'Raglan beach day with the flat', 'good');
+    return out;
   }
 
   dismissLevelSummary() { this.pendingLevelSummary = null; this.touch(true); }
@@ -971,6 +1405,12 @@ export class GameStore {
         s.world.relationships[ex.relationship.npc] = Math.max(-5, Math.min(5, cur + ex.relationship.delta));
       }
       if (def.id === 'get_to_school') s.today.lateToSchool = true;
+      if (ex.fine && !this.spend(ex.fine, 'fee', `${def.name} fine`, def.id)) {
+        const owed = s.finance.debt.loans.find(l => l.id === 'arrears');
+        if (owed) owed.principal += ex.fine;
+        else s.finance.debt.loans.push({ id: 'arrears', kind: 'other', principal: ex.fine, apr: 0, paymentPerPeriod: 0, periodDays: 30, nextDueAt: s.minutes + 30 * MIN_PER_DAY });
+      }
+      if (!s.sleeping) this.pushNotice(ex.message);
     }
   }
 
@@ -979,7 +1419,7 @@ export class GameStore {
    *  actually happened (never on merely walking in). */
   markSchoolAttended() {
     const s = this.state, p = parts(s.minutes);
-    if (s.lifePath !== 'school') return;
+    if (!this.rules.study) return;
     const key = markKey('at_school', p.day);
     if (!s.world.dailyMarks.includes(key)) {
       s.world.dailyMarks.push(key);
@@ -1067,7 +1507,7 @@ export class GameStore {
     const p = parts(s.minutes);
     s.today.bedtimeMinuteOfDay = passedOut ? PASS_OUT_AT : p.minuteOfDay;
     s.today.endBalance = s.finance.accounts.cash;
-    if (s.lifePath === 'school' && p.dayOfWeek < 5 && s.today.schoolAttended === null) s.today.schoolAttended = false;
+    if (this.rules.study && p.dayOfWeek < 5 && s.today.schoolAttended === null) s.today.schoolAttended = false;
     const record: DayRecord = { ...s.today, missionsCompleted: [...s.today.missionsCompleted], missionsMissed: [...s.today.missionsMissed], travel: [...s.today.travel] };
     s.weekDays.push(record);
     this.emit({ type: 'day_end', day: record.day, minutes: s.minutes });

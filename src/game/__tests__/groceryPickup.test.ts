@@ -35,9 +35,9 @@ function storeAtGroceryStep(): GameStore {
   rt.stepIndex = 1; // steps[0] = 's1' (remote accept), steps[1] = 's2' (awaitsPurchase)
   store.state.player.place = 'supermarket';
   store.state.player.scene = 'interior_supermarket';
-  // Stand exactly on the milk shelf (tx:2, ty:4.5 in world.ts's interior_supermarket.shopItems).
-  store.state.player.x = 2 * INTERIOR_TILE_PX;
-  store.state.player.y = 4.5 * INTERIOR_TILE_PX;
+  // Stand at the Value milk tag on the fridge (tx:2.75, ty:5.1 in world.ts's interior_supermarket.shopItems).
+  store.state.player.x = 2.75 * INTERIOR_TILE_PX;
+  store.state.player.y = 5.1 * INTERIOR_TILE_PX;
   // The real 's1' accept step earns the player $15 for this errand before they ever reach the
   // supermarket; a schoolPath store otherwise starts with $0, which would make every pickup an
   // affordability failure unrelated to what this file is testing.
@@ -85,7 +85,7 @@ test('GroceryPickup 4: the same physical item cannot be collected twice', () => 
 test('GroceryPickup 5: a different brand of an already-covered need is also blocked (need is per-prefix, not per-item-id)', () => {
   const store = storeAtGroceryStep();
   store.buyNearbyShopItem(); // covers milk_ via milk_basic
-  moveTo(store, 2, 5.5); // milk_mid shelf
+  moveTo(store, 2.75, 5.9); // milk_mid tag
   const blocked = store.buyNearbyShopItem();
   assert.equal(blocked.ok, false);
 });
@@ -93,7 +93,7 @@ test('GroceryPickup 5: a different brand of an already-covered need is also bloc
 test('GroceryPickup 6: remaining items stay collectable after one need is covered', () => {
   const store = storeAtGroceryStep();
   store.buyNearbyShopItem(); // milk
-  moveTo(store, 4.5, 1.7); // bread shelf
+  moveTo(store, 1.5, 2.75); // bread shelf
   const bread = store.buyNearbyShopItem();
   assert.equal(bread.ok, true);
   assert.equal(bread.item?.id, 'bread_basic');
@@ -110,8 +110,8 @@ test('GroceryPickup 7: an incomplete list does not complete the mission on leavi
 test('GroceryPickup 8: collecting all three items and leaving completes the mission and advances the objective', () => {
   const store = storeAtGroceryStep();
   store.buyNearbyShopItem(); // milk
-  moveTo(store, 4.5, 1.7); store.buyNearbyShopItem(); // bread
-  moveTo(store, 1.5, 1.7); store.buyNearbyShopItem(); // eggs
+  moveTo(store, 1.5, 2.75); store.buyNearbyShopItem(); // bread
+  moveTo(store, 1.5, 4.25); store.buyNearbyShopItem(); // eggs
   const progress = store.shoppingProgress()!;
   assert.ok(progress.covered.every(Boolean));
   store.state.player.lastDoor = { placeId: 'supermarket', x: 0, y: 0, facing: 0 };

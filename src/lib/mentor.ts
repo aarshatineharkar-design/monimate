@@ -11,6 +11,9 @@ export interface MentorChatContext {
 }
 
 export interface MentorWeeklyContext {
+  lifePath?: string;
+  /** that path's week, as plain sentences ("Paid the $200 rent on time") */
+  highlights?: string[];
   startBalance: number;
   endBalance: number;
   daysAttended: number;
@@ -19,6 +22,10 @@ export interface MentorWeeklyContext {
   birthdayOutcome: string;
   unexpectedOutcome: string;
   wentToArcade: boolean;
+  goalName?: string;
+  goalAchieved?: boolean;
+  savings?: number;
+  busSpent?: number;
 }
 
 async function callMentor(mode: 'chat' | 'weekly', message: string | undefined, context: unknown): Promise<string> {

@@ -38,8 +38,8 @@ export const ACHIEVEMENTS: AchievementDef[] = [
   },
   {
     id: 'goal_reached', name: 'Goal Getter', emoji: '🎯',
-    description: 'Fully fund one of your savings goals.',
-    check: s => s.goals.active.some(g => g.kind === 'financial' && g.target > 0 && g.saved >= g.target),
+    description: "Achieve the goal you picked for the week.",
+    check: s => s.world.flags.includes('week_goal_met'),
   },
   {
     id: 'debt_free', name: 'Debt Free', emoji: '🧾',

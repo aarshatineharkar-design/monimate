@@ -5,7 +5,7 @@
  */
 import { GameStore } from './store';
 import { SmoothCamera, stepMovement, MoveInput, MoverConfig, DEFAULT_MOVER } from './render';
-import { TILE_PX, doorTile, getPlace, PLACES, getInterior, INTERIOR_TILE_PX } from './world';
+import { TILE_PX, doorTile, getPlace, PLACES, getInterior, INTERIOR_TILE_PX, interiorBlocked } from './world';
 
 export interface CollisionOptions { worldW: number; worldH: number }
 
@@ -59,7 +59,8 @@ export class GameLoop {
         const b = insideAnyBuilding(x, y);
         return !!b; // buildings are solid except through their own door gap, handled above
       };
-      const { movedTiles } = stepMovement(s.player, input, dt, this.mover, collides);
+      const mover = this.store.exhausted ? { ...this.mover, maxSpeed: this.mover.maxSpeed * 0.65 } : this.mover;
+      const { movedTiles } = stepMovement(s.player, input, dt, mover, collides);
       this.store.tick(dt, movedTiles, 'walk');
 
       // entering a building through its door; a closed door says why, once per visit to it
@@ -83,15 +84,7 @@ export class GameLoop {
       // Real interior room: same free movement + collision system, scaled to the room's own grid.
       const interior = getInterior(s.player.scene);
       if (interior) {
-        const collides = (x: number, y: number) => {
-          const tx = x / INTERIOR_TILE_PX, ty = y / INTERIOR_TILE_PX;
-          if (tx < 0.3 || ty < 0.3 || tx > interior.widthTiles - 0.3 || ty > interior.heightTiles - 0.3) return true;
-          for (const f of interior.furniture) {
-            if (!f.solid) continue;
-            if (tx > f.tx - 0.05 && tx < f.tx + f.tw + 0.05 && ty > f.ty - 0.05 && ty < f.ty + f.th + 0.05) return true;
-          }
-          return false;
-        };
+        const collides = (x: number, y: number) => interiorBlocked(interior, x / INTERIOR_TILE_PX, y / INTERIOR_TILE_PX);
         stepMovement(s.player, input, dt, { ...this.mover, maxSpeed: this.mover.maxSpeed * 0.6 }, collides);
         this.store.tick(dt, 0);
         // walking onto any door tile either steps back outside or hops to another room in the

@@ -16,6 +16,9 @@ export default function Home() {
           style={{ background: '#f0c038', color: '#1a1a2e' }}>
           Play Now
         </Link>
+        <div className="mt-4 text-sm">
+          <Link href="/login?mode=signup" style={{ color: '#8892a4' }}>New here? Create an account</Link>
+        </div>
         <p className="text-xs mt-6" style={{ color: '#8892a4' }}>
           A COMPX576 project — University of Waikato
         </p>

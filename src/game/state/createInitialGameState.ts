@@ -51,7 +51,7 @@ export function createInitialGameState(): GameState {
     finance: {
       // Step 3: the Core Simulation's player starts the day already holding $20 pocket money —
       // per Step 3's explicit instruction ("Money: $20 pocket money"). This is deliberately
-      // different from the live game's $35/week, handed over via a Monday dialogue mission — that
+      // like the live game's $20/week, handed over via a Monday dialogue mission — that
       // mission system doesn't exist in this parallel foundation yet, so the Core Simulation just
       // starts with cash in hand rather than simulating how it arrived.
       accounts: { cash: 20, checking: 0, savings: 0, emergencyFund: 0 },

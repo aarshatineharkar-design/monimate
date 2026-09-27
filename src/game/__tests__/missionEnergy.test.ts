@@ -171,7 +171,8 @@ test('MissionEnergy 8: selected physical choices carry their intended authored v
   const lunch = getDef(SCHOOL_MISSIONS, 'lunch_break')!;
   const skip = lunch.steps[0].choices!.find(c => c.id === 'skip')!;
   const meal = lunch.steps[0].choices!.find(c => c.id === 'meal')!;
-  assert.equal(skip.energyCost, undefined, 'lunch_break/skip must NOT have an energyCost per the approved spec');
+  assert.equal(skip.energyCost, 10, 'Pack 2: skipping lunch costs energy (food is how you get it back)');
+  assert.equal(meal.energyRestore, 15);
   assert.equal(meal.energyCost, undefined);
 
   const homework = getDef(SCHOOL_MISSIONS, 'homework')!;

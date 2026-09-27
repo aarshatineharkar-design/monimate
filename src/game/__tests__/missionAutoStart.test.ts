@@ -55,7 +55,7 @@ test('MissionAutoStart 4: the auto-started mission plays out normally end to end
   const actionable = store.actionableStep()!;
   const balanceBefore = store.state.finance.accounts.cash;
   store.applyChoice('pocket_money', actionable.step.choices![0]);
-  assert.equal(store.state.finance.accounts.cash, balanceBefore + 35);
+  assert.equal(store.state.finance.accounts.cash, balanceBefore + 20);
   assert.equal(store.state.missions.find(m => m.id === 'pocket_money')!.state, 'completed');
 });
 
@@ -93,6 +93,8 @@ test('MissionAutoStart 8: end-to-end through the REAL trigger chain — pickup_g
   const store = freshDefaultStore();
   const pm = store.actionableStep()!;
   store.applyChoice(pm.def.id, pm.step.choices![0]); // accept Mum's pocket money
+  const goal = store.actionableStep()!;
+  store.applyChoice(goal.def.id, goal.step.choices![0]); // pick this week's goal
   store.advance(64); // -> 8:05 AM
   store.enterPlace('university');
   const outcome = store.attendClass();

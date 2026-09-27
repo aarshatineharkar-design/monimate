@@ -71,7 +71,13 @@ export interface InteriorLink { tile: Tile; toScene: SceneId | 'outside'; label:
 /** A single shelf-standable product (Phase 10 / Rule 27-28): the player walks up, interacts, sees
  *  the price, and buys — no dropdown. `brand`/`note` let the grocery items support real price
  *  comparison (Rule 28: same product, different price/quality) without the game saying which is "right". */
-export interface ShopItemDef { id: string; name: string; brand?: string; price: number; tx: number; ty: number }
+export interface ShopItemDef {
+  id: string; name: string; brand?: string; price: number; tx: number; ty: number;
+  /** what the product looks like on its price tag */
+  icon?: string;
+  /** world flag set when bought (e.g. a weekly goal item) */
+  flag?: string;
+}
 export interface InteriorDef {
   id: string;
   name: string;
@@ -225,19 +231,31 @@ export const INTERIORS: Record<string, InteriorDef> = {
         sprite: { src: FURNITURE, sx: 0, sy: 48, sw: 96, sh: 144 } },
       { id: 'checkout', name: 'Checkout', emoji: '🧾', tx: 8, ty: 5, tw: 2, th: 1, solid: true,
         sprite: { src: FURNITURE, sx: 96, sy: 768, sw: 96, sh: 96 } },
+      // Pantry island in the middle of the floor: pasta and rice (the student's weekly shop).
+      { id: 'shelf4', name: 'Pantry Shelf', emoji: '🥫', tx: 4.5, ty: 4.2, tw: 2, th: 2, solid: true,
+        sprite: { src: FURNITURE, sx: 240, sy: 672, sw: 96, sh: 96 } },
     ],
     // Real price comparison, exactly per Rule 28 — the game never labels one "correct".
+    // Every tag sits on the FRONT edge of the shelf/fridge it belongs to (the side you can walk up
+    // to), so it's drawn on top of the furniture and always within reach — see interiorBlocked().
     shopItems: [
-      { id: 'milk_basic', name: 'Milk', brand: 'Value', price: 3.50, tx: 2, ty: 4.5 },
-      { id: 'milk_mid', name: 'Milk', brand: 'Farmhouse', price: 4.80, tx: 2, ty: 5.5 },
-      { id: 'milk_premium', name: 'Milk', brand: 'Premium', price: 6.00, tx: 2, ty: 6.2 },
-      { id: 'bread_basic', name: 'Bread', brand: 'Value', price: 2.20, tx: 4.5, ty: 1.7 },
-      { id: 'bread_mid', name: 'Bread', brand: 'Bakery', price: 3.90, tx: 5.5, ty: 1.7 },
-      { id: 'eggs_basic', name: 'Eggs (6)', brand: 'Value', price: 3.00, tx: 1.5, ty: 1.7 },
-      { id: 'eggs_free_range', name: 'Eggs (6)', brand: 'Free Range', price: 4.50, tx: 2.5, ty: 1.7 },
-      { id: 'notebook_4', name: 'Notebook', brand: 'Basic', price: 4.00, tx: 8.5, ty: 1.7 },
-      { id: 'notebook_7', name: 'Notebook', brand: 'Standard', price: 7.00, tx: 9.5, ty: 1.7 },
-      { id: 'notebook_10', name: 'Notebook', brand: 'Deluxe', price: 10.00, tx: 8.5, ty: 2.5 },
+      { id: 'bread_basic', name: 'Bread', brand: 'Value', price: 2.20, tx: 1.5, ty: 2.75, icon: '🍞' },
+      { id: 'bread_mid', name: 'Bread', brand: 'Bakery', price: 3.90, tx: 2.5, ty: 2.75, icon: '🥖' },
+      { id: 'notebook_4', name: 'Notebook', brand: 'Basic', price: 4.00, tx: 4.5, ty: 2.75, icon: '📓' },
+      { id: 'notebook_7', name: 'Notebook', brand: 'Standard', price: 7.00, tx: 5.5, ty: 2.75, icon: '📒' },
+      { id: 'notebook_10', name: 'Notebook', brand: 'Deluxe', price: 10.00, tx: 8.5, ty: 2.75, icon: '📔' },
+      { id: 'choc_bar', name: 'Chocolate', brand: 'Cocoa Co', price: 2.50, tx: 9.5, ty: 2.75, icon: '🍫' },
+      { id: 'eggs_basic', name: 'Eggs (6)', brand: 'Value', price: 3.00, tx: 1.5, ty: 4.25, icon: '🥚' },
+      { id: 'eggs_free_range', name: 'Eggs (6)', brand: 'Free Range', price: 4.50, tx: 2.5, ty: 4.25, icon: '🥚' },
+      { id: 'milk_basic', name: 'Milk', brand: 'Value', price: 3.50, tx: 2.75, ty: 5.1, icon: '🥛' },
+      { id: 'milk_mid', name: 'Milk', brand: 'Farmhouse', price: 4.80, tx: 2.75, ty: 5.9, icon: '🥛' },
+      { id: 'milk_premium', name: 'Milk', brand: 'Premium', price: 6.00, tx: 2.75, ty: 6.7, icon: '🥛' },
+      { id: 'pasta_basic', name: 'Pasta', brand: 'Value', price: 1.80, tx: 5, ty: 3.95, icon: '🍝' },
+      { id: 'pasta_brand', name: 'Pasta', brand: 'Italia', price: 3.20, tx: 6, ty: 3.95, icon: '🍝' },
+      { id: 'rice_basic', name: 'Rice 1kg', brand: 'Value', price: 2.50, tx: 5, ty: 6.45, icon: '🍚' },
+      { id: 'rice_jasmine', name: 'Rice 1kg', brand: 'Jasmine', price: 4.50, tx: 6, ty: 6.45, icon: '🍚' },
+      { id: 'noodles_5pk', name: 'Noodles', brand: '5-pack', price: 2.90, tx: 4.25, ty: 5.2, icon: '🍜' },
+      { id: 'frozen_veg', name: 'Frozen Veg', price: 3.40, tx: 6.75, ty: 5.2, icon: '🥦' },
     ],
   },
   interior_shop: {
@@ -308,6 +326,15 @@ export const INTERIORS: Record<string, InteriorDef> = {
       { id: 'checkout', name: 'Checkout', emoji: '🧾', tx: 8, ty: 5, tw: 1, th: 1, solid: true,
         sprite: { src: FURNITURE, sx: 144, sy: 192, sw: 48, sh: 48 } },
     ],
+    shopItems: [
+      { id: 'sneakers', name: 'Sneakers', brand: 'Stride', price: 30.00, tx: 1.5, ty: 2.75, icon: '👟', flag: 'bought_sneakers' },
+      { id: 'hoodie', name: 'Hoodie', brand: 'Urban', price: 25.00, tx: 2.5, ty: 2.75, icon: '🧥' },
+      { id: 'tshirt', name: 'T-Shirt', brand: 'Basic', price: 12.00, tx: 4.5, ty: 2.75, icon: '👕' },
+      { id: 'cap', name: 'Cap', brand: 'Urban', price: 10.00, tx: 5.5, ty: 2.75, icon: '🧢' },
+      { id: 'headphones', name: 'Headphones', brand: 'SoundBud', price: 15.00, tx: 7, ty: 2.6, icon: '🎧', flag: 'bought_headphones' },
+      { id: 'phone_case', name: 'Phone Case', brand: 'Glitter', price: 6.00, tx: 8.5, ty: 2.75, icon: '📱' },
+      { id: 'sticker_pack', name: 'Stickers', price: 2.50, tx: 9.5, ty: 2.75, icon: '✨' },
+    ],
   },
   interior_restaurant: {
     id: 'interior_restaurant', name: 'Restaurant',
@@ -351,9 +378,15 @@ export const INTERIORS: Record<string, InteriorDef> = {
     // The "School Project Supplies" mission's shopping list — real walk-up-and-buy items, same
     // system as the supermarket (Rule 27/28: the game never picks a tier for the player).
     shopItems: [
-      { id: 'poster_basic', name: 'Poster Board', brand: 'Plain', price: 4.00, tx: 1.5, ty: 1.7 },
-      { id: 'markers_basic', name: 'Markers (8pk)', brand: 'Standard', price: 5.00, tx: 4.5, ty: 1.7 },
-      { id: 'glue_basic', name: 'Glue Stick', brand: 'Standard', price: 2.00, tx: 1.5, ty: 5.2 },
+      { id: 'poster_basic', name: 'Poster Board', brand: 'Plain', price: 4.00, tx: 1.5, ty: 2.25, icon: '🪧' },
+      { id: 'markers_basic', name: 'Markers (8pk)', brand: 'Standard', price: 5.00, tx: 2.5, ty: 2.25, icon: '🖍️' },
+      { id: 'novel', name: 'Novel', brand: 'Paperback', price: 12.00, tx: 4.5, ty: 2.25, icon: '📘' },
+      { id: 'comic', name: 'Comic', price: 6.00, tx: 5.5, ty: 2.25, icon: '📗' },
+      { id: 'puzzle_book', name: 'Puzzle Book', price: 5.00, tx: 6.5, ty: 3.75, icon: '🧩' },
+      { id: 'glue_basic', name: 'Glue Stick', brand: 'Standard', price: 2.00, tx: 1.5, ty: 5.25, icon: '🧴' },
+      { id: 'pens', name: 'Pens (5pk)', price: 3.00, tx: 2.5, ty: 5.25, icon: '🖊️' },
+      // University: the ECON101 textbook (see uni_textbook). Buying it any time counts.
+      { id: 'textbook_econ', name: 'Textbook', brand: 'ECON101', price: 120.00, tx: 3.25, ty: 4.0, icon: '📕', flag: 'wk_textbook_new' },
     ],
   },
 };
@@ -368,6 +401,17 @@ export const PLACE_INTERIOR_SCENE: Partial<Record<string, string>> = {
   shop_small: 'interior_bookshop',
 };
 export const getInterior = (sceneId: string) => INTERIORS[sceneId];
+
+/** True when a point (in interior tiles) is inside a wall or a solid piece of furniture. Shared by
+ *  the movement loop and the tests, so "can the player stand here?" has exactly one answer. */
+export function interiorBlocked(interior: InteriorDef, tx: number, ty: number): boolean {
+  if (tx < 0.3 || ty < 0.3 || tx > interior.widthTiles - 0.3 || ty > interior.heightTiles - 0.3) return true;
+  for (const f of interior.furniture) {
+    if (!f.solid) continue;
+    if (tx > f.tx - 0.05 && tx < f.tx + f.tw + 0.05 && ty > f.ty - 0.05 && ty < f.ty + f.th + 0.05) return true;
+  }
+  return false;
+}
 
 // ── Places ──────────────────────────────────────────────────────────────────
 // `door` is the sidewalk tile directly in front of the entrance (building bottom edge, centred).
@@ -477,7 +521,7 @@ export const OPENING_HOURS: Record<string, DailyWindow[]> = {
   home: ALWAYS,
   park: ALWAYS,
   bus_stop: ALWAYS,
-  university: [{ open: hm(7, 0), close: hm(15, 30), days: WEEKDAYS }], // gates open 7:00 (first bus), bell at 8:30
+  university: [{ open: hm(7, 0), close: hm(15, 30), days: WEEKDAYS }, { open: hm(10), close: hm(14), days: [5] }], // weekdays; Saturday = school fair
   supermarket: [{ open: hm(7), close: hm(21) }],
   dairy: [{ open: hm(6, 30), close: hm(22) }],
   cafe: [{ open: hm(7), close: hm(17) }],
@@ -491,7 +535,7 @@ export const OPENING_HOURS: Record<string, DailyWindow[]> = {
   gym: [{ open: hm(6), close: hm(21) }],
   hospital: [{ open: hm(8), close: hm(17), days: WEEKDAYS }],
   office: [{ open: hm(8), close: hm(18), days: WEEKDAYS }],
-  police: [{ open: hm(9), close: hm(16), days: WEEKDAYS }],
+  police: [{ open: hm(9), close: hm(17, 30), days: WEEKDAYS }], // open late enough to hand in a wallet found after school
   apartment: [{ open: hm(9), close: hm(18) }],
 };
 
@@ -539,7 +583,9 @@ export const NPCS: NpcDef[] = [
     schedule: [
       { from: hm(0), place: 'apartment' },
       { from: hm(7, 55), place: 'university', days: WEEKDAYS },
-      { from: hm(15, 35), place: 'university' },             // outside the school gate after the bell
+      { from: hm(15, 35), place: 'university', days: WEEKDAYS }, // outside the school gate after the bell
+      { from: hm(10, 0), place: 'university', days: [5] },    // Saturday: school fair
+      { from: hm(14, 0), place: 'park', days: [5] },
       { from: hm(16, 0), place: 'park', days: [0, 1, 2, 4] },
       { from: hm(15, 45), place: 'mall', days: [3] },        // Thursday: arcade (matches arcade_invite)
       { from: hm(18, 0), place: 'apartment' },
@@ -551,7 +597,8 @@ export const NPCS: NpcDef[] = [
       { from: hm(0), place: 'apartment' },
       { from: hm(8, 0), place: 'university', days: WEEKDAYS },
       { from: hm(15, 40), place: 'park', days: WEEKDAYS },   // the after-school food truck
-      { from: hm(10, 0), place: 'market', days: [5, 6] },    // weekend market
+      { from: hm(10, 0), place: 'university', days: [5] },   // Saturday: school fair
+      { from: hm(10, 0), place: 'market', days: [6] },       // Sunday: weekend market
       { from: hm(17, 0), place: 'apartment' },
     ],
   },
@@ -560,6 +607,8 @@ export const NPCS: NpcDef[] = [
     schedule: [
       { from: hm(0), place: 'apartment' },
       { from: hm(7, 30), place: 'university', days: WEEKDAYS },
+      { from: hm(9, 30), place: 'university', days: [5] },   // running the fair
+      { from: hm(14, 30), place: 'apartment', days: [5] },
       { from: hm(16, 30), place: 'apartment' },
     ],
   },
@@ -571,6 +620,45 @@ export const NPCS: NpcDef[] = [
       { from: hm(22), place: 'apartment' },
     ],
   },
+  // ── University path cast ──────────────────────────────────────────────────
+  // Sam is your flatmate, so unlike the School cast he really does live at 'home' (your flat).
+  {
+    id: 'sam', name: 'Sam', color: '#4f8fd0', speedTilesPerMin: 2.0, sheet: 'alex',
+    schedule: [
+      { from: hm(0), place: 'home' },
+      { from: hm(9, 30), place: 'university', days: WEEKDAYS },
+      { from: hm(15, 0), place: 'gym', days: WEEKDAYS },
+      { from: hm(10, 30), place: 'park', days: [5, 6] },
+      { from: hm(17, 30), place: 'home' },
+    ],
+  },
+  {
+    id: 'mei', name: 'Mei', color: '#d0a040', speedTilesPerMin: 2.0, sheet: 'amelia',
+    schedule: [
+      { from: hm(0), place: 'apartment' },
+      { from: hm(9, 40), place: 'university', days: WEEKDAYS },
+      { from: hm(13, 30), place: 'library', days: WEEKDAYS },
+      { from: hm(10, 0), place: 'market', days: [5] },
+      { from: hm(11, 0), place: 'cafe', days: [6] },
+      { from: hm(17, 0), place: 'apartment' },
+    ],
+  },
+  {
+    id: 'lecturer', name: 'Dr Hughes', color: '#7050a0', speedTilesPerMin: 1.8, sheet: 'bob',
+    schedule: [
+      { from: hm(0), place: 'apartment' },
+      { from: hm(8, 30), place: 'university', days: WEEKDAYS },
+      { from: hm(16, 30), place: 'apartment' },
+    ],
+  },
+  {
+    id: 'leah', name: 'Leah', color: '#c06090', speedTilesPerMin: 2.0, sheet: 'amelia',
+    schedule: [
+      { from: hm(0), place: 'apartment' },
+      { from: hm(6, 45), place: 'cafe' },
+      { from: hm(17, 15), place: 'apartment' },
+    ],
+  },
 ];
 
 /**
@@ -580,8 +668,14 @@ export const NPCS: NpcDef[] = [
  */
 export function npcRoomAt(npcId: string, placeId: string, minutes: number): string | undefined {
   if (placeId !== 'university') return undefined;
-  if (npcId === 'teacher') return 'interior_school_classroom';
+  if (parts(minutes).dayOfWeek >= 5) return 'interior_school_hall'; // fair day: everyone's in the hall
+  if (npcId === 'teacher' || npcId === 'lecturer') return 'interior_school_classroom';
   const m = parts(minutes).minuteOfDay;
+  // University: your classmates sit the 10–12 lecture with you, then grab lunch in the student café.
+  if (npcId === 'sam' || npcId === 'mei') {
+    if (m >= hm(10) && m < hm(12)) return 'interior_school_classroom';
+    return m >= hm(12) && m < hm(13) ? 'interior_school_cafeteria' : 'interior_school_hall';
+  }
   return m >= hm(12, 30) && m < hm(13, 30) ? 'interior_school_cafeteria' : 'interior_school_hall';
 }
 

@@ -27,6 +27,8 @@ function storeAttendedAndHome(): GameStore {
   // the way a player would, so later actionableStep() calls surface the mission under test.
   const pm = store.actionableStep()!;
   store.applyChoice(pm.def.id, pm.step.choices![0]);
+  const goal = store.actionableStep()!; // then the phone asks for this week's goal
+  store.applyChoice(goal.def.id, goal.step.choices![0]);
   store.advance(64); // -> 8:05 AM
   store.enterPlace('university');
   const outcome = store.attendClass();
