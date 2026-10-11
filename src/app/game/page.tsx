@@ -855,7 +855,7 @@ function GameCanvas({ supabase, player, initialState, notice, onChangePath }: {
         )}
       </div>
 
-      <button style={hud.phoneBtn} onClick={() => setPhoneApp(a => (a ? null : 'home'))} aria-label="Phone">
+      <button style={{ ...hud.phoneBtn, bottom: isTouch ? 206 : 24 }} onClick={() => setPhoneApp(a => (a ? null : 'home'))} aria-label="Phone">
         📱{inbox.length > 0 && <span style={hud.phoneBadge}>{inbox.length}</span>}
         {!isTouch && <span style={hud.phoneKey}>P</span>}
       </button>
@@ -898,13 +898,13 @@ function GameCanvas({ supabase, player, initialState, notice, onChangePath }: {
           same underlying buy path (buyNearbyShopItem()), just worded and gated as a collection. */}
       {nearbyItem && !actionable && (
         groceryNeedIdx >= 0 ? (
-          <div style={hud.buyPrompt}>
+          <div style={{ ...hud.buyPrompt, bottom: isTouch ? 196 : 12 }}>
             {groceryAlreadyGot
               ? `✓ Already picked up ${nearbyItem.name} — find what's left on the list`
               : `[E] Pick Up — ${nearbyItem.brand ? `${nearbyItem.brand} ` : ''}${nearbyItem.name} ($${nearbyItem.price.toFixed(2)})`}
           </div>
         ) : (
-          <div style={hud.buyPrompt}>
+          <div style={{ ...hud.buyPrompt, bottom: isTouch ? 196 : 12 }}>
             E: Buy {nearbyItem.brand ? `${nearbyItem.brand} ` : ''}{nearbyItem.name} — ${nearbyItem.price.toFixed(2)}
             {!nearbyItem.affordable && <span style={{ color: '#ff8080' }}> (not enough money)</span>}
           </div>
@@ -917,7 +917,7 @@ function GameCanvas({ supabase, player, initialState, notice, onChangePath }: {
           handleInteract() already uses — no new detection logic, just a visible cue for it. */}
       {nearbyNpc && !actionable && !nearbyItem && !nearStopId && !dialogueLines && !lifeEvent && !boardingAt &&
         helpParentsPhase !== 'seek' && helpParentsPhase !== 'working' && (
-        <div style={hud.buyPrompt}>[E] Talk — {getNpcDef(nearbyNpc.id)?.name ?? nearbyNpc.id}</div>
+        <div style={{ ...hud.buyPrompt, bottom: isTouch ? 196 : 12 }}>[E] Talk — {getNpcDef(nearbyNpc.id)?.name ?? nearbyNpc.id}</div>
       )}
 
       {/* Phase 14 / Step 27: bus-stop prompt — arrived bus vs. a countdown to the next one. Step 27
@@ -928,7 +928,7 @@ function GameCanvas({ supabase, player, initialState, notice, onChangePath }: {
           the player can see the whole route (BUS_ROUTE.name/fare, unchanged authoritative data)
           the moment they reach any stop — "make it obvious what the player can do here." */}
       {nearStopId && !actionable && !nearbyItem && (
-        <div style={hud.buyPrompt}>
+        <div style={{ ...hud.buyPrompt, bottom: isTouch ? 196 : 12 }}>
           <div style={{ fontSize: 11, opacity: 0.8, marginBottom: 2 }}>
             🚏 {stopName(nearStopId)} · {BUS_ROUTE.name} · Fare ${store.busFare().toFixed(2)}{(s.world.rideCredits ?? 0) > 0 ? ` · 🎫 ${s.world.rideCredits} rides left` : ''}
           </div>
@@ -968,6 +968,7 @@ function GameCanvas({ supabase, player, initialState, notice, onChangePath }: {
             if (!result.ok) setDialogueLines({ npc: stopName(boardingAt), text: result.reason ?? "Couldn't board the bus." });
           }}
           voiceOn={voiceOn}
+          style={isTouch ? { bottom: 196 } : undefined}
         />
       )}
 
@@ -990,13 +991,14 @@ function GameCanvas({ supabase, player, initialState, notice, onChangePath }: {
           balance={store.cash}
           voiceOn={voiceOn}
           onChoose={() => attendClass()}
+          style={isTouch ? { bottom: 196 } : undefined}
         />
       )}
 
       {/* Result of a rejected Attend Class attempt (e.g. not enough energy) — informational, click
           to dismiss. Does NOT mark class complete or advance the day on its own. */}
       {classFailure && (
-        <div style={hud.dialogue} onClick={() => setClassFailure(null)}>
+        <div style={{ ...hud.dialogue, ...(isTouch ? { bottom: 196 } : {}) }} onClick={() => setClassFailure(null)}>
           <div style={{ fontWeight: 700, color: '#ffd700', marginBottom: 4 }}>{rules.study?.teacher}</div>
           <div>{classFailure}</div>
         </div>
@@ -1004,7 +1006,7 @@ function GameCanvas({ supabase, player, initialState, notice, onChangePath }: {
 
       {/* Where's class? A single hint in the prompt slot while you're at school but not yet in class. */}
       {!actionable && !nearbyItem && !lifeEvent && !boardingAt && (classStatus === 'go_to_classroom' || classStatus === 'too_late') && (
-        <div style={hud.buyPrompt}>
+        <div style={{ ...hud.buyPrompt, bottom: isTouch ? 196 : 12 }}>
           {classStatus === 'go_to_classroom'
             ? `🔔 ${rules.study?.roomHint}`
             : `🔔 Too late for the ${rules.study?.noun} today — you'll be marked absent`}
@@ -1027,6 +1029,7 @@ function GameCanvas({ supabase, player, initialState, notice, onChangePath }: {
           balance={store.cash}
           voiceOn={voiceOn}
           onChoose={(c) => { if (c.id === 'help') setHelpParentsPhaseBoth('seek'); else declineHelpParents(); }}
+          style={isTouch ? { bottom: 196 } : undefined}
         />
       )}
 
@@ -1035,7 +1038,7 @@ function GameCanvas({ supabase, player, initialState, notice, onChangePath }: {
           prompts), not a menu — pressing E near Mum (handled in the keydown handler via
           tryStartHelpParentsActivity()) is what actually starts the activity. */}
       {helpParentsPhase === 'seek' && (
-        <div style={hud.buyPrompt}>🧹 Find Mum and press E to start helping</div>
+        <div style={{ ...hud.buyPrompt, bottom: isTouch ? 196 : 12 }}>🧹 Find Mum and press E to start helping</div>
       )}
 
       {/* Step 27: 'working' phase — the reusable short activity sequence itself. A real progress
@@ -1055,7 +1058,7 @@ function GameCanvas({ supabase, player, initialState, notice, onChangePath }: {
       {/* Result of a rejected Help Parents attempt (e.g. not enough energy) — informational, click
           to dismiss. Does NOT mark the chore complete. */}
       {helpParentsFailure && (
-        <div style={hud.dialogue} onClick={() => setHelpParentsFailure(null)}>
+        <div style={{ ...hud.dialogue, ...(isTouch ? { bottom: 196 } : {}) }} onClick={() => setHelpParentsFailure(null)}>
           <div style={{ fontWeight: 700, color: '#ffd700', marginBottom: 4 }}>Mum</div>
           <div>{helpParentsFailure}</div>
         </div>
@@ -1063,7 +1066,7 @@ function GameCanvas({ supabase, player, initialState, notice, onChangePath }: {
 
       {/* Idle chat / purchase confirmation / bus-timing toast — auto-dismisses, yields to real dialogue */}
       {dialogueLines && !actionable && !lifeEvent && !boardingAt && (
-        <div style={hud.dialogue} onClick={() => { stopSpeaking(); setDialogueLines(null); }}>
+        <div style={{ ...hud.dialogue, ...(isTouch ? { bottom: 196 } : {}) }} onClick={() => { stopSpeaking(); setDialogueLines(null); }}>
           {dialogueLines.npc && <div style={{ fontWeight: 700, color: '#ffd700', marginBottom: 4 }}>{dialogueLines.npc}</div>}
           <div>{dialogueLines.text}</div>
         </div>
@@ -1079,6 +1082,7 @@ function GameCanvas({ supabase, player, initialState, notice, onChangePath }: {
           voiceOn={voiceOn}
           skipSignal={skipSignal}
           onChoose={(c) => { store.applyChoice(actionable.def.id, c); setDialogueLines(null); }}
+          style={isTouch ? { bottom: 196 } : undefined}
         />
       )}
 
@@ -1103,6 +1107,7 @@ function GameCanvas({ supabase, player, initialState, notice, onChangePath }: {
           }))}
           balance={store.cash}
           onChoose={(c) => store.resolveLifeEvent(c.id)}
+          style={isTouch ? { bottom: 196 } : undefined}
         />
       )}
 
@@ -1195,7 +1200,7 @@ function GameCanvas({ supabase, player, initialState, notice, onChangePath }: {
   );
 }
 
-function DialoguePanel({ speaker, lines, choices, onChoose, balance, voiceOn, skipSignal }: {
+function DialoguePanel({ speaker, lines, choices, onChoose, balance, voiceOn, skipSignal, style }: {
   speaker?: string; lines: string[]; choices?: MissionChoice[]; onChoose: (c: MissionChoice) => void;
   /** When given, a choice costing more than this is shown but disabled — real trade-offs mean some
    *  options genuinely aren't available, not just unwise (Rule 3/4: the game never hides the option,
@@ -1206,6 +1211,8 @@ function DialoguePanel({ speaker, lines, choices, onChoose, balance, voiceOn, sk
   /** Bump this (any changed number) to fast-forward straight to the choices — driven by the
    *  on-screen "SKIP" touch button, since there's no keyboard shortcut to hold down on mobile. */
   skipSignal?: number;
+  /** Optional style overrides (e.g. bottom offset on mobile to clear the d-pad). */
+  style?: React.CSSProperties;
 }) {
   // Reveal one line at a time (tap/click to advance) instead of dumping the whole exchange at
   // once — reads like an actual back-and-forth instead of a wall of text with buttons under it.
@@ -1230,7 +1237,7 @@ function DialoguePanel({ speaker, lines, choices, onChoose, balance, voiceOn, sk
   useEffect(() => { if (atEnd) choicesShownAt.current = performance.now(); }, [atEnd, key]);
   const choiceReady = () => performance.now() - choicesShownAt.current > 350;
   return (
-    <div style={hud.dialogue} onClick={() => { if (!atEnd) setShown(n => n + 1); }}>
+    <div style={{ ...hud.dialogue, ...style }} onClick={() => { if (!atEnd) setShown(n => n + 1); }}>
       {speaker && <div style={{ fontWeight: 700, color: '#ffd700', marginBottom: 4 }}>{speaker}</div>}
       {lines.slice(0, shown).map((l, i) => <div key={i} style={{ marginBottom: 4 }}>{l}</div>)}
       {!atEnd && <div style={{ fontSize: 11, opacity: 0.6, marginTop: 6 }}>▾ tap to continue</div>}
@@ -1845,13 +1852,13 @@ const hud: Record<string, React.CSSProperties> = {
     position: 'absolute', inset: 0, zIndex: 60, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center',
     background: 'linear-gradient(#0b1030 0%, #1b1f4a 60%, #2c2350 100%)', overflow: 'hidden', animation: 'mmFade 3s ease-in-out forwards',
   },
-  topLeft: { position: 'absolute', top: 12, left: 12, zIndex: 10, fontFamily: 'monospace', color: '#fff', textShadow: '0 1px 2px #000', maxWidth: 260 },
+  topLeft: { position: 'absolute', top: 12, left: 12, zIndex: 10, fontFamily: 'monospace', color: '#fff', textShadow: '0 1px 2px #000', maxWidth: 'min(260px, calc(50vw - 16px))' },
   clock: { display: 'inline-block', background: 'rgba(10,10,20,0.75)', border: '1px solid #444', borderRadius: 8, padding: '4px 10px', fontSize: 13, color: '#ffd23f', marginBottom: 8 },
   objectiveBtn: { background: 'rgba(18,53,28,0.9)', border: '1px solid #3fb950', borderRadius: 8, padding: '6px 10px', color: '#fff', textAlign: 'left', cursor: 'pointer', fontFamily: 'monospace', animation: 'mmPulse 1.6s ease-in-out infinite' },
   topRight: { position: 'absolute', top: 12, right: 12, zIndex: 10, display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 6, fontFamily: 'monospace' },
   money: { background: 'rgba(10,10,20,0.75)', border: '1px solid #444', borderRadius: 8, padding: '4px 12px', fontSize: 18, fontWeight: 700, color: '#7cfc00', textShadow: '0 1px 2px #000' },
   energyRow: { display: 'flex', alignItems: 'center', gap: 6, background: 'rgba(10,10,20,0.75)', border: '1px solid #444', borderRadius: 8, padding: '4px 10px' },
-  energyTrack: { width: 110, height: 8, background: '#2a2d36', borderRadius: 4, overflow: 'hidden' },
+  energyTrack: { width: 'clamp(70px, 20vw, 110px)', height: 8, background: '#2a2d36', borderRadius: 4, overflow: 'hidden' },
   energyFill: { height: '100%', borderRadius: 4, transition: 'width 300ms' },
   phoneBtn: {
     position: 'absolute', right: 24, bottom: 206, width: 58, height: 58, borderRadius: 16, zIndex: 26, fontSize: 28,
@@ -1859,7 +1866,7 @@ const hud: Record<string, React.CSSProperties> = {
   },
   phoneBadge: { position: 'absolute', top: -6, right: -6, minWidth: 22, height: 22, borderRadius: 11, background: '#f85149', fontSize: 12, fontWeight: 700, display: 'flex', alignItems: 'center', justifyContent: 'center', fontFamily: 'monospace', animation: 'mmPulse 1.2s ease-in-out infinite' },
   phoneKey: { position: 'absolute', bottom: -18, left: 0, right: 0, fontSize: 10, fontFamily: 'monospace', opacity: 0.7, textShadow: '0 1px 2px #000' },
-  toastStack: { position: 'absolute', top: 12, left: '50%', transform: 'translateX(-50%)', zIndex: 40, display: 'flex', flexDirection: 'column', gap: 6, width: 'min(380px, 60vw)' },
+  toastStack: { position: 'absolute', top: 12, left: '50%', transform: 'translateX(-50%)', zIndex: 40, display: 'flex', flexDirection: 'column', gap: 6, width: 'min(380px, 90vw)' },
   toast: {
     display: 'flex', alignItems: 'center', gap: 10, background: 'rgba(20,16,30,0.95)', border: '1px solid', borderRadius: 10,
     padding: '8px 14px', color: '#fff', fontFamily: 'monospace', fontSize: 13, animation: 'mmToastIn 220ms ease-out', boxShadow: '0 4px 20px rgba(0,0,0,0.4)',
