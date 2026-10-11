@@ -515,7 +515,7 @@ export const UNI_DAILY: MissionDef[] = [
         ],
       },
       {
-        id: 's2', place: 'university', waypoint: 'Campus', speaker: 'Psych Dept',
+        id: 's2', place: 'university', waypoint: 'Dr Lin, in the hallway', speaker: 'Dr Lin', host: 'researcher',
         lines: ['Welcome! Just remember these 20 words…'],
         choices: [{ id: 'do', label: '🧪 Take part (+$20)', sublabel: '1 hour · 5 energy', category: 'income', cost: 20, minutes: 60, energyCost: 5, consequence: 'You remember 14 words and earn $20 of groceries.', finish: true }],
       },
@@ -537,7 +537,7 @@ export const UNI_DAILY: MissionDef[] = [
         ],
       },
       {
-        id: 's2', place: 'library', waypoint: 'Library', speaker: 'Mei', npcId: 'mei',
+        id: 's2', place: 'library', waypoint: 'Library', speaker: 'Mei', npcId: 'mei', withNpc: true,
         lines: ['Okay so why does the curve go DOWN?'],
         choices: [{ id: 'study', label: '📖 Study together (1 hr)', sublabel: 'Free · Mei +2', cost: 0, minutes: 60, energyCost: 6, relationship: 2, social: true, consequence: 'You explain it; you both finally get it.', lesson: 'Teaching something is the fastest way to learn it.', finish: true }],
       },

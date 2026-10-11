@@ -69,6 +69,8 @@ export interface MissionChoice {
     | 'emergency_buffer_set' | 'scam_reported'
     // International effects
     | 'nz_bank_account' | 'visa_rules_known'
+    // Hands-on errands
+    | 'start_dog_walk' | 'start_can_collect'
     // Working effects (none extra — uses mark_attended + emergency_buffer_set from above)
     ;
   /** Hide this option when it doesn't make sense right now (e.g. packed lunch when you have none). */
@@ -97,6 +99,13 @@ export interface MissionStep {
   /** face-to-face step: happens wherever the player is with `npcId` (same room indoors, a few steps
    *  away outdoors), instead of at a fixed `place`. */
   withNpc?: boolean;
+  /** An errand host (see ERRAND_HOSTS in world.ts) who is physically waiting at `place` for this
+   *  step — Mrs Kaur and Biscuit by the park bench, the librarian at her desk. The step only opens
+   *  when you walk up to them. */
+  host?: string;
+  /** This step waits until the hands-on errand started by the previous step (walking Biscuit,
+   *  collecting litter) is finished. */
+  needsErrandDone?: boolean;
   /**
    * Shopping-list completion: instead of a scripted dialogue choice, the player does real walk-up-
    * and-buy shopping (Rule 27) inside `place`, and the step resolves itself the moment they walk back
@@ -785,6 +794,39 @@ export function makeAvailable(s: GameState, rt: MissionRuntime, def: MissionDef,
   emit({ type: 'mission_available', missionId: rt.id });
 }
 
+/** Minutes between one side task and the next from the same pool, so a day's tasks arrive spread
+ *  out instead of two or three landing at once. */
+const POOL_SPACING: Record<NonNullable<MissionDef['pool']>, number> = { morning: 25, after_school: 70, evening: 60, weekend: 90 };
+/** Breathing room after a side task finishes before the next one arrives. */
+const POOL_BREATHER = 15;
+
+/**
+ * May this rolled side task arrive now? One at a time, in turn, at a sensible moment:
+ *  1. nothing else from the pools is still waiting on the player (unanswered, or accepted and not done);
+ *  2. it's this task's turn — today's picks from a pool arrive in order, `POOL_SPACING` apart;
+ *  3. there's a short breather after the last side task finished;
+ *  4. there's still time to actually do it (an errand needs ~45 minutes before its window closes).
+ * The first task of each pool arrives right when its window opens.
+ */
+export function poolTaskMayArrive(s: GameState, defs: MissionDef[], def: MissionDef): boolean {
+  if (!def.pool) return true;
+  const p = parts(s.minutes);
+  const pooled = (id: string) => !!getDef(defs, id)?.pool;
+  if (s.missions.some(rt => rt.id !== def.id && (rt.state === 'available' || rt.state === 'active') && pooled(rt.id))) return false;
+  const todays = s.world.dailyMarks.filter(m => m.startsWith('pool:') && m.endsWith(`:${p.day}`)).map(m => m.split(':')[1]);
+  const turn = Math.max(0, todays.filter(id => getDef(defs, id)?.pool === def.pool).indexOf(def.id));
+  if (p.minuteOfDay < def.window.from + turn * POOL_SPACING[def.pool]) return false;
+  if (turn > 0) {
+    const lastFinished = Math.max(-Infinity, ...s.missions
+      .filter(rt => pooled(rt.id) && rt.finishedAt !== undefined && parts(rt.finishedAt).day === p.day)
+      .map(rt => rt.finishedAt!));
+    if (s.minutes - lastFinished < POOL_BREATHER) return false;
+    const needs = def.steps.some(st => !st.remote) ? 45 : 10;
+    if (def.window.until - p.minuteOfDay < needs) return false;
+  }
+  return true;
+}
+
 /** Called once per game minute. Handles time triggers, expiry and daily/weekly resets. */
 export function missionsOnMinute(s: GameState, defs: MissionDef[], emit: Emit, onExpired: (def: MissionDef, rt: MissionRuntime) => void) {
   for (const rt of s.missions) {
@@ -818,6 +860,7 @@ export function missionsOnMinute(s: GameState, defs: MissionDef[], emit: Emit, o
 
     if (!windowOpen(def, s.minutes)) continue;
     if (def.requires && !def.requires(s)) continue;
+    if (!poolTaskMayArrive(s, defs, def)) continue;
     // Remember when this window's occurrence ends, so the missed-obligation check above can fire.
     if (rt.expiresAt === undefined) rt.expiresAt = expiryFor(def, s.minutes);
 

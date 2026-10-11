@@ -23,11 +23,14 @@ import { MoveInput, drawDayNightOverlay, drawMinimap, hudTime, waypointReadout }
 import {
   PLACES, TILE_PX, isOpen as placeIsOpen, groundSprite,
   CHAR_FRAME_W, CHAR_FRAME_H, CHAR_RUN_FRAMES, DIR_ORDER, facingToDir, characterSheet,
-  getInterior, INTERIOR_TILE_PX, DECOR_PROPS, getNpcDef,
+  getInterior, INTERIOR_TILE_PX, DECOR_PROPS, getNpcDef, ERRAND_HOSTS,
   BUS_STOPS, BUS_ROUTE, busAtStop, nextBusAt, stopById, rideMinutes, getPlace, type ShopItemDef,
 } from '../../lib/world';
 import { buildJournal, MissionChoice, MissionDef, trackedMission } from '../../lib/missions';
 import { dayToSummaryView, weekToSummaryView } from '../../lib/summary';
+import { HOME_JOBS, type HomeJob } from '../../lib/content/homeJobs';
+import { chatLinesFor } from '../../lib/smallTalk';
+const HOME_JOB_BY_ID = new Map(HOME_JOBS.map(j => [j.id, j]));
 import type { DayRecord, DecisionRecord, GameState, NpcRuntime } from '../../lib/types';
 import { formatDay, formatTime, parts } from '../../lib/clock';
 import { pathText, placeName, pathUnlocked, maxLevel, LEVELS_TO_UNLOCK } from '../../lib/pathRules';
@@ -35,104 +38,6 @@ import { LIFE_EVENTS } from '../../lib/lifeEvents';
 import Phone, { type PhoneApp } from '../../components/Phone';
 
 const MAP_W = 60, MAP_H = 44;
-
-/** Small talk when an NPC has nothing mission-related to say. Lines depend on the day, the time,
- *  your money, your goal and how things stand with them — so chatting never feels canned. */
-function idlePoolFor(npcId: string, store: GameStore): string[] {
-  const s = store.state, p = parts(s.minutes), cash = store.cash;
-  const flags = s.world.flags, rel = s.world.relationships;
-  const goal = store.weekGoalId();
-  const morning = p.hour < 12, evening = p.hour >= 17, weekend = p.dayOfWeek >= 5;
-  const lines: string[] = [];
-  const add = (cond: boolean, ...l: string[]) => { if (cond) lines.push(...l); };
-  switch (npcId) {
-    case 'mum':
-      add(morning && !weekend, 'Have a good day, love. Got everything?', "Don't forget — lunch doesn't buy itself.");
-      add(evening, 'How was school?', "Dinner's at seven.");
-      add(cash < 3, "Running low? I'll pay you to help around the house.", 'Money tight this week? Happens to everyone.');
-      add(cash > 15, "Look at you, still with money left. I'm impressed.");
-      add(goal === 'save_event', "How's the fair fund going?");
-      add(goal === 'buy_headphones', 'Those headphones… are they worth a whole week of lunches?');
-      add(s.finance.accounts.savings > 0, `$${s.finance.accounts.savings.toFixed(0)} in the piggy bank? That's my kid.`);
-      add(weekend, 'No school today — enjoy it.');
-      add(true, "Love you, kiddo.", 'Let me know if you need to talk about money — no judgment.');
-      break;
-    case 'jordan':
-      add(p.dayOfWeek === 3, 'Arcade later?? You in?');
-      add(p.dayOfWeek === 4, 'Weekend plans? The fair is Saturday!');
-      add(weekend, "Fair's actually good this year.");
-      add(cash < 3, "Broke too? Same. Payday can't come fast enough.");
-      add((rel.Jordan ?? 0) <= 0, '…hey.', 'Oh. Hi.');
-      add((rel.Jordan ?? 0) >= 4, "You're a legend, you know that?");
-      add(flags.includes('shared_game'), 'Pixel Racer is SO good. Your turn Saturday!');
-      add(true, "I'm saving up for new headphones — slow going.", 'You seen Riley today?');
-      break;
-    case 'riley':
-      add(p.dayOfWeek <= 3 && !flags.includes('birthday_resolved'), "My birthday's this week 👀", "You're still coming to my birthday thing?");
-      add(flags.includes('birthday_contributed'), 'Thanks again for chipping in for my birthday!');
-      add(flags.includes('birthday_declined'), 'Oh. Hi.');
-      add(goal === 'save_event', "Are you coming to the fair? I've saved $6 so far.");
-      add(weekend, 'The market has the best dumplings.');
-      add(true, "School's been a lot lately, honestly.", 'Have you done the maths homework?');
-      break;
-    case 'teacher':
-      add(!weekend && !store.hasDoneToday('at_school') && p.hour < 12, "Class is starting — find a seat.");
-      add(!weekend && store.hasDoneToday('at_school'), 'Good work today.');
-      add(!flags.includes('school_project_done') && p.dayOfWeek <= 2, 'Have you got your project supplies yet?');
-      add(weekend, 'Enjoying the fair? The raffle draws at one.');
-      add(true, 'Let me know if you are stuck on anything.');
-      break;
-    // ── University cast ──
-    case 'sam':
-      add(morning && !weekend, "Lecture at 10? I'm going back to sleep.", 'Did you take my milk? …Fine, it was old anyway.');
-      add(evening, "What's for dinner? Please say it's not noodles again.", 'Flat meeting on Sunday about the dishes 😤');
-      add(flags.includes('wk_rent_late') || flags.includes('wk_rent_owed'), 'So… about that rent.', "Not to be weird, but I'm still out of pocket for your rent.");
-      add(flags.includes('wk_rent_paid'), 'Cheers for paying rent on time. Honestly rare.');
-      add(flags.includes('wk_sky_yes'), 'Sky Sport was the best decision this flat has ever made 🏉');
-      add(flags.includes('wk_power_owed'), "Power's still $45 short, just saying.");
-      add(cash < 30, "Broke? The Psych department pays $20 for studies. Easy money.");
-      add(weekend, "Raglan's the best. Or the park. Anywhere but here.");
-      add(true, 'Flatting is just paying bills with friends.', "I'm cooking pasta again. It's always pasta.");
-      break;
-    case 'mei':
-      add(!weekend && p.hour < 12, "Did you do the reading? I did the reading. Twice.");
-      add(!flags.includes('wk_textbook_told') && p.dayOfWeek <= 1, 'Dr Hughes talks about the textbook after the first lecture — stay till the end!');
-      add(flags.includes('wk_club_joined'), 'See you at the club this week!');
-      add(flags.includes('wk_textbook_used'), "Second-hand textbook? Smart. I paid full price like a fool.");
-      add((rel.Mei ?? 0) >= 3, "Honestly, you're the best part of ECON101.");
-      add(weekend, 'The market has the best dumplings. Trust me.');
-      add(true, 'Supply and demand is just vibes with graphs.', 'The library is open till 8 if you need a quiet spot.');
-      break;
-    case 'lecturer':
-      add(!weekend && !store.hasDoneToday('at_school') && p.hour < 11, 'Lecture starts at ten — the Lecture Theatre, first door on the left.');
-      add(!flags.includes('wk_quiz_done') && p.dayOfWeek === 4, "Don't forget, Quiz 1 closes at midnight.");
-      add(true, 'Economics is really about choices: what you give up to get what you want.', 'Office hours are Thursdays. Nobody ever comes.');
-      break;
-    case 'leah':
-      add(flags.includes('wk_job_offer'), "Good to have you on the team! Rosters go out Sunday.");
-      add(flags.includes('wk_trial_offered') && !flags.includes('wk_job_offer'), 'See you Friday at 1 for your trial!');
-      add(flags.includes('wk_applied') && !flags.includes('wk_trial_offered'), 'Interviews are Wednesday afternoon — come by between 1 and 4:30.');
-      add(true, 'Flat white? $5.50. Staff get them free, just saying.', 'Busiest café near campus. We are always hiring.');
-      break;
-    case 'shopkeeper':
-      add(p.dayOfWeek === 3, 'Delivery day. My back is already sore.');
-      add(flags.includes('dairy_shift_done'), 'Best shelf-stocker I have had!');
-      add(true, 'Fresh bread came in this morning.', "Let me know if you can't find something.");
-      break;
-  }
-  return lines.length ? lines : ['Hey.'];
-}
-
-/** A short chat: two or three different lines from the pool, kept in pool order (the situational
- *  lines are added first, the general ones last), so it reads like one conversation that ends —
- *  pressing E again moves it on instead of starting it over. */
-function chatLinesFor(npcId: string, store: GameStore): string[] {
-  const pool = [...new Set(idlePoolFor(npcId, store))];
-  const want = Math.min(pool.length, pool.length >= 4 ? 3 : 2);
-  const picked = new Set<number>();
-  while (picked.size < want) picked.add(Math.floor(Math.random() * pool.length));
-  return [...picked].sort((a, b) => a - b).map(i => pool[i]);
-}
 
 /** Returns `value` only once it has stayed the same for `ms` — closing (null) is instant. Used so
  *  panels don't snap open the same frame something else closes: each beat gets a breath. */
@@ -144,6 +49,49 @@ function useSettled<T>(value: T | null, ms: number): T | null {
     return () => clearTimeout(t);
   }, [value, ms]);
   return settled;
+}
+
+/** A white name tag with a dark outline, centred under a character. */
+function labelUnder(ctx: CanvasRenderingContext2D, text: string, x: number, y: number, size: number) {
+  ctx.font = `bold ${Math.round(size)}px monospace`;
+  ctx.textAlign = 'center';
+  ctx.fillStyle = '#fff'; ctx.strokeStyle = '#000'; ctx.lineWidth = 3;
+  ctx.strokeText(text, x, y);
+  ctx.fillText(text, x, y);
+}
+
+/** Biscuit: a 16x14 two-frame sprite (scripts/art/build_characters.py), mirrored when facing left. */
+function drawDog(ctx: CanvasRenderingContext2D, x: number, y: number, T: number, facing: number, moving: boolean) {
+  const img = getImg('/characters/dog/biscuit.png');
+  const w = T * 0.62, h = w * 14 / 16;
+  const frame = moving ? Math.floor(performance.now() / 140) % 2 : 0;
+  ctx.save();
+  ctx.fillStyle = 'rgba(0,0,0,0.25)';
+  ctx.beginPath(); ctx.ellipse(x, y + 1, w * 0.38, w * 0.1, 0, 0, Math.PI * 2); ctx.fill();
+  if (img) {
+    const left = Math.cos(facing) < 0;
+    ctx.translate(x, y - h + 3);
+    if (left) ctx.scale(-1, 1);
+    ctx.drawImage(img, frame * 16, 0, 16, 14, -w / 2, 0, w, h);
+  }
+  ctx.restore();
+}
+
+/** A little pile of cans and a crisp packet for the litter pick. */
+function drawLitter(ctx: CanvasRenderingContext2D, x: number, y: number, T: number, seed: number) {
+  const u = T / 16;
+  ctx.save();
+  ctx.fillStyle = 'rgba(0,0,0,0.2)';
+  ctx.beginPath(); ctx.ellipse(x, y + u, u * 6, u * 1.8, 0, 0, Math.PI * 2); ctx.fill();
+  const cans = [[-3, 0, '#c8cdd6', '#d23a3a'], [1, -1, '#c8cdd6', '#3a7bd2'], [3.5, 1, '#c8cdd6', '#3fb950']] as const;
+  cans.forEach(([dx, dy, metal, band], i) => {
+    if ((seed + i) % 4 === 3) return;
+    ctx.fillStyle = metal; ctx.fillRect(x + dx * u, y + (dy - 3) * u, u * 2.4, u * 3.4);
+    ctx.fillStyle = band; ctx.fillRect(x + dx * u, y + (dy - 2) * u, u * 2.4, u * 1.2);
+    ctx.strokeStyle = '#3a3a50'; ctx.lineWidth = 1; ctx.strokeRect(x + dx * u, y + (dy - 3) * u, u * 2.4, u * 3.4);
+  });
+  ctx.fillStyle = '#f0b429'; ctx.fillRect(x - u * 1.5, y + u * 0.2, u * 3, u * 1.6);
+  ctx.restore();
 }
 
 // ── Sprite cache: loads each image once, draw() just reads whatever is ready this frame. ─────
@@ -514,20 +462,9 @@ function GameCanvas({ supabase, player, initialState, notice, onChangePath }: {
   // Attend Class: a message when it can't happen (e.g. too tired), shown until dismissed.
   const [classFailure, setClassFailure] = useState<string | null>(null);
   const classResolvingRef = useRef(false);
-  // Help Mum: once a day, only when she's home (see helpParentsEligible). Done/declined is saved as a daily mark.
-  const [helpParentsFailure, setHelpParentsFailure] = useState<string | null>(null);
-  const helpParentsResolvingRef = useRef(false);
-  // Help Mum sequence: 'seek' (find Mum, press E) -> 'working' (progress bar) -> done.
-  const [helpParentsPhase, setHelpParentsPhase] = useState<'ask' | 'seek' | 'working' | null>(null);
-  // Ref copy for the keydown handler, which is registered once and would otherwise read stale state.
-  const helpParentsPhaseRef = useRef<typeof helpParentsPhase>(null);
-  const setHelpParentsPhaseBoth = useCallback((p: typeof helpParentsPhase) => {
-    helpParentsPhaseRef.current = p;
-    setHelpParentsPhase(p);
-  }, []);
-  const [helpParentsProgress, setHelpParentsProgress] = useState(0);
-  // Balance/energy when the chore starts, so the toast reports the real change.
-  const helpParentsSnapshotRef = useRef<{ balance: number; energy: number } | null>(null);
+  // Jobs board (home): which job is being done right now, and how far along the progress bar is.
+  const [jobsOpen, setJobsOpen] = useState(false);
+  const [jobWork, setJobWork] = useState<{ job: HomeJob; pct: number } | null>(null);
   const [isTouch, setIsTouch] = useState(false);
   const [voiceOn, setVoiceOn] = useState(true);
   useEffect(() => () => stopSpeaking(), []); // stop any speech mid-line if the page/component unmounts
@@ -606,28 +543,31 @@ function GameCanvas({ supabase, player, initialState, notice, onChangePath }: {
     }, 1400);
     return () => clearTimeout(t);
   }, [store]);
-  // The first few seconds after loading belong to waking up and the phone — side asks (like Mum's
-  // chores) wait until then.
-  const [settledIn, setSettledIn] = useState(false);
-  useEffect(() => { const t = setTimeout(() => setSettledIn(true), 3200); return () => clearTimeout(t); }, []);
-
-  // Help Mum progress bar: fills over ~1.2 real seconds, then store.helpParents() applies the real
-  // time/energy/money change once.
+  // Doing a job from the board: a short progress bar, then the store applies the real time, energy
+  // and pay in one go (and the decision card explains the hourly rate).
+  const startJob = useCallback((job: HomeJob) => {
+    setJobsOpen(false);
+    setJobWork({ job, pct: 0 });
+  }, []);
+  const jobId = jobWork?.job.id;
   useEffect(() => {
-    if (helpParentsPhase !== 'working') return;
-    const durationMs = 1200;
-    const start = performance.now();
+    if (!jobId) return;
+    const job = HOME_JOB_BY_ID.get(jobId)!;
+    const durationMs = 1600, start = performance.now();
     let raf = 0;
     const tick = (now: number) => {
       const pct = Math.min(100, ((now - start) / durationMs) * 100);
-      setHelpParentsProgress(pct);
-      if (pct >= 100) { helpParents(); return; }
-      raf = requestAnimationFrame(tick);
+      setJobWork(w => (w && w.job.id === jobId ? { ...w, pct } : w));
+      if (pct < 100) { raf = requestAnimationFrame(tick); return; }
+      const out = store.doHomeJob(job.id);
+      setJobWork(null);
+      if (!out.ok) { setDialogueLines({ npc: 'Jobs board', text: out.message ?? "That didn't work." }); return; }
+      pushToast({ icon: job.emoji, lines: [job.name, `${job.pay > 0 ? `+$${job.pay.toFixed(2)} · ` : ''}${job.minutes} min · -${out.energyConsumed} energy`] });
     };
     raf = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(raf);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [helpParentsPhase]);
+  }, [jobId]);
 
   // Switching life paths: force a save under the CURRENT path's key first, so
   // nothing from this session is lost, then hand control back to path select.
@@ -654,7 +594,7 @@ function GameCanvas({ supabase, player, initialState, notice, onChangePath }: {
       if (key === 'e' || key === 'enter') {
         if (e.repeat) return; // holding the key down shouldn't skip a whole conversation
         if (conversationOpenRef.current) { setAdvanceSignal(n => n + 1); return; }
-        if (key === 'e' && !tryStartHelpParentsActivity()) handleInteract();
+        if (key === 'e') handleInteract();
       }
       if (key === 'j') setPhoneApp(a => (a === 'today' ? null : 'today'));
       if (key === 'p') setPhoneApp(a => (a ? null : 'home'));
@@ -671,6 +611,14 @@ function GameCanvas({ supabase, player, initialState, notice, onChangePath }: {
     if (npc) store.talkTo(npc.id);
     const step = store.actionableStep('inPerson');
     if (step) return; // handled by the main mission DialoguePanel (driven by `actionable`, not this state)
+    const host = store.hostsHere().find(h => store.hostNearPlayer(h.hostId));
+    if (host && !host.waiting) {
+      const st = store.errandStatus();
+      setDialogueLines({ npc: ERRAND_HOSTS[host.hostId].name, text: host.hostId === 'kaur'
+        ? `Biscuit still wants his walk! ${st?.detail ?? ''}`.trim()
+        : `Keep going — ${st?.detail ?? 'nearly there'}.` });
+      return;
+    }
     if (npc && !recentlyChatted(npc.id)) {
       setDialogueLines({ npc: getNpcDef(npc.id)?.name ?? npc.id, lines: chatLinesFor(npc.id, store), chatWith: npc.id });
       return;
@@ -711,21 +659,6 @@ function GameCanvas({ supabase, player, initialState, notice, onChangePath }: {
     }
   }, [store]);
 
-  // Step 27: once the player has accepted "Help Mum" and is in the 'seek' phase, pressing E near
-  // Mum (the same npcNearPlayer() check handleInteract() already uses for dialogue/idle-chat) starts
-  // the activity sequence instead of the normal idle-chat fallback. This reuses the existing NPC
-  // proximity system rather than inventing a new interactable-object system, per the Step 27 Part 3
-  // instruction to prefer existing systems when they genuinely cover the need.
-  const tryStartHelpParentsActivity = useCallback(() => {
-    if (helpParentsPhaseRef.current !== 'seek') return false;
-    const npc = store.npcNearPlayer();
-    if (!npc || npc.id !== 'mum') return false;
-    helpParentsSnapshotRef.current = { balance: store.cash, energy: store.getEnergy().current };
-    setHelpParentsProgress(0);
-    setHelpParentsPhaseBoth('working');
-    return true;
-  }, [store, setHelpParentsPhaseBoth]);
-
   // Attend Class: runs through store.attendClass() (ActivitySystem on the live game).
   const attendClass = useCallback(() => {
     if (classResolvingRef.current) return; // already handling a click for this prompt
@@ -747,51 +680,6 @@ function GameCanvas({ supabase, player, initialState, notice, onChangePath }: {
     }
   }, [store]);
 
-  // Help Mum: called when the progress bar finishes; the toast shows the real before/after change.
-  const helpParents = useCallback(() => {
-    if (helpParentsResolvingRef.current) return; // already handling a click for this prompt
-    helpParentsResolvingRef.current = true;
-    try {
-      const before = helpParentsSnapshotRef.current;
-      const outcome = store.helpParents();
-      if (!outcome.ok) {
-        // Never pretend a failed activity succeeded: not marked complete, so the player remains
-        // eligible to try again (e.g. after energy recovers).
-        setHelpParentsFailure(outcome.message ?? 'That didn\'t work.');
-        setHelpParentsPhaseBoth(null);
-        return;
-      }
-      store.markDoneToday('helped_parents');
-      setHelpParentsFailure(null);
-      setHelpParentsPhaseBoth(null);
-      const after = { balance: store.cash, energy: store.getEnergy().current };
-      const moneyDelta = before ? after.balance - before.balance : outcome.amountEarned;
-      const energyDelta = before ? before.energy - after.energy : outcome.energyConsumed;
-      pushToast({ icon: '🧹', lines: ['Helped around the house',
-          `${moneyDelta > 0 ? '+' : ''}$${moneyDelta.toFixed(2)} · -${energyDelta.toFixed(0)} energy · Mum +1`,] });
-      store.noteDecision('activity:help_mum', 'Mum asked for a hand', 'Helped around the house',
-        `Half an hour of chores, and Mum paid you for it.`, moneyDelta,
-        'Trading your time for money is how every job works — even small ones add up.');
-    } finally {
-      helpParentsResolvingRef.current = false;
-    }
-  }, [store, setHelpParentsPhaseBoth]);
-
-  // Step 27: DECLINE path. Not silent — applies a small, believable relationship consequence
-  // (mirroring the -1 scale every other mission's "decline"-shaped choice already uses, e.g.
-  // arcade_invite's 'home' choice), via the new adjustRelationship() method, and gives the player
-  // immediate feedback for why. No money/time/energy change — declining a chore costs nothing
-  // materially, only a little goodwill, which is the believable-consequence bar Step 27 set.
-  const declineHelpParents = useCallback(() => {
-    store.adjustRelationship('Mum', -1);
-    store.markDoneToday('declined_parents');
-    store.noteDecision('activity:decline_mum', 'Mum asked for a hand', 'Not right now',
-      'You kept your time free, but missed out on the money — and Mum noticed.', 0,
-      'Free time has a cost too: the money you could have earned instead (opportunity cost).');
-    setHelpParentsPhaseBoth(null);
-    pushToast({ icon: '🙁', lines: ["Mum looks a little disappointed, but doesn't push it.", 'Mum -1'] });
-  }, [store, setHelpParentsPhaseBoth]);
-
   // Main loop.
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -811,6 +699,7 @@ function GameCanvas({ supabase, player, initialState, notice, onChangePath }: {
       for (const t of store.takeAchievementToasts()) pushToast({ icon: t.emoji, label: 'ACHIEVEMENT UNLOCKED', lines: [t.name], tone: 'gold' });
       for (const n of store.takeNotices()) pushToast({ icon: 'ℹ️', lines: [n], ms: 5000, urgent: true });
       for (const d of store.takeDecisions()) decisionQueueRef.current.push(d);
+      for (const t of store.takeTips()) pushToast({ icon: '📋', label: 'JOBS BOARD', lines: [t], tone: 'gold', ms: 6500 });
       // In-person objectives get a small "new objective" card; phone messages get a notification.
       for (const d of store.takeOffers()) {
         if (!d.steps[0]?.remote) pushToast({ icon: d.emoji, label: 'NEW OBJECTIVE', lines: [d.name], tone: 'blue' });
@@ -859,28 +748,20 @@ function GameCanvas({ supabase, player, initialState, notice, onChangePath }: {
   // Attend Class: every weekday, in the classroom, from the gates opening until 11:30.
   const classStatus = store.classStatus();
   const classEligible = classStatus === 'ready';
-  // Help Mum: only when you're home AND Mum actually is (she's at work 8:00-17:30 on weekdays),
-  // once a day. Accepting/declining is remembered in the save, so a reload can't farm it.
-  const helpParentsEligible =
-    profile.lifePath === 'school' &&
-    s.player.place === 'home' &&
-    s.npcs.mum?.place === 'home' && !s.npcs.mum?.moving &&
-    clockParts.minuteOfDay >= 6 * 60 + 30 && clockParts.minuteOfDay < 21 * 60 && // not at midnight
-    !store.hasDoneToday('helped_parents') &&
-    !store.hasDoneToday('declined_parents');
+  // Jobs board: School path, at home.
+  const jobsHere = profile.lifePath === 'school' && s.player.place === 'home' ? store.homeJobs() : [];
+  const openJobs = jobsHere.filter(j => j.status === 'open').length;
+  const errand = store.errandStatus();
   const busArrived = nearStopId ? busAtStop(nearStopId, s.minutes) : null;
 
   // ── Pacing: one conversation at a time, each opening a beat after the last one closes ──
   // Nobody starts talking behind a full-screen card (day recap, goodnight, level summary…).
   const screenCovered = !!(dayCard || transition || store.pendingDaySummary || store.pendingWeekSummary
-    || store.pendingLevelSummary || confirmSwitch || showPiggy);
+    || store.pendingLevelSummary || confirmSwitch || showPiggy || jobsOpen || jobWork);
   modalOpenRef.current = screenCovered;
   const missionKey = actionable && !lifeEvent && !phoneApp && !screenCovered ? `${actionable.def.id}:${actionable.rt.stepIndex}` : null;
   const settledMission = useSettled(missionKey, 650);
   const missionPanel = missionKey && settledMission === missionKey ? actionable : null;
-  const helpAskWanted = settledIn && !screenCovered && helpParentsEligible && helpParentsPhase === null && !actionable && !lifeEvent && !boardingAt &&
-    !classEligible && !classFailure && !helpParentsFailure && !nearbyItem && !nearStopId && !phoneApp && !dialogueLines;
-  const helpAskShown = useSettled(helpAskWanted ? 'help' : null, 900) === 'help' && helpAskWanted;
   const classWanted = !screenCovered && classEligible && !!rules.study && !actionable && !lifeEvent && !boardingAt && !classFailure && !phoneApp && !dialogueLines;
   const classShown = useSettled(classWanted ? 'class' : null, 500) === 'class' && classWanted;
   const chatShown = !!dialogueLines && !actionable && !lifeEvent && !boardingAt && !screenCovered;
@@ -891,7 +772,7 @@ function GameCanvas({ supabase, player, initialState, notice, onChangePath }: {
   useEffect(() => { if (settledMission && dialogueLinesRef.current) closeChat(); }, [settledMission, closeChat]);
   // "That's everything for today": once nothing is left and no other panel is open.
   const dayDoneNow = !dayCard && !transition && !actionable && !lifeEvent && !boardingAt && !daySummary
-    && !weekSummary && !store.pendingLevelSummary && helpParentsPhase === null && store.dayComplete();
+    && !weekSummary && !store.pendingLevelSummary && !jobWork && store.dayComplete();
   useEffect(() => {
     if (!dayDoneNow) return;
     store.markDayDoneShown();
@@ -1003,6 +884,9 @@ function GameCanvas({ supabase, player, initialState, notice, onChangePath }: {
 
       {/* Notifications: one queue, newest at the bottom, tap a message to open it */}
       <div style={hud.toastStack}>
+        {/* Decision card — how that choice went, money-wise, and what it teaches. Shares the stack
+            with notifications so the two can never land on top of each other. */}
+        {decisionCard && <DecisionCard key={decisionCard.uid} d={decisionCard} onClose={() => setDecisionCard(null)} />}
         {toasts.map(t => (
           <div key={t.key} onClick={t.onClick} style={{ ...hud.toast, borderColor: TOAST_COLORS[t.tone ?? 'plain'], cursor: t.onClick ? 'pointer' : 'default' }}>
             <span style={{ fontSize: 22 }}>{t.icon}</span>
@@ -1014,8 +898,6 @@ function GameCanvas({ supabase, player, initialState, notice, onChangePath }: {
         ))}
       </div>
 
-      {/* Decision card — how that choice went, money-wise, and what it teaches */}
-      {decisionCard && <DecisionCard key={decisionCard.uid} d={decisionCard} onClose={() => setDecisionCard(null)} />}
 
       {!isTouch && s.player.scene !== 'outdoor' && s.player.scene !== 'bus' && (
         <div style={hud.exitHint}>Press ESC to go outside</div>
@@ -1059,8 +941,7 @@ function GameCanvas({ supabase, player, initialState, notice, onChangePath }: {
           interact with and nothing higher-priority (a mission panel, a shop item, a bus stop) is
           already claiming the prompt slot. Reuses the same npcNearPlayer() proximity check
           handleInteract() already uses — no new detection logic, just a visible cue for it. */}
-      {nearbyNpc && !actionable && !nearbyItem && !nearStopId && !dialogueLines && !lifeEvent && !boardingAt && !recentlyChatted(nearbyNpc.id) &&
-        helpParentsPhase !== 'seek' && helpParentsPhase !== 'working' && (
+      {nearbyNpc && !actionable && !nearbyItem && !nearStopId && !dialogueLines && !lifeEvent && !boardingAt && !recentlyChatted(nearbyNpc.id) && !jobWork && (
         <div style={{ ...hud.buyPrompt, bottom: isTouch ? 196 : 12 }}>{isTouch ? 'ACT' : '[E]'} Talk — {getNpcDef(nearbyNpc.id)?.name ?? nearbyNpc.id}</div>
       )}
 
@@ -1172,53 +1053,33 @@ function GameCanvas({ supabase, player, initialState, notice, onChangePath }: {
         </div>
       )}
 
-      {/* Step 15/27: Help Parents — the Step 27 first-vertical-slice mission. Same priority pattern
-          as the Attend Class panel, only shown when nothing else is active AND the player hasn't
-          already been asked today (helpParentsPhase === null means "not yet accepted/declined
-          today" — the panel disappears the instant a choice is made, it does not linger). */}
-      {helpAskShown && (
-        <DialoguePanel
-          speaker="Mum"
-          lines={['Could you help out around the house for a bit?']}
-          choices={[
-            { id: 'help', label: 'Help Mum', sublabel: '~30 min · 5 energy · +$5', cost: 0, minutes: 0, consequence: '' },
-            { id: 'decline', label: 'Not right now', sublabel: 'Mum will understand — probably', cost: 0, minutes: 0, consequence: '' },
-          ]}
-          balance={store.cash}
-          voiceOn={voiceOn}
-          onChoose={(c) => { if (c.id === 'help') setHelpParentsPhaseBoth('seek'); else declineHelpParents(); }}
-          style={isTouch ? { bottom: 196 } : undefined}
-        />
-      )}
-
-      {/* Step 27: 'seek' phase — the player accepted, dialogue has closed, and they keep full normal
-          movement/control. This is a HUD hint only (same style as the existing shop/bus contextual
-          prompts), not a menu — pressing E near Mum (handled in the keydown handler via
-          tryStartHelpParentsActivity()) is what actually starts the activity. */}
-      {helpParentsPhase === 'seek' && (
-        <div style={{ ...hud.buyPrompt, bottom: isTouch ? 196 : 12 }}>🧹 Find Mum and press E to start helping</div>
-      )}
-
-      {/* Step 27: 'working' phase — the reusable short activity sequence itself. A real progress
-          bar (driven by the useEffect above), not a fake video and not a full mini-game. The
-          player's objective/HUD stays visible underneath; this is an overlay, not a modal that
-          blocks the rest of the screen. */}
-      {helpParentsPhase === 'working' && (
+      {/* A job from the board in progress */}
+      {jobWork && (
         <div style={hud.activitySequence}>
-          <div style={{ fontSize: 22, marginBottom: 4 }}>🧹</div>
-          <div style={{ fontSize: 13, marginBottom: 8 }}>Helping around the house…</div>
+          <div style={{ fontSize: 22, marginBottom: 4 }}>{jobWork.job.emoji}</div>
+          <div style={{ fontSize: 13, marginBottom: 8 }}>{jobWork.job.name}…</div>
           <div style={hud.activityBarTrack}>
-            <div style={{ ...hud.activityBarFill, width: `${helpParentsProgress}%` }} />
+            <div style={{ ...hud.activityBarFill, width: `${jobWork.pct}%` }} />
           </div>
         </div>
       )}
 
-      {/* Result of a rejected Help Parents attempt (e.g. not enough energy) — informational, click
-          to dismiss. Does NOT mark the chore complete. */}
-      {helpParentsFailure && (
-        <div style={{ ...hud.dialogue, ...(isTouch ? { bottom: 196 } : {}) }} onClick={() => setHelpParentsFailure(null)}>
-          <div style={{ fontWeight: 700, color: '#ffd700', marginBottom: 4 }}>Mum</div>
-          <div>{helpParentsFailure}</div>
+      {/* The jobs board on the fridge */}
+      {jobsOpen && (
+        <JobsBoard jobs={jobsHere} energy={store.getEnergy().current} weekJobs={s.world.flags.filter(f => f.startsWith('wk_job:')).length}
+          bonusPaid={s.world.flags.includes('wk_job_bonus')} onDo={startJob} onClose={() => setJobsOpen(false)} />
+      )}
+
+      {/* Hands-on errand in progress: what's next */}
+      {errand && (
+        <div style={{ ...hud.errandChip, top: isTouch ? 108 : 118 }}>
+          <div style={{ fontSize: 11, color: '#ffd23f', letterSpacing: 0.5 }}>{errand.emoji} {errand.title.toUpperCase()}</div>
+          <div style={{ fontSize: 13, fontWeight: 700 }}>{errand.detail}</div>
+          <div style={{ display: 'flex', gap: 3, marginTop: 4 }}>
+            {Array.from({ length: errand.total }, (_, i) => (
+              <span key={i} style={{ flex: 1, height: 4, borderRadius: 2, background: i < errand.done ? '#3fb950' : 'rgba(255,255,255,0.2)' }} />
+            ))}
+          </div>
         </div>
       )}
 
@@ -1358,6 +1219,11 @@ function GameCanvas({ supabase, player, initialState, notice, onChangePath }: {
       {s.player.place === 'home' && (
         <div style={isTouch ? { ...hud.homeBtns, bottom: 'auto', top: 116, flexDirection: 'column', alignItems: 'flex-start' } : hud.homeBtns}>
           <button style={{ ...hud.sleepBtn, position: 'static' }} onClick={() => store.sleep(false)}>🛏️ Go to sleep</button>
+          {jobsHere.length > 0 && (
+            <button style={{ ...hud.sleepBtn, position: 'static', background: '#ffd23f' }} onClick={() => setJobsOpen(true)}>
+              📋 Jobs board{openJobs > 0 ? ` · ${openJobs}` : ''}
+            </button>
+          )}
           {store.savingsInfo.atHome
             ? <button style={{ ...hud.sleepBtn, position: 'static', background: '#f0a0c0' }} onClick={() => setShowPiggy(true)}>{store.savingsInfo.emoji} {store.savingsInfo.name} · ${s.finance.accounts.savings.toFixed(2)}</button>
             : <button style={{ ...hud.sleepBtn, position: 'static', background: '#79c0ff' }} onClick={() => setPhoneApp('bank')}>{store.savingsInfo.emoji} {store.savingsInfo.name} · ${s.finance.accounts.savings.toFixed(2)}</button>}
@@ -1553,10 +1419,9 @@ function DecisionCard({ d, onClose }: { d: DecisionRecord; onClose: () => void }
   const v = VERDICT_STYLE[d.verdict ?? 'none'];
   return (
     <div onClick={onClose} role="status" style={{
-      position: 'absolute', top: 58, left: '50%', transform: 'translateX(-50%)', zIndex: 60,
-      width: 'min(380px, 92vw)', background: v.bg, border: `2px solid ${v.color}`, borderRadius: 12,
+      width: '100%', boxSizing: 'border-box', background: v.bg, border: `2px solid ${v.color}`, borderRadius: 12,
       padding: '10px 14px', color: '#fff', fontFamily: 'monospace', cursor: 'pointer',
-      boxShadow: `0 6px 24px ${v.color}40`, animation: 'mmCardIn 280ms cubic-bezier(.2,1.3,.4,1)',
+      boxShadow: `0 6px 24px ${v.color}40`, animation: 'mmCardDrop 280ms cubic-bezier(.2,1.3,.4,1)',
     }}>
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 4 }}>
         <span style={{ fontSize: 12, fontWeight: 700, letterSpacing: 1, color: v.color }}>{v.icon} {v.label}</span>
@@ -1669,6 +1534,56 @@ function DayRecapModal({ view, rec, onClose }: { view: ReturnType<typeof dayToSu
           {[view.schoolLine, view.missionsLine, view.timeLine].filter(Boolean).join(' · ')}
         </div>
         <button style={{ ...btnStyle, marginTop: 14 }} onClick={onClose}>Start the day</button>
+      </div>
+    </div>
+  );
+}
+
+/** The family jobs board on the fridge: today's three jobs with pay, time, effort and — the point —
+ *  the hourly rate, so picking one is a real "is this worth my time?" decision. */
+function JobsBoard({ jobs, energy, weekJobs, bonusPaid, onDo, onClose }: {
+  jobs: { job: HomeJob; status: 'open' | 'done' | 'later'; reason?: string }[];
+  energy: number; weekJobs: number; bonusPaid: boolean;
+  onDo: (job: HomeJob) => void; onClose: () => void;
+}) {
+  const best = Math.max(...jobs.filter(j => j.job.pay > 0).map(j => j.job.pay / j.job.minutes * 60));
+  return (
+    <div style={hud.modalBackdrop} onClick={onClose}>
+      <div style={{ ...hud.modal, width: 'min(420px, 94vw)', background: '#f6efd9', color: '#2b2418', border: '3px solid #8a6a3a', animation: 'mmPop 220ms ease-out' }} onClick={e => e.stopPropagation()}>
+        <div style={{ textAlign: 'center', marginBottom: 10 }}>
+          <div style={{ fontSize: 30 }}>📋</div>
+          <h3 style={{ margin: '2px 0 0' }}>Family jobs board</h3>
+          <div style={{ fontSize: 12, opacity: 0.75 }}>Pick a job, earn some money. New jobs every day.</div>
+        </div>
+        {jobs.map(({ job, status, reason }) => {
+          const perHour = job.pay > 0 ? job.pay / job.minutes * 60 : 0;
+          const tooTired = energy < job.energy;
+          const canDo = status === 'open' && !tooTired;
+          return (
+            <div key={job.id} style={{ background: status === 'done' ? '#e4ddc4' : '#fffaf0', border: '1px solid #c9b88f', borderRadius: 8, padding: '8px 10px', marginBottom: 8, opacity: status === 'done' ? 0.7 : 1, transform: `rotate(${job.id.length % 2 ? -0.6 : 0.5}deg)` }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', gap: 8 }}>
+                <b style={{ fontSize: 14 }}>{job.emoji} {job.name}</b>
+                <b style={{ fontSize: 14, color: job.pay > 0 ? '#1f7a33' : '#7a5a1f', whiteSpace: 'nowrap' }}>{job.pay > 0 ? `$${job.pay.toFixed(2)}` : 'Dinner!'}</b>
+              </div>
+              <div style={{ fontSize: 12, opacity: 0.8, margin: '2px 0 4px' }}>{job.blurb}</div>
+              <div style={{ fontSize: 11, display: 'flex', gap: 10, flexWrap: 'wrap', opacity: 0.85 }}>
+                <span>⏱ {job.minutes} min</span><span>⚡ {job.energy} energy</span>
+                {perHour > 0 && <span style={{ fontWeight: 700, color: perHour >= best - 0.01 ? '#1f7a33' : undefined }}>= ${perHour.toFixed(2)}/hour{perHour >= best - 0.01 && jobs.length > 1 ? ' · best rate' : ''}</span>}
+                {job.energyRestore ? <span>🍽 +{job.energyRestore} energy back</span> : null}
+              </div>
+              <div style={{ marginTop: 6 }}>
+                {status === 'done' ? <span style={{ fontSize: 12, fontWeight: 700 }}>✅ Done today</span>
+                  : status === 'later' ? <span style={{ fontSize: 12, opacity: 0.75 }}>🕒 {reason}</span>
+                  : tooTired ? <span style={{ fontSize: 12, color: '#a33' }}>😴 Too tired — needs {job.energy} energy</span>
+                  : <button style={{ ...btnStyle, padding: 6, width: 'auto', paddingInline: 14 }} disabled={!canDo} onClick={() => onDo(job)}>Do it</button>}
+              </div>
+            </div>
+          );
+        })}
+        <div style={{ fontSize: 12, textAlign: 'center', margin: '4px 0 10px' }}>
+          {bonusPaid ? '⭐ Reliability bonus earned this week!' : `⭐ Do 3 different jobs this week for a $3 reliability bonus (${Math.min(weekJobs, 3)}/3)`}
+        </div>
+        <button style={{ ...btnStyle, background: '#8a6a3a', color: '#fff' }} onClick={onClose}>Close</button>
       </div>
     </div>
   );
@@ -1926,8 +1841,36 @@ function draw(ctx: CanvasRenderingContext2D, cw: number, ch: number, store: Game
   // Player + NPCs, Y-sorted by their base (feet) position so whoever is "lower" on screen draws
   // on top — this is the depth-sort the master doc asks for among characters.
   const runFrame = Math.floor((performance.now() / 90) % CHAR_RUN_FRAMES);
-  type Entity = { x: number; y: number; facing: number; moving: boolean; sheetName: string; npcId?: string };
+  type Entity = { x: number; y: number; facing: number; moving: boolean; sheetName: string; npcId?: string; label?: string; bubble?: string; dog?: boolean };
+  // Hands-on errand points: the next stop on Biscuit's walk, or the litter still lying around.
+  if (s.errand) {
+    const t = performance.now();
+    s.errand.points.forEach((pt, i) => {
+      if (s.errand!.done[i]) return;
+      if (s.errand!.kind === 'walk') {
+        if (s.errand!.done.indexOf(false) !== i) return;
+        const r = TILE_PX * (0.45 + 0.08 * Math.sin(t / 250));
+        ctx.strokeStyle = 'rgba(255,214,90,0.9)'; ctx.lineWidth = 4;
+        ctx.beginPath(); ctx.ellipse(pt.x, pt.y, r, r * 0.55, 0, 0, Math.PI * 2); ctx.stroke();
+        ctx.font = `${Math.round(TILE_PX * 0.36)}px sans-serif`; ctx.textAlign = 'center';
+        ctx.fillText('🐾', pt.x, pt.y - TILE_PX * 0.35 + Math.sin(t / 300) * 3);
+      } else {
+        drawLitter(ctx, pt.x, pt.y, TILE_PX, i);
+      }
+    });
+  }
+  const hostEntities: Entity[] = [];
+  for (const h of store.hostsHere()) {
+    const def = ERRAND_HOSTS[h.hostId];
+    hostEntities.push({ x: h.x, y: h.y, facing: Math.PI / 2, moving: false, sheetName: def.sheet, label: def.name, bubble: h.waiting ? '💬' : '⏳' });
+    if (def.companion === 'dog' && !s.errand) hostEntities.push({ x: h.x + TILE_PX * 0.8, y: h.y + TILE_PX * 0.12, facing: Math.PI, moving: false, sheetName: '', dog: true });
+  }
+  if (s.errand?.follower) {
+    const f = s.errand.follower;
+    hostEntities.push({ x: f.x, y: f.y, facing: f.facing, moving: f.moving, sheetName: '', dog: true });
+  }
   const entities: Entity[] = [
+    ...hostEntities,
     ...(Object.values(s.npcs) as NpcRuntime[]).filter(n => n.visible).map(n => ({
       // npc.facing is already the real per-step walking direction the store computed in stepNpcs()
       x: n.x, y: n.y, facing: n.facing, moving: n.moving, sheetName: getNpcDef(n.id)?.sheet ?? 'alex', npcId: n.id,
@@ -1943,6 +1886,11 @@ function draw(ctx: CanvasRenderingContext2D, cw: number, ch: number, store: Game
   const bob = Math.sin(performance.now() / 300) * 3;
   const wantsToTalk = store.npcsWantingToTalk();
   for (const e of entities) {
+    if (e.dog) {
+      drawDog(ctx, e.x, e.y, TILE_PX, e.facing, e.moving);
+      if (e.label) labelUnder(ctx, e.label, e.x, e.y + TILE_PX * 0.3, TILE_PX * 0.15);
+      continue;
+    }
     const dir = facingToDir(e.facing);
     const dirIdx = DIR_ORDER.indexOf(dir);
     const sheet = getImg(characterSheet(e.sheetName, e.moving ? 'run' : 'idle'));
@@ -1961,6 +1909,11 @@ function draw(ctx: CanvasRenderingContext2D, cw: number, ch: number, store: Game
       const tag = getNpcDef(e.npcId)?.name ?? e.npcId;
       ctx.strokeText(tag, e.x, e.y + TILE_PX * 0.38);
       ctx.fillText(tag, e.x, e.y + TILE_PX * 0.38);
+    }
+    if (e.label) labelUnder(ctx, e.label, e.x, e.y + TILE_PX * 0.38, TILE_PX * 0.17);
+    if (e.bubble) {
+      ctx.font = `${Math.round(TILE_PX * 0.4)}px sans-serif`; ctx.textAlign = 'center';
+      ctx.fillText(e.bubble, e.x, e.y - drawH + TILE_PX * 0.15 - 6 + bob);
     }
     if (e.npcId && (e.npcId === targetNpcId || wantsToTalk.has(e.npcId))) {
       ctx.font = `${Math.round(TILE_PX * 0.4)}px sans-serif`;
@@ -2098,6 +2051,22 @@ function drawInterior(ctx: CanvasRenderingContext2D, cw: number, ch: number, sto
           ctx.font = `${Math.round(T * 0.4)}px sans-serif`;
           ctx.fillText(indoorWantsToTalk.has(npc.id) ? '💬' : '📍', anchorX, anchorY - drawH + T * 0.15 - 6 + indoorBob);
         }
+      },
+    });
+  }
+
+  for (const h of store.hostsHere()) {
+    const def = ERRAND_HOSTS[h.hostId];
+    drawables.push({
+      y: h.y,
+      draw: () => {
+        const sheet = getImg(characterSheet(def.sheet, 'idle'));
+        const drawH = T * 1.25, drawW = drawH * (CHAR_FRAME_W / CHAR_FRAME_H);
+        if (sheet) ctx.drawImage(sheet, 0, 0, CHAR_FRAME_W, CHAR_FRAME_H, h.x - drawW / 2, h.y - drawH + T * 0.15, drawW, drawH);
+        else drawPersonFallback(ctx, h.x, h.y, T, '#8ac0d6');
+        labelUnder(ctx, def.name, h.x, h.y + T * 0.3, T * 0.22);
+        ctx.font = `${Math.round(T * 0.4)}px sans-serif`; ctx.textAlign = 'center';
+        ctx.fillText(h.waiting ? '💬' : '⏳', h.x, h.y - drawH + T * 0.15 - 6 + indoorBob);
       },
     });
   }
@@ -2274,6 +2243,7 @@ const TRANSITION_CSS = `
 @keyframes mmPhoneUp { from { transform: translateY(40px); opacity: 0 } to { transform: translateY(0); opacity: 1 } }
 @keyframes mmDialogIn { from { transform: translate(-50%, 14px); opacity: 0 } to { transform: translate(-50%, 0); opacity: 1 } }
 @keyframes mmLineIn { from { transform: translateY(4px); opacity: 0 } to { transform: translateY(0); opacity: 1 } }
+@keyframes mmCardDrop { from { transform: translateY(-14px) scale(0.95); opacity: 0 } to { transform: translateY(0) scale(1); opacity: 1 } }
 @keyframes mmCardIn { from { transform: translate(-50%, -16px) scale(0.94); opacity: 0 } to { transform: translate(-50%, 0) scale(1); opacity: 1 } }
 @keyframes mmToastIn { from { transform: translateY(-12px); opacity: 0 } to { transform: translateY(0); opacity: 1 } }
 @keyframes mmPulse { 0%, 100% { transform: scale(1) } 50% { transform: scale(1.08) } }
@@ -2310,7 +2280,7 @@ const hud: Record<string, React.CSSProperties> = {
   },
   phoneBadge: { position: 'absolute', top: -6, right: -6, minWidth: 22, height: 22, borderRadius: 11, background: '#f85149', fontSize: 12, fontWeight: 700, display: 'flex', alignItems: 'center', justifyContent: 'center', fontFamily: 'monospace', animation: 'mmPulse 1.2s ease-in-out infinite' },
   phoneKey: { position: 'absolute', bottom: -18, left: 0, right: 0, fontSize: 10, fontFamily: 'monospace', opacity: 0.7, textShadow: '0 1px 2px #000' },
-  toastStack: { position: 'absolute', top: 12, left: '50%', transform: 'translateX(-50%)', zIndex: 40, display: 'flex', flexDirection: 'column', gap: 6, width: 'min(380px, 90vw)' },
+  toastStack: { position: 'absolute', top: 12, left: '50%', transform: 'translateX(-50%)', zIndex: 60, display: 'flex', flexDirection: 'column', gap: 6, width: 'min(380px, 90vw)' },
   toast: {
     display: 'flex', alignItems: 'center', gap: 10, background: 'rgba(20,16,30,0.95)', border: '1px solid', borderRadius: 10,
     padding: '8px 14px', color: '#fff', fontFamily: 'monospace', fontSize: 13, animation: 'mmToastIn 220ms ease-out', boxShadow: '0 4px 20px rgba(0,0,0,0.4)',
@@ -2325,6 +2295,7 @@ const hud: Record<string, React.CSSProperties> = {
   exitHint: { position: 'absolute', bottom: 12, left: 12, color: '#fff', fontFamily: 'monospace', fontSize: 12, background: 'rgba(0,0,0,0.6)', padding: '6px 10px', borderRadius: 6, zIndex: 10 },
   buyPrompt: { position: 'absolute', bottom: 12, left: '50%', transform: 'translateX(-50%)', color: '#ffd700', fontFamily: 'monospace', fontSize: 13, background: 'rgba(0,0,0,0.75)', padding: '8px 14px', borderRadius: 8, zIndex: 10 },
   sleepBtn: { position: 'absolute', bottom: 12, left: 12, ...btnStyle, width: 'auto', padding: '8px 14px', zIndex: 10 },
+  errandChip: { position: 'absolute', left: 12, zIndex: 11, width: 'min(230px, 55vw)', background: 'rgba(10,10,20,0.85)', border: '1px solid #3fb950', borderRadius: 8, padding: '6px 10px', color: '#fff', fontFamily: 'monospace' },
   homeBtns: { position: 'absolute', bottom: 48, left: 12, display: 'flex', gap: 8, zIndex: 10 },
   goalChip: {
     width: 'min(230px, 55vw)', cursor: 'pointer', textAlign: 'left',

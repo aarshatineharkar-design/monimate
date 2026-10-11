@@ -52,7 +52,9 @@ import {
   BIKE_MIN_PER_TILE, BUS_ROUTE, BUS_STOPS, NPCS, TILE_PX, WALK_MIN_PER_TILE, busAtStop, distanceTiles,
   doorTile, getPlace, isOpen, closedReason, npcPlaceAt, rideMinutes, routeTiles, stopById, tileToPx,
   getInterior, INTERIOR_TILE_PX, PLACE_INTERIOR_SCENE, npcRoomAt, interiorBlocked,
+  ERRAND_HOSTS, DOG_WALK_ROUTE, LITTER_SPOTS,
 } from './world';
+import { HOME_JOBS, JOB_BONUS, type HomeJob } from './content/homeJobs';
 import { verdictFor } from './content/verdicts';
 import type { ShopItemDef } from './world';
 
@@ -148,6 +150,8 @@ export interface GoalStatus {
 
 /** Flags that describe one week. Cleared when the next week's pocket money arrives, so last
  *  week's arcade trip can't count toward this week's goal. */
+const fmtHm = (m: number) => { const h = Math.floor(m / 60), mm = m % 60; return `${h % 12 === 0 ? 12 : h % 12}:${String(mm).padStart(2, '0')} ${h >= 12 ? 'PM' : 'AM'}`; };
+
 const WEEK_FLAG_PREFIXES = [
   'wk_', // every path's newer content marks its week-only flags with this prefix
   'goal:', 'friends_base:', 'birthday_', 'unexpected_', 'school_project_', 'school_fair_', 'dairy_shift_',
@@ -209,6 +213,7 @@ export class GameStore {
   /** One-line notices for the HUD (e.g. "Closed — opens at 7:30 AM"), drained by takeNotices(). */
   private noticeQueue: string[] = [];
   private decisionQueue: DecisionRecord[] = [];
+  private tipQueue: string[] = [];
   /** Driver-waits hold for the bus at the player's stop: which arrival it's for, and real seconds left. */
   private busHold: { key: string; left: number } | null = null;
 
@@ -343,6 +348,7 @@ export class GameStore {
     if (!s.ride) this.drainEnergy(Math.min(minutes, 5) * ENERGY_DRAIN_PER_HOUR / 60);
     this.stepNpcs(minutes);
     if (s.ride && s.minutes >= s.ride.endsAt - 1e-6) this.finishRide();
+    if (s.errand) this.updateErrand(dtSec);
     this.touch();
   }
 
@@ -404,6 +410,7 @@ export class GameStore {
     this.evaluateMissions();
     this.updateNpcTargets();
     this.economyOnMinute(p);
+    this.pitchJobOnMinute(p);
 
     if (p.minuteOfDay === PASS_OUT_AT && !s.sleeping) this.sleep(true);
   }
@@ -619,6 +626,8 @@ export class GameStore {
   }
   private applyEffect(effect: NonNullable<MissionChoice['effect']>) {
     const s = this.state, p = parts(s.minutes);
+    if (effect === 'start_dog_walk') this.startErrand('dog_walk', 'walk');
+    if (effect === 'start_can_collect') this.startErrand('can_recycling', 'collect');
     if (effect === 'bus_pass_week') s.world.busPass = { validUntil: at(p.day - p.dayOfWeek + 7, 0, 0) };
     if (effect === 'subscribe_streambox' && !s.finance.expenses.recurring.some(r => r.id === 'streambox')) {
       s.finance.expenses.recurring.push({ id: 'streambox', category: 'subscription', name: 'StreamBox', amount: 5, periodDays: 30, nextDueAt: s.minutes + 30 * MIN_PER_DAY });
@@ -960,6 +969,9 @@ export class GameStore {
   // ══ NOTICES ══════════════════════════════════════════════════════════════
   pushNotice(text: string) { this.noticeQueue.push(text); }
   takeNotices(): string[] { const n = this.noticeQueue; this.noticeQueue = []; return n; }
+  /** A friendly, non-urgent heads-up (Mum mentioning a job) — waits its turn behind conversations. */
+  pushTip(text: string) { this.tipQueue.push(text); }
+  takeTips(): string[] { const n = this.tipQueue; this.tipQueue = []; return n; }
 
   // ══ DAILY MARKS ══════════════════════════════════════════════════════════
   /** Once-per-day facts ("helped Mum today") live in the saved GameState, so a page reload can't
@@ -1185,7 +1197,7 @@ export class GameStore {
   private initNpcs(snap: boolean) {
     const s = this.state;
     for (const def of this.cast) {
-      const placeId = npcPlaceAt(def, s.minutes);
+      const placeId = this.errandPlaceFor(def.id) ?? npcPlaceAt(def, s.minutes);
       const t = tileToPx(this.npcSpot(def.id, placeId));
       const cur = s.npcs[def.id];
       if (!cur || snap) {
@@ -1207,11 +1219,23 @@ export class GameStore {
     return false; // inside a building
   }
 
+  /** Where an errand you've agreed to says this NPC should be (Jordan at the Mall for the game
+   *  sale, Riley at the café to study) — overrides their usual schedule until it's done. */
+  private errandPlaceFor(npcId: string): string | null {
+    for (const rt of this.state.missions) {
+      if (rt.state !== 'active' && rt.state !== 'available') continue;
+      const def = this.def(rt.id);
+      const step = def && this.stepFor(def, rt);
+      if (step && !step.remote && step.withNpc && step.npcId === npcId && rt.stepIndex > 0) return step.place;
+    }
+    return null;
+  }
+
   private updateNpcTargets() {
     const s = this.state;
     for (const def of this.cast) {
       const npc = s.npcs[def.id];
-      const placeId = npcPlaceAt(def, s.minutes);
+      const placeId = this.errandPlaceFor(def.id) ?? npcPlaceAt(def, s.minutes);
       if (placeId === npc.place) continue;
       npc.place = placeId;
       const to = tileToPx(this.npcSpot(def.id, placeId));
@@ -1311,6 +1335,181 @@ export class GameStore {
     return out;
   }
 
+  // ══ ERRAND HOSTS ══════════════════════════════════════════════════════════
+  /** Hosts waiting for the player right now: the current step of an offered/accepted task is an
+   *  in-person one with a host (Mrs Kaur at the park, the librarian at her desk…). */
+  hostsOnDuty(): { hostId: string; missionId: string; place: string; waiting: boolean }[] {
+    const out: { hostId: string; missionId: string; place: string; waiting: boolean }[] = [];
+    for (const rt of this.state.missions) {
+      if (rt.state !== 'active' && rt.state !== 'available') continue;
+      const def = this.def(rt.id);
+      const step = def && this.stepFor(def, rt);
+      if (!def || !step?.host || step.remote || !ERRAND_HOSTS[step.host]) continue;
+      out.push({ hostId: step.host, missionId: def.id, place: step.place,
+        waiting: !step.needsErrandDone || this.errandDone(def.id) });
+    }
+    return out;
+  }
+  /** On-duty hosts in the scene the player is in, with where they stand (world px outdoors,
+   *  interior px indoors). The renderer draws them here; proximity is measured from here. */
+  hostsHere(): { hostId: string; missionId: string; x: number; y: number; waiting: boolean }[] {
+    const s = this.state, pl = s.player;
+    const out: { hostId: string; missionId: string; x: number; y: number; waiting: boolean }[] = [];
+    for (const h of this.hostsOnDuty()) {
+      const def = ERRAND_HOSTS[h.hostId];
+      if (def.room) {
+        if (pl.place !== h.place || pl.scene !== def.room) continue;
+        out.push({ ...h, x: def.spot.x * INTERIOR_TILE_PX, y: def.spot.y * INTERIOR_TILE_PX });
+      } else if (pl.scene === 'outdoor') {
+        out.push({ ...h, x: def.spot.x * TILE_PX, y: def.spot.y * TILE_PX });
+      }
+    }
+    return out;
+  }
+  /** Close enough to talk to this host (about two steps). */
+  hostNearPlayer(hostId: string): boolean {
+    const pl = this.state.player, T = pl.scene === 'outdoor' ? TILE_PX : INTERIOR_TILE_PX;
+    return this.hostsHere().some(h => h.hostId === hostId && Math.hypot(h.x - pl.x, h.y - pl.y) < T * 2);
+  }
+  private hostReady(missionId: string, step: MissionStep): boolean {
+    if (this.state.player.place !== step.place || !step.host) return false;
+    if (step.needsErrandDone && !this.errandDone(missionId)) return false;
+    return this.hostNearPlayer(step.host);
+  }
+
+  // ══ HANDS-ON ERRANDS ══════════════════════════════════════════════════════
+  private startErrand(missionId: string, kind: 'walk' | 'collect') {
+    const s = this.state;
+    const pts = (kind === 'walk' ? DOG_WALK_ROUTE : LITTER_SPOTS).map(p => ({ x: p.x * TILE_PX, y: p.y * TILE_PX, label: p.label }));
+    const kaur = ERRAND_HOSTS.kaur.spot;
+    s.errand = {
+      missionId, kind, points: pts, done: pts.map(() => false),
+      follower: kind === 'walk' ? { x: (kaur.x + 0.5) * TILE_PX, y: (kaur.y + 0.2) * TILE_PX, facing: 0, moving: false } : undefined,
+    };
+  }
+  errandDone(missionId: string): boolean {
+    const e = this.state.errand;
+    return !!e && e.missionId === missionId && e.done.every(Boolean);
+  }
+  /** What the HUD shows while an errand is under way. */
+  errandStatus(): { emoji: string; title: string; detail: string; done: number; total: number; next?: { x: number; y: number } } | null {
+    const e = this.state.errand;
+    if (!e) return null;
+    const done = e.done.filter(Boolean).length, total = e.done.length;
+    const host = e.kind === 'walk' ? ERRAND_HOSTS.kaur.name : ERRAND_HOSTS.council.name;
+    if (done === total) return { emoji: e.kind === 'walk' ? '🐕' : '♻️', title: e.kind === 'walk' ? 'Walking Biscuit' : 'Litter pick', detail: `All done — back to ${host}`, done, total };
+    if (e.kind === 'walk') {
+      const i = e.done.indexOf(false);
+      return { emoji: '🐕', title: 'Walking Biscuit', detail: `Next: ${e.points[i].label}`, done, total, next: e.points[i] };
+    }
+    return { emoji: '♻️', title: 'Litter pick', detail: `${total - done} spot${total - done === 1 ? '' : 's'} left`, done, total };
+  }
+  private updateErrand(dtSec: number) {
+    const s = this.state, e = s.errand!, pl = s.player;
+    const rt = this.runtime(e.missionId);
+    if (!rt || (rt.state !== 'active' && rt.state !== 'available')) { delete s.errand; return; }
+    if (pl.scene !== 'outdoor') return; // Biscuit waits at the door
+    // Biscuit trots along a step behind you
+    if (e.follower) {
+      const f = e.follower;
+      const tx = pl.x - Math.cos(pl.facing) * TILE_PX * 0.7, ty = pl.y - Math.sin(pl.facing) * TILE_PX * 0.5;
+      const dx = tx - f.x, dy = ty - f.y, d = Math.hypot(dx, dy);
+      f.moving = d > TILE_PX * 0.25;
+      if (d > TILE_PX * 6) { f.x = tx; f.y = ty; }                     // you ran off — he catches up
+      else if (f.moving) {
+        const step = Math.min(d, Math.max(TILE_PX * 4.2 * dtSec, d * Math.min(1, dtSec * 5)));
+        f.x += (dx / d) * step; f.y += (dy / d) * step;
+        if (Math.abs(dx) > 1) f.facing = dx > 0 ? 0 : Math.PI;
+      }
+    }
+    // reach the next point (a walk goes in order; litter can be picked up in any order)
+    const reach = TILE_PX * (e.kind === 'walk' ? 1.2 : 0.9);
+    for (let i = 0; i < e.points.length; i++) {
+      if (e.done[i]) continue;
+      if (e.kind === 'walk' && e.done.indexOf(false) !== i) break;
+      const p = e.points[i];
+      if (Math.hypot(p.x - pl.x, p.y - pl.y) > reach) continue;
+      e.done[i] = true;
+      const n = e.done.filter(Boolean).length, total = e.done.length;
+      if (e.kind === 'walk') {
+        this.pushNotice(n < total ? `🐕 Biscuit loved ${p.label}! (${n}/${total})` : `🐕 Great walk! Take Biscuit back to ${ERRAND_HOSTS.kaur.name}.`);
+      } else {
+        this.pushNotice(n < total ? `♻️ Picked up the litter ${p.label} (${n}/${total})` : `♻️ Bag's full — take it back to the ${ERRAND_HOSTS.council.name.toLowerCase()}.`);
+      }
+      this.touch(true);
+    }
+  }
+
+  // ══ JOBS BOARD (home) ═════════════════════════════════════════════════════
+  /** Today's three jobs on the fridge, and whether each can be done right now. */
+  homeJobs(): { job: HomeJob; status: 'open' | 'done' | 'later'; reason?: string }[] {
+    const s = this.state, p = parts(s.minutes);
+    if (this.rules.id !== 'school') return [];
+    const eligible = HOME_JOBS.filter(j => !j.days || j.days.includes(p.dayOfWeek));
+    const rnd = this.dayRandom('jobs');
+    const pool = [...eligible];
+    const picks: HomeJob[] = [];
+    while (picks.length < 3 && pool.length) picks.push(pool.splice(Math.floor(rnd() * pool.length), 1)[0]);
+    return picks.map(job => {
+      if (this.hasDoneToday(`job:${job.id}`)) return { job, status: 'done' as const };
+      const m = p.minuteOfDay;
+      if (job.from !== undefined && m < job.from) return { job, status: 'later' as const, reason: `From ${fmtHm(job.from)}` };
+      if (job.until !== undefined && m >= job.until) return { job, status: 'later' as const, reason: 'Too late today' };
+      if (job.needsMum && !this.mumHome()) return { job, status: 'later' as const, reason: 'When Mum is home' };
+      return { job, status: 'open' as const };
+    });
+  }
+  private mumHome(): boolean {
+    const mum = this.state.npcs.mum;
+    return !!mum && mum.place === 'home' && !mum.moving;
+  }
+  /** Do one of today's jobs: time passes, energy is spent, Mum pays. */
+  doHomeJob(jobId: string): ActivityOutcome & { bonus?: number } {
+    const s = this.state;
+    const entry = this.homeJobs().find(e => e.job.id === jobId);
+    const fail = (message: string): ActivityOutcome => ({ ok: false, reason: 'unavailable', message, minutesAdvanced: 0, energyConsumed: 0, amountEarned: 0 });
+    if (!entry) return fail("That job isn't on today's board.");
+    if (s.player.place !== 'home') return fail('Jobs are done at home.');
+    if (entry.status === 'done') return fail('Already done today.');
+    if (entry.status === 'later') return fail(entry.reason ?? 'Not right now.');
+    const job = entry.job;
+    if (this.getEnergy().current < job.energy) return fail(`You're too tired for that — it takes ${job.energy} energy.`);
+    const out = this.runActivity({
+      id: `job_${job.id}`, name: job.name, category: 'chore', timeCostMinutes: job.minutes, energyCost: job.energy,
+      financialEffect: job.pay > 0 ? { account: 'cash', amount: job.pay, category: 'income', type: 'income', source: 'parents', description: `Jobs board: ${job.name}` } : undefined,
+    });
+    if (!out.ok) return out;
+    this.markDoneToday(`job:${job.id}`);
+    if (job.energyRestore) this.restoreEnergy(job.energyRestore);
+    if (job.mumBonus) this.adjustRelationship('Mum', job.mumBonus);
+    // the weekly reliability bonus
+    if (!s.world.flags.includes(`wk_job:${job.id}`)) s.world.flags.push(`wk_job:${job.id}`);
+    let bonus = 0;
+    const distinct = s.world.flags.filter(f => f.startsWith('wk_job:')).length;
+    if (distinct >= JOB_BONUS.distinctJobs && !s.world.flags.includes('wk_job_bonus')) {
+      s.world.flags.push('wk_job_bonus');
+      bonus = JOB_BONUS.amount;
+      this.earn(bonus, 'income', 'Reliability bonus from Mum', 'parents');
+      this.pushNotice(`⭐ Reliability bonus: Mum adds $${bonus} for doing ${distinct} different jobs this week.`);
+    }
+    this.noteDecision(`job:${job.id}`, 'Jobs board', `${job.emoji} ${job.name}`,
+      job.pay > 0 ? `${job.minutes} minutes of work, $${job.pay.toFixed(2)} from Mum.` : `${job.minutes} minutes well spent — and dinner sorted.`,
+      job.pay + bonus, job.lesson, 'good');
+    this.touch(true);
+    return { ...out, bonus };
+  }
+  /** Once a day Mum mentions one job — a different one each day — instead of asking for "help". */
+  private pitchJobOnMinute(p: ReturnType<typeof parts>) {
+    if (this.rules.id !== 'school' || this.hasDoneToday('jobs_pitched')) return;
+    const at = p.dayOfWeek >= 5 ? hm(10) : hm(17, 45);
+    if (p.minuteOfDay !== at) return;
+    const open = this.homeJobs().filter(e => e.status !== 'done');
+    if (!open.length) return;
+    this.markDoneToday('jobs_pitched');
+    const pick = open.sort((a, b) => (b.job.pay / b.job.minutes) - (a.job.pay / a.job.minutes))[0];
+    this.pushTip(`Mum: "${pick.job.pitch}"`);
+  }
+
   talkTo(npcId: string) {
     this.emit({ type: 'talked_to', npcId });
     this.evaluateMissions();
@@ -1385,16 +1584,16 @@ export class GameStore {
   // ══ DECISIONS ════════════════════════════════════════════════════════════
   /** Log a choice into today's record with its money verdict, and queue it for the decision card.
    *  Only real decisions are kept: ones with a verdict or a lesson. */
-  private recordDecision(d: Omit<DecisionRecord, 'verdict' | 'minutes'>) {
-    const verdict = verdictFor(d.key);
+  private recordDecision(d: Omit<DecisionRecord, 'verdict' | 'minutes'> & { verdict?: DecisionRecord['verdict'] }) {
+    const verdict = d.verdict ?? verdictFor(d.key);
     if (!verdict && !d.lesson) return; // plain receipts (pocket money arriving) aren't decisions
     const rec: DecisionRecord = { ...d, verdict, minutes: this.state.minutes };
     (this.state.today.decisions ??= []).push(rec);
     this.decisionQueue.push(rec);
   }
   /** Log a decision made through a UI activity rather than a mission choice (e.g. helping Mum). */
-  noteDecision(key: string, title: string, choice: string, consequence: string, amount = 0, lesson?: string) {
-    this.recordDecision({ key, title, choice, consequence, amount, lesson });
+  noteDecision(key: string, title: string, choice: string, consequence: string, amount = 0, lesson?: string, verdict?: DecisionRecord['verdict']) {
+    this.recordDecision({ key, title, choice, consequence, amount, lesson, verdict });
   }
   /** Decisions made since the UI last asked (consumes the queue) — drives the decision card. */
   takeDecisions(): DecisionRecord[] { const q = this.decisionQueue; this.decisionQueue = []; return q; }
@@ -1402,7 +1601,9 @@ export class GameStore {
   startMission(id: string) {
     const rt = this.runtime(id);
     if (!rt || (rt.state !== 'available')) return;
-    rt.state = 'active'; rt.startedAt = this.state.minutes; rt.stepIndex = 0;
+    // Never rewind: a task accepted by text (step 1 done) must not jump back to that text when you
+    // arrive in person — that used to leave you at the park with nothing to do.
+    rt.state = 'active'; rt.startedAt = this.state.minutes;
     this.emit({ type: 'mission_started', missionId: id });
     this.touch(true);
   }
@@ -1437,7 +1638,8 @@ export class GameStore {
       if (!step || step.completeOnArrival || step.awaitsPurchase) continue;
       if (mode === 'inPerson' && step.remote) continue; // phone messages live in the Messages app
       const reachable = step.remote
-        || (step.withNpc && step.npcId ? this.npcPresent(step.npcId) : s.player.place === step.place);
+        || (step.host ? this.hostReady(def.id, step)
+          : step.withNpc && step.npcId ? this.npcPresent(step.npcId) : s.player.place === step.place);
       if (reachable) {
         if (rt.state === 'available') this.startMission(rt.id);
         return { def, rt, step };
@@ -1537,6 +1739,7 @@ export class GameStore {
   completeMission(rt: MissionRuntime, def: MissionDef, outcome: string, choiceFlags?: string[]) {
     if (rt.state === 'completed') return;
     const s = this.state;
+    if (s.errand?.missionId === def.id) delete s.errand;
     rt.state = 'completed'; rt.finishedAt = s.minutes; rt.outcome = outcome;
     s.xp += def.rewards.xp;
     if (def.rewards.money) this.earn(def.rewards.money, 'mission_reward', def.name, def.id);
@@ -1794,6 +1997,11 @@ export class GameStore {
 
   private onMissionExpired(def: MissionDef, rt: MissionRuntime) {
     const s = this.state;
+    if (s.errand?.missionId === def.id) {
+      delete s.errand;
+      const host = def.steps.map(st => st.host).find(Boolean);
+      this.pushNotice(`${host ? ERRAND_HOSTS[host]?.name ?? 'They' : 'They'} had to go — the errand ran out of time.`);
+    }
     s.today.missionsMissed.push(def.id);
     const ex = def.onExpire;
     if (ex) {

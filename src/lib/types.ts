@@ -71,6 +71,17 @@ export interface DayRecord {
   decisions?: DecisionRecord[];
 }
 
+/** A hands-on errand: walk to each point (in order for a walk, any order for a pick-up). */
+export interface ErrandActivity {
+  missionId: string;
+  kind: 'walk' | 'collect';
+  /** World pixels. */
+  points: { x: number; y: number; label: string }[];
+  done: boolean[];
+  /** A companion who tags along (Biscuit), world pixels. */
+  follower?: { x: number; y: number; facing: number; moving: boolean };
+}
+
 /** One choice the player made, and how it reads money-wise (see content/verdicts.ts). */
 export interface DecisionRecord {
   key: string;              // `missionId:choiceId` or `life:eventId:choiceId`
@@ -163,6 +174,9 @@ export interface GameState {
   missions: MissionRuntime[];
   npcs: Record<string, NpcRuntime>;
   today: DayRecord;
+  /** A hands-on errand in progress — walking Biscuit round the park, picking up litter. Optional so
+   *  older saves load. */
+  errand?: ErrandActivity;
   weekDays: DayRecord[];
   weeks: WeekRecord[];
   lifePath: 'school' | 'university' | 'international' | 'working';

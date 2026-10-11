@@ -80,7 +80,6 @@ test('Decisions: every verdict key points at a real choice (no stale keys)', () 
     for (const d of missionDefs(p.id as LifePath)) for (const st of d.steps) for (const c of st.choices ?? []) real.add(`${d.id}:${c.id}`);
   }
   for (const e of LIFE_EVENTS) for (const c of e.choices) real.add(`life:${e.id}:${c.id}`);
-  real.add('activity:help_mum'); real.add('activity:decline_mum');
   const stale = Object.keys(CHOICE_VERDICTS).filter(k => !real.has(k));
   assert.deepEqual(stale, [], `verdicts for choices that no longer exist: ${stale.join(', ')}`);
 });
@@ -120,11 +119,11 @@ test('Decisions: a refused choice (can not afford) is not logged', () => {
 
 test('Decisions: the day recap gets the whole day, and a new day starts clean', () => {
   const store = newGame();
-  store.noteDecision('activity:help_mum', 'Mum asked for a hand', 'Helped', 'Chores done.', 5, 'Time is money.');
+  store.noteDecision('job:laundry', 'Jobs board', 'Fold the laundry', 'Chores done.', 2, 'Time is money.', 'good');
   store.advance(at(0, 22, 0) - store.state.minutes);
   store.sleep();
   const rec = store.pendingDaySummary!;
-  assert.ok(rec.decisions!.some(d => d.key === 'activity:help_mum' && d.verdict === 'good'));
+  assert.ok(rec.decisions!.some(d => d.key === 'job:laundry' && d.verdict === 'good'));
   assert.deepEqual(store.state.today.decisions ?? [], []);
 });
 
@@ -133,7 +132,7 @@ test('Decisions: saves from before decisions existed still load', () => {
   const raw = JSON.parse(store.serialize());
   delete raw.today.decisions;
   const back = GameStore.hydrate(JSON.stringify(raw))!;
-  back.noteDecision('activity:decline_mum', 'Mum asked', 'Not now', 'Kept the afternoon.', 0);
+  back.noteDecision('job:recycling', 'Jobs board', 'Sort the recycling', 'Done.', 1.5, undefined, 'good');
   assert.equal(back.state.today.decisions!.length, 1);
 });
 

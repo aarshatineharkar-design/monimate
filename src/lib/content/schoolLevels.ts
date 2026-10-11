@@ -343,7 +343,7 @@ export const SCHOOL_L2_POOL: MissionDef[] = [
     window: { days: [1, 2, 3], from: hm(12, 30), until: hm(15, 20) }, trigger: { type: 'time' },
     requires: attendedToday,
     steps: [{
-      id: 's1', place: 'university', waypoint: 'School hall', speaker: 'Book fair',
+      id: 's1', place: 'university', waypoint: 'School hall', speaker: 'Book-fair seller', host: 'bookseller',
       lines: ['Book fair! Paperbacks $8.', 'The library down the hall has most of these to borrow — free.'],
       choices: [
         { id: 'buy', label: '📘 Buy one ($8)', sublabel: 'Yours to keep', category: 'shopping', cost: -8, minutes: 15, consequence: 'New-book smell. Worth something.', finish: true },

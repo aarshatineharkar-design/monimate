@@ -178,14 +178,19 @@ export const DAILY_MISSIONS: MissionDef[] = [
         id: 's1', place: 'park', waypoint: 'Reply to Mrs Kaur', speaker: 'Mrs Kaur', remote: true,
         lines: ["Hi dear! Could you walk Biscuit around the park? I'll pay $4."],
         choices: [
-          { id: 'accept', label: "🐕 Sure, I'll meet you at the park", sublabel: 'Before 6 PM', cost: 0, minutes: 0, consequence: 'Biscuit will be waiting at the park.' },
+          { id: 'accept', label: "🐕 Sure, I'll meet you at the park", sublabel: 'Before 6 PM', cost: 0, minutes: 0, consequence: 'Mrs Kaur and Biscuit will wait by the bench in the park.' },
           { id: 'decline', label: '🙅 Not today', sublabel: '', cost: 0, minutes: 0, consequence: 'Mrs Kaur: "Another time!"', finish: true },
         ],
       },
       {
-        id: 's2', place: 'park', waypoint: 'Park', speaker: 'Mrs Kaur',
-        lines: ["Here's Biscuit! He loves the pond."],
-        choices: [{ id: 'walk', label: '🐕 Walk Biscuit (+$4)', sublabel: '30 min · 8 energy', category: 'income', cost: 4, minutes: 30, energyCost: 8, consequence: 'Biscuit is thrilled. Mrs Kaur hands you $4.', flags: ['walked_dog'], finish: true }],
+        id: 's2', place: 'park', waypoint: 'Mrs Kaur, by the bench', speaker: 'Mrs Kaur', host: 'kaur',
+        lines: ["There you are! Here's Biscuit.", 'Take him to the pond, down to the end of the path and past the little pond — he knows the way.'],
+        choices: [{ id: 'lead', label: "🐕 Take Biscuit's lead", sublabel: 'Walk him round the park', cost: 0, minutes: 0, effect: 'start_dog_walk', consequence: 'Biscuit tugs you straight towards the pond.' }],
+      },
+      {
+        id: 's3', place: 'park', waypoint: 'Back to Mrs Kaur', speaker: 'Mrs Kaur', host: 'kaur', needsErrandDone: true,
+        lines: ['Back already? Look at that tail go!', "Here's your $4, love. Same time next week?"],
+        choices: [{ id: 'walk', label: '🐕 Hand Biscuit back (+$4)', sublabel: '8 energy', category: 'income', cost: 4, minutes: 2, energyCost: 8, consequence: 'Biscuit is thrilled. Mrs Kaur hands you $4.', lesson: 'You traded about half an hour for $4 — that is $8 an hour. Knowing your hourly rate helps you judge any job.', flags: ['walked_dog'], finish: true }],
       },
     ],
     rewards: { xp: 15, message: 'Easy money, happy dog.' },
@@ -207,7 +212,7 @@ export const DAILY_MISSIONS: MissionDef[] = [
         ],
       },
       {
-        id: 's2', place: 'library', waypoint: 'Library', speaker: 'Librarian',
+        id: 's2', place: 'library', waypoint: 'Librarian, at the desk', speaker: 'Mrs Ngata', host: 'librarian',
         lines: ["Thanks for bringing it back! No fine today."],
         choices: [{ id: 'done', label: '📕 Hand it over', sublabel: 'Free', cost: 0, minutes: 5, consequence: 'Returned. $2 saved.', finish: true }],
       },
@@ -232,7 +237,7 @@ export const DAILY_MISSIONS: MissionDef[] = [
         ],
       },
       {
-        id: 's2', place: 'mall', waypoint: 'Mall', speaker: 'Jordan', npcId: 'jordan',
+        id: 's2', place: 'mall', waypoint: 'Mall', speaker: 'Jordan', npcId: 'jordan', withNpc: true,
         lines: ['Got it! Your turn Saturdays, mine Sundays?'],
         choices: [{ id: 'pay', label: '🎮 Pay your half ($6)', sublabel: 'Shared game', category: 'entertainment', cost: -6, minutes: 20, relationship: 1, social: true, consequence: 'Half a game, all the fun.', flags: ['shared_game'], finish: true }],
       },
@@ -256,7 +261,7 @@ export const DAILY_MISSIONS: MissionDef[] = [
         ],
       },
       {
-        id: 's2', place: 'cafe', waypoint: 'Café', speaker: 'Riley', npcId: 'riley',
+        id: 's2', place: 'cafe', waypoint: 'Café', speaker: 'Riley', npcId: 'riley', withNpc: true,
         lines: ['You came! Want a hot chocolate? They are $4.50.'],
         choices: [
           { id: 'choc', label: '☕ Hot chocolate ($4.50)', sublabel: '1 hour · +10 energy · Riley +1', category: 'food', cost: -4.5, minutes: 60, energyRestore: 10, relationship: 1, social: true, consequence: 'Maths makes more sense with hot chocolate.', finish: true },
@@ -283,7 +288,7 @@ export const DAILY_MISSIONS: MissionDef[] = [
         ],
       },
       {
-        id: 's2', place: 'police', waypoint: 'Services', speaker: 'Officer Tane',
+        id: 's2', place: 'police', waypoint: 'Officer Tane, at the counter', speaker: 'Officer Tane', host: 'officer',
         lines: ["Someone's been looking everywhere for this. Thank you!", 'The owner left a $3 reward for whoever found it.'],
         choices: [{ id: 'thanks', label: '🙂 Take the reward (+$3)', sublabel: 'Honest money', category: 'income', cost: 3, minutes: 10, consequence: 'You did the right thing, and got $3 for it.', flags: ['honest_finder'], finish: true }],
       },
@@ -308,7 +313,7 @@ export const DAILY_MISSIONS: MissionDef[] = [
         ],
       },
       {
-        id: 's2', place: 'mall', waypoint: 'Mall', speaker: 'Jordan', npcId: 'jordan',
+        id: 's2', place: 'mall', waypoint: 'Mall', speaker: 'Jordan', npcId: 'jordan', withNpc: true,
         lines: ['Grab a sponge! We need $80 for new jerseys.'],
         choices: [{ id: 'wash', label: '🧽 Wash cars for 45 min', sublabel: '10 energy · Jordan +2', cost: 0, minutes: 45, energyCost: 10, relationship: 2, social: true, consequence: 'Soaked, but the team hits its target.', lesson: 'Time is something you can give instead of money.', finish: true }],
       },
@@ -333,7 +338,7 @@ export const DAILY_MISSIONS: MissionDef[] = [
         ],
       },
       {
-        id: 's2', place: 'library', waypoint: 'Library', speaker: 'Arjun',
+        id: 's2', place: 'library', waypoint: 'Arjun, at a reading table', speaker: 'Arjun', host: 'arjun',
         lines: ['Hi… so what even IS a denominator?'],
         choices: [{ id: 'teach', label: '📐 Tutor for an hour (+$6)', sublabel: '1 hour · 8 energy', category: 'income', cost: 6, minutes: 60, energyCost: 8, consequence: 'Arjun finally gets it. Mrs Kaur pays you $6.', lesson: 'What you know is worth money — tutoring is a real job.', flags: ['did_homework'], finish: true }],
       },
@@ -357,9 +362,14 @@ export const DAILY_MISSIONS: MissionDef[] = [
         ],
       },
       {
-        id: 's2', place: 'park', waypoint: 'Park', speaker: 'Council',
-        lines: ['The bins by the pond are overflowing.'],
-        choices: [{ id: 'collect', label: '♻️ Collect for 45 min (+$3.40)', sublabel: '34 cans · 10 energy', category: 'income', cost: 3.4, minutes: 45, energyCost: 10, consequence: '34 cans, $3.40, and a cleaner park.', lesson: 'Small amounts add up: 34 × 10c is $3.40.', finish: true }],
+        id: 's2', place: 'park', waypoint: 'Council worker, on the path', speaker: 'Council worker', host: 'council',
+        lines: ['Kia ora! The bins by the pond are overflowing again.', 'Six spots need clearing — bring the bag back and I pay 10c a can.'],
+        choices: [{ id: 'bag', label: '♻️ Grab a bag', sublabel: 'Clear the six litter spots', cost: 0, minutes: 0, effect: 'start_can_collect', consequence: 'Bag in hand. Time to find those cans.' }],
+      },
+      {
+        id: 's3', place: 'park', waypoint: 'Back to the council worker', speaker: 'Council worker', host: 'council', needsErrandDone: true,
+        lines: ['Look at that — a full bag!', 'Thirty-four cans at 10c each.'],
+        choices: [{ id: 'collect', label: '♻️ Hand in the bag (+$3.40)', sublabel: '34 cans · 10 energy', category: 'income', cost: 3.4, minutes: 5, energyCost: 10, consequence: '34 cans, $3.40, and a cleaner park.', lesson: 'Small amounts add up: 34 × 10c is $3.40.', finish: true }],
       },
     ],
     rewards: { xp: 15, message: 'Park cleaner, pocket fuller.' },
@@ -424,7 +434,7 @@ export const DAILY_MISSIONS: MissionDef[] = [
         ],
       },
       {
-        id: 's2', place: 'mall', waypoint: 'Mall', speaker: 'Jordan', npcId: 'jordan',
+        id: 's2', place: 'mall', waypoint: 'Mall', speaker: 'Jordan', npcId: 'jordan', withNpc: true,
         lines: ['Large is $6.50, small is $4. Or just hang out?'],
         choices: [
           { id: 'large', label: '🧋 Large ($6.50)', sublabel: '+6 energy · Jordan +1', category: 'food', cost: -6.5, minutes: 40, energyRestore: 6, relationship: 1, social: true, consequence: 'So many tapioca pearls.', finish: true },
@@ -452,7 +462,7 @@ export const DAILY_MISSIONS: MissionDef[] = [
         ],
       },
       {
-        id: 's2', place: 'post_office', waypoint: 'Post Office', speaker: 'Post Office',
+        id: 's2', place: 'post_office', waypoint: 'Hemi, at the counter', speaker: 'Hemi', host: 'postie',
         lines: ['Small parcel? That is $3 postage.'],
         choices: [{ id: 'post', label: '📦 Post it (+$10 − $3)', sublabel: '$7 profit', category: 'income', cost: 7, minutes: 15, consequence: 'Sold for $10, postage $3: you keep $7.', lesson: 'Profit = price − costs. Selling things you do not use turns clutter into cash.', finish: true }],
       },
@@ -672,7 +682,7 @@ export const DAILY_MISSIONS: MissionDef[] = [
         ],
       },
       {
-        id: 's2', place: 'market', waypoint: 'Weekend Market', speaker: 'Riley', npcId: 'riley',
+        id: 's2', place: 'market', waypoint: 'Weekend Market', speaker: 'Riley', npcId: 'riley', withNpc: true,
         lines: ['Table fee is $2 each. Last week I made $9!'],
         choices: [{ id: 'sell', label: '🧺 Pay $2, sell for 2 hours', sublabel: 'Revenue − costs = profit', category: 'income', cost: 6, minutes: 120, energyCost: 10, relationship: 1, social: true, consequence: 'You sold $8 of old stuff and paid $2 for the table: $6 profit.', lesson: 'Profit is what is left after costs: $8 revenue − $2 fee = $6.', finish: true }],
       },
@@ -713,7 +723,7 @@ export const DAILY_MISSIONS: MissionDef[] = [
         ],
       },
       {
-        id: 's2', place: 'market', waypoint: 'Weekend Market', speaker: 'Riley', npcId: 'riley',
+        id: 's2', place: 'market', waypoint: 'Weekend Market', speaker: 'Riley', npcId: 'riley', withNpc: true,
         lines: ['This one! Barely worn. $8.'],
         choices: [
           { id: 'buy', label: '🧥 Buy it ($8)', sublabel: '$17 cheaper than the Mall', category: 'shopping', cost: -8, minutes: 30, social: true, consequence: 'It fits perfectly. Nobody will guess it was $8.', lesson: 'Second-hand is the same jacket for a third of the price.', finish: true },

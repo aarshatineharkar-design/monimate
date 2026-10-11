@@ -914,6 +914,34 @@ export function npcRoomAt(npcId: string, placeId: string, minutes: number): stri
   return m >= hm(12, 30) && m < hm(13, 30) ? 'interior_school_cafeteria' : 'interior_school_hall';
 }
 
+// ── Errand hosts ────────────────────────────────────────────────────────────
+/** People who only appear for a side task: they wait at the errand's place while it's yours to do,
+ *  and you walk up to them to finish it. `room` + `spot` (interior tiles) for indoor places; `spot`
+ *  in world tiles for the park. Sprites are palette swaps of the main cast (scripts/art). */
+export interface ErrandHostDef { id: string; name: string; sheet: string; room?: SceneId; spot: Tile; companion?: 'dog' }
+export const ERRAND_HOSTS: Record<string, ErrandHostDef> = {
+  kaur:       { id: 'kaur', name: 'Mrs Kaur', sheet: 'kaur', spot: { x: 4.6, y: 38.35 }, companion: 'dog' },
+  council:    { id: 'council', name: 'Council worker', sheet: 'council', spot: { x: 14.5, y: 38.4 } },
+  librarian:  { id: 'librarian', name: 'Mrs Ngata', sheet: 'librarian', room: 'interior_library', spot: { x: 8.6, y: 5.2 } },
+  arjun:      { id: 'arjun', name: 'Arjun', sheet: 'arjun', room: 'interior_library', spot: { x: 3.3, y: 4.1 } },
+  officer:    { id: 'officer', name: 'Officer Tane', sheet: 'officer', room: 'interior_services', spot: { x: 2.3, y: 1.8 } },
+  postie:     { id: 'postie', name: 'Hemi', sheet: 'postie', room: 'interior_post', spot: { x: 1.6, y: 1.8 } },
+  researcher: { id: 'researcher', name: 'Dr Lin', sheet: 'researcher', room: 'interior_school_hall', spot: { x: 7.0, y: 2.3 } },
+  bookseller: { id: 'bookseller', name: 'Book-fair seller', sheet: 'bookseller', room: 'interior_school_hall', spot: { x: 2.4, y: 2.4 } },
+};
+
+/** Walking Biscuit: the pond, the far end of the path, the little pond — then back to Mrs Kaur. */
+export const DOG_WALK_ROUTE: { x: number; y: number; label: string }[] = [
+  { x: 8.6, y: 37.3, label: 'the pond' },
+  { x: 21.4, y: 38.45, label: 'the end of the path' },
+  { x: 16.5, y: 39.7, label: 'the little pond' },
+];
+/** Litter picking: six spots around the park, any order. */
+export const LITTER_SPOTS: { x: number; y: number; label: string }[] = [
+  { x: 3.2, y: 36.4, label: 'by the trees' }, { x: 11.8, y: 36.5, label: 'by the bins' }, { x: 19.4, y: 36.3, label: 'near the flowers' },
+  { x: 6.6, y: 40.5, label: 'by the bench' }, { x: 13.0, y: 40.7, label: 'under the tree' }, { x: 20.4, y: 40.4, label: 'by the fence' },
+];
+
 const npcDefById = new Map(NPCS.map(n => [n.id, n]));
 export const getNpcDef = (id: string) => npcDefById.get(id);
 

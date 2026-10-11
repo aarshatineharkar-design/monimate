@@ -231,9 +231,6 @@ export const CHOICE_VERDICTS: Record<string, Verdict> = {
   'work_friday_recap:saved': G, 'work_friday_recap:broke_even': T, 'work_friday_recap:overspent': B,
   'work_gross_net:explain': G, 'work_gross_net:gross': B, 'work_gross_net:net': G,
 
-  // ── Activities started from the HUD ──
-  'activity:help_mum': G, 'activity:decline_mum': T,
-
   // ── Small life events ──
   'life:found_coins:keep': G, 'life:found_coins:leave': T,
   'life:jordan_borrow:lend': T, 'life:jordan_borrow:decline': T,

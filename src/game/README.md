@@ -23,6 +23,16 @@ Rules:
   real money decision, add its verdict there — `polishPass.test.ts` fails on keys that no longer exist.
 - **The bus waits.** Standing still at a stop when a bus pulls in holds the clock for
   `BUS_HOLD_REAL_SECONDS` real seconds (`busHoldSecondsLeft()` drives the HUD countdown).
+- **Side tasks arrive one at a time.** `poolTaskMayArrive()` (missions.ts) holds a rolled task back
+  while another is still waiting on the player, spaces a pool's tasks out (`POOL_SPACING`), leaves a
+  breather after the last one, and skips one that no longer has time to be done.
+- **Errands have someone there.** A step with `host` (see `ERRAND_HOSTS` in world.ts) only opens when
+  you walk up to that person at the place; `withNpc` errands send the friend there (`errandPlaceFor`).
+  `effect: 'start_dog_walk' | 'start_can_collect'` starts a hands-on errand (`GameState.errand`) and a
+  `needsErrandDone` step waits for it. `startMission()` never rewinds a task you accepted by text.
+- **Home has a jobs board** (`content/homeJobs.ts`, `GameStore.homeJobs()/doHomeJob()`) instead of a
+  daily "help Mum?" prompt: three different jobs a day, an hourly rate on each, a weekly bonus.
+- **Small talk never repeats in a day** (`src/lib/smallTalk.ts`), and reacts to your decisions.
 - `types/` holds the domain types; `systems/interfaces.ts` holds contracts for systems not built yet
   (Mission, Event, NPC, Relationship, Progression, Save) — the next ones to move in.
 
