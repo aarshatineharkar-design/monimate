@@ -73,9 +73,11 @@ const pixelFont = "'Press Start 2P', monospace";
 const bodyFont = "'VT323', monospace";
 
 const s: Record<string, React.CSSProperties> = {
-  screen: { position: 'relative', minHeight: '100dvh', display: 'grid', placeItems: 'center', padding: 16, background: '#1a1a2e', overflow: 'hidden' },
-  sky: { position: 'absolute', inset: 0, background: 'linear-gradient(#2b2d6e 0%, #6b4a8a 55%, #f0a060 100%)', opacity: 0.55 },
-  card: { position: 'relative', width: 'min(380px, 100%)', background: '#14161c', border: '4px solid #f0c038', boxShadow: '8px 8px 0 #000', padding: '28px 22px', color: '#fff' },
+  // Its own scroll area (the page body never scrolls), so the sign-up form stays reachable on a phone
+  // with the keyboard up. Auto margins centre the card without clipping it when it is taller than the screen.
+  screen: { position: 'fixed', inset: 0, overflowY: 'auto', overflowX: 'hidden', WebkitOverflowScrolling: 'touch', overscrollBehavior: 'contain', display: 'flex', flexDirection: 'column', alignItems: 'center', padding: 16, background: '#1a1a2e' },
+  sky: { position: 'fixed', inset: 0, pointerEvents: 'none', background: 'linear-gradient(#2b2d6e 0%, #6b4a8a 55%, #f0a060 100%)', opacity: 0.55 },
+  card: { position: 'relative', margin: 'auto 0', flexShrink: 0, width: 'min(380px, 100%)', background: '#14161c', border: '4px solid #f0c038', boxShadow: '8px 8px 0 #000', padding: '28px 22px', color: '#fff' },
   logo: { fontFamily: pixelFont, fontSize: 26, color: '#f0c038', textAlign: 'center', textShadow: '3px 3px 0 #000' },
   tag: { fontFamily: bodyFont, fontSize: 22, textAlign: 'center', margin: '10px 0 20px', color: '#cfd8e3' },
   tabs: { display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8, marginBottom: 18 },

@@ -52,7 +52,7 @@ import {
   BIKE_MIN_PER_TILE, BUS_ROUTE, BUS_STOPS, NPCS, TILE_PX, WALK_MIN_PER_TILE, busAtStop, distanceTiles,
   doorTile, getPlace, isOpen, closedReason, npcPlaceAt, rideMinutes, routeTiles, stopById, tileToPx,
   getInterior, INTERIOR_TILE_PX, PLACE_INTERIOR_SCENE, npcRoomAt, interiorBlocked,
-  ERRAND_HOSTS, DOG_WALK_ROUTE, LITTER_SPOTS,
+  ERRAND_HOSTS, DOG_WALK_ROUTE, LITTER_SPOTS, INTERIOR_NPC_SPOTS,
 } from './world';
 import { HOME_JOBS, JOB_BONUS, type HomeJob } from './content/homeJobs';
 import { factsFor, MONEY_FACTS, type MoneyFact } from './content/moneyFacts';
@@ -1205,6 +1205,9 @@ export class GameStore {
   // ══ NPCs ═════════════════════════════════════════════════════════════════
   private initNpcs(snap: boolean) {
     const s = this.state;
+    // Only this life's cast lives in this town. Older saves could carry people from another path (Sam
+    // the flatmate in a School save, say) who then stood in your house forever — drop them.
+    for (const id of Object.keys(s.npcs)) if (!this.cast.some(c => c.id === id)) delete s.npcs[id];
     for (const def of this.cast) {
       const placeId = this.errandPlaceFor(def.id) ?? npcPlaceAt(def, s.minutes);
       const t = tileToPx(this.npcSpot(def.id, placeId));
@@ -1280,14 +1283,19 @@ export class GameStore {
     const s = this.state, pl = s.player;
     const interior = getInterior(pl.scene);
     if (!interior || !pl.place) return [];
-    const here = (Object.values(s.npcs) as NpcRuntime[]).filter(n => {
-      if (n.place !== pl.place || n.moving) return false;
+    const here = this.cast.map(c => s.npcs[c.id]).filter((n): n is NpcRuntime => {
+      if (!n || n.place !== pl.place || n.moving) return false;
       const room = npcRoomAt(n.id, n.place, s.minutes);
       return !room || room === pl.scene;
     });
     const T = INTERIOR_TILE_PX;
-    return here.map((npc, i) => {
-      const tx = interior.widthTiles / 2 + (i - (here.length - 1) / 2) * 1.4;
+    const spots = INTERIOR_NPC_SPOTS[pl.scene] ?? {};
+    const free = here.filter(n => !spots[n.id]);
+    return here.map(npc => {
+      const spot = spots[npc.id];
+      if (spot) return { npc, x: spot.x * T, y: spot.y * T };
+      const i = free.indexOf(npc);
+      const tx = interior.widthTiles / 2 + (i - (free.length - 1) / 2) * 1.4;
       // Stand in the first clear spot down from the back wall — never inside (or hidden behind) a
       // desk or shelf, so the lecturer stands in front of their desk rather than behind it.
       let ty = Math.min(interior.heightTiles - 1.5, 1.4);
@@ -1299,7 +1307,6 @@ export class GameStore {
     });
   }
 
-  /** The closest NPC in talking range: outdoors a visible NPC within ~1.4 tiles, indoors within ~1.8. */
   /** How far (in tiles) this person is from you, or Infinity if they are not where you are. */
   npcDistanceTiles(npcId: string): number {
     const s = this.state, pl = s.player;
@@ -1311,11 +1318,12 @@ export class GameStore {
     return e ? Math.hypot(e.x - pl.x, e.y - pl.y) / INTERIOR_TILE_PX : Infinity;
   }
 
+  /** The closest NPC in talking range: outdoors a visible NPC within ~1.4 tiles, indoors within ~1.8. */
   npcNearPlayer(): NpcRuntime | null {
     const s = this.state, pl = s.player;
     let best: NpcRuntime | null = null, bestD = Infinity;
     if (pl.scene === 'outdoor') {
-      for (const npc of Object.values(s.npcs)) {
+      for (const npc of this.cast.map(c => s.npcs[c.id]).filter(Boolean)) {
         const d = Math.hypot(npc.x - pl.x, npc.y - pl.y);
         if (npc.visible && d < TILE_PX * 1.4 && d < bestD) { best = npc; bestD = d; }
       }

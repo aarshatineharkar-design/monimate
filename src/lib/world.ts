@@ -914,6 +914,12 @@ export function npcRoomAt(npcId: string, placeId: string, minutes: number): stri
   return m >= hm(12, 30) && m < hm(13, 30) ? 'interior_school_cafeteria' : 'interior_school_hall';
 }
 
+/** Where someone stands in a room when they're home, instead of the middle of the floor: Mum by the
+ *  kitchen bench, Sam (your University flatmate) by the couch. Interior tiles. */
+export const INTERIOR_NPC_SPOTS: Partial<Record<SceneId, Record<string, Tile>>> = {
+  interior_home: { mum: { x: 3.55, y: 3.4 }, sam: { x: 5.4, y: 5.1 } },
+};
+
 // ── Errand hosts ────────────────────────────────────────────────────────────
 /** People who only appear for a side task: they wait at the errand's place while it's yours to do,
  *  and you walk up to them to finish it. `room` + `spot` (interior tiles) for indoor places; `spot`

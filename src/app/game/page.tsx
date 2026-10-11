@@ -353,8 +353,10 @@ function PathSelect({ supabase, userId, current, onChoose, onBack, playerName, o
 }
 const DAY_SHORT = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
 const ps: Record<string, React.CSSProperties> = {
-  screen: { position: 'relative', minHeight: '100dvh', background: '#1a1a2e', color: '#e6edf3', overflowX: 'hidden', fontFamily: "'VT323', monospace" },
-  sky: { position: 'absolute', inset: 0, background: 'linear-gradient(#2b2d6e 0%, #6b4a8a 55%, #f0a060 100%)', opacity: 0.45 },
+  // The page body never scrolls (the game is full-screen), so this screen is its own scroll area —
+  // otherwise on a phone only the first card (School) fits and the rest are unreachable.
+  screen: { position: 'fixed', inset: 0, overflowY: 'auto', overflowX: 'hidden', WebkitOverflowScrolling: 'touch', touchAction: 'pan-y', overscrollBehavior: 'contain', background: '#1a1a2e', color: '#e6edf3', fontFamily: "'VT323', monospace" },
+  sky: { position: 'fixed', inset: 0, pointerEvents: 'none', background: 'linear-gradient(#2b2d6e 0%, #6b4a8a 55%, #f0a060 100%)', opacity: 0.45 },
   wrap: { position: 'relative', maxWidth: 1040, margin: '0 auto', padding: '28px 16px 40px' },
   back: { fontFamily: "'Press Start 2P', monospace", fontSize: 10, background: '#14161c', color: '#ffd23f', border: '3px solid #000', boxShadow: '3px 3px 0 #000', padding: '8px 10px', cursor: 'pointer', marginBottom: 18 },
   title: { fontFamily: "'Press Start 2P', monospace", fontSize: 22, color: '#f0c038', textShadow: '3px 3px 0 #000', margin: '0 0 8px', textAlign: 'center' },
@@ -1860,12 +1862,24 @@ function draw(ctx: CanvasRenderingContext2D, cw: number, ch: number, store: Game
   ctx.translate(cw / 2 - camX, ch / 2 - camY);
 
   // Ground tiles (viewport-culled)
-  const startTx = Math.max(0, Math.floor((camX - cw / 2) / TILE_PX));
-  const endTx = Math.min(MAP_W, Math.ceil((camX + cw / 2) / TILE_PX));
-  const startTy = Math.max(0, Math.floor((camY - ch / 2) / TILE_PX));
-  const endTy = Math.min(MAP_H, Math.ceil((camY + ch / 2) / TILE_PX));
+  // The camera can look a few tiles past the edge of town: that strip is countryside — grass with a
+  // hedge along the town boundary — rather than a black void.
+  const startTx = Math.floor((camX - cw / 2) / TILE_PX);
+  const endTx = Math.ceil((camX + cw / 2) / TILE_PX);
+  const startTy = Math.floor((camY - ch / 2) / TILE_PX);
+  const endTy = Math.ceil((camY + ch / 2) / TILE_PX);
+  const bush = getImg('/sprites/props/bush.png');
   for (let ty = startTy; ty < endTy; ty++) {
     for (let tx = startTx; tx < endTx; tx++) {
+      const outside = tx < 0 || ty < 0 || tx >= MAP_W || ty >= MAP_H;
+      if (outside) {
+        const grass = getImg('/sprites/tiles/grass_full.png');
+        if (grass) ctx.drawImage(grass, tx * TILE_PX, ty * TILE_PX, TILE_PX, TILE_PX);
+        else { ctx.fillStyle = '#5a8a4a'; ctx.fillRect(tx * TILE_PX, ty * TILE_PX, TILE_PX, TILE_PX); }
+        const hedge = (tx === -1 || tx === MAP_W) ? (ty >= -1 && ty <= MAP_H) : (ty === -1 || ty === MAP_H) && tx >= -1 && tx <= MAP_W;
+        if (hedge && bush) ctx.drawImage(bush, tx * TILE_PX + 4, ty * TILE_PX + 4, TILE_PX - 8, TILE_PX - 8);
+        continue;
+      }
       const img = getImg(groundSprite(tx, ty));
       if (img) ctx.drawImage(img, tx * TILE_PX, ty * TILE_PX, TILE_PX, TILE_PX);
       else { ctx.fillStyle = '#5a8a4a'; ctx.fillRect(tx * TILE_PX, ty * TILE_PX, TILE_PX, TILE_PX); }
@@ -2047,7 +2061,10 @@ function draw(ctx: CanvasRenderingContext2D, cw: number, ch: number, store: Game
   drawDayNightOverlay(ctx, s.minutes, cw, ch);
 
   // Minimap (bottom-right)
-  drawMinimap(ctx, cw - 190, ch - 190, { size: 170, worldW: MAP_W * TILE_PX, worldH: MAP_H * TILE_PX }, s, store.defs, loop.pulseT);
+  // Phones: a smaller map in the bottom-left, clear of the phone and ACT buttons on the right.
+  const narrow = cw < 640;
+  const mm = narrow ? 104 : 170;
+  drawMinimap(ctx, narrow ? 12 : cw - mm - 20, ch - mm - (narrow ? 28 : 20), { size: mm, worldW: MAP_W * TILE_PX, worldH: MAP_H * TILE_PX }, s, store.defs, loop.pulseT);
 }
 
 /** Phase 7: a real explorable interior room — its own small tile grid, camera-centred (rooms are
@@ -2063,13 +2080,13 @@ function drawInterior(ctx: CanvasRenderingContext2D, cw: number, ch: number, sto
   // room on the canvas — correct at the old fixed 1280x800 canvas, but on a real fullscreen viewport
   // (now often much larger, see the canvas-resize fix) the room looked like a small box floating in
   // a sea of black, i.e. "not fullscreen". Scale the room up to actually fill the viewport instead of
-  // just centering it at native size — clamped to [1, 3] so a tiny window never shrinks it below
-  // native size and a huge monitor never blows it up into blurry oversized tiles. Every draw call
+  // just centering it at native size — clamped to [0.6, 3]: on a phone the room shrinks a little so
+  // the whole room fits the screen width, and a huge monitor never blows it up into blurry tiles. Every draw call
   // below this point still uses plain room-local pixel coordinates (tx*T, ty*T, …) — only the
   // translate/scale setup changes, so nothing else in this function needed to move.
   // A back wall (wallpaper strip) sits above row 0 — it's part of the picture, so fit it in too.
   const wallH = interior.wall ? T * 1.5 : 0;
-  const scale = Math.min(3, Math.max(1, Math.min((cw * 0.92) / roomW, (ch * 0.85) / (roomH + wallH))));
+  const scale = Math.min(3, Math.max(0.6, Math.min((cw * 0.94) / roomW, (ch * 0.85) / (roomH + wallH))));
   const ox = Math.round((cw - roomW * scale) / 2), oy = Math.round((ch - (roomH + wallH) * scale) / 2 + wallH * scale);
 
   ctx.save();

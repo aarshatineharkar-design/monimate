@@ -287,7 +287,8 @@ const INTERNATIONAL: PathRules = {
     intl_cook: 'Tip: rice, eggs and drumsticks are the cheapest proteins. Shop Tuesday after orientation.',
     intl_social: 'Tip: sit next to someone new at orientation — most students there don\'t know anyone either.',
   },
-  cast: ['priya', 'jae', 'coordinator', 'leo', 'landlord', 'bank_teller', 'mum'],
+  // Mum is back home overseas — she only calls (remote messages), so she is not in the town itself.
+  cast: ['priya', 'jae', 'coordinator', 'leo', 'landlord', 'bank_teller'],
   relationships: { Mum: 3, Priya: 0, Jae: 0, Leo: 0 },
   contacts: [
     { key: 'Mum', id: 'mum', note: 'Back home. Video calls Sunday.' },

@@ -7,7 +7,7 @@ import { GameStore } from './store';
 import { SmoothCamera, stepMovement, MoveInput, MoverConfig, DEFAULT_MOVER } from './render';
 import { TILE_PX, doorTile, getPlace, PLACES, getInterior, INTERIOR_TILE_PX, interiorBlocked } from './world';
 
-export interface CollisionOptions { worldW: number; worldH: number }
+export interface CollisionOptions { worldW: number; worldH: number; /** How far past the edge of town the camera may look (px). */ edgePad?: number }
 
 /** True footprint collision only — the door gap (checked separately below) is never solid here. */
 function insideAnyBuilding(px: number, py: number): string | null {
@@ -55,10 +55,17 @@ export class GameLoop {
     const s = this.store.state;
 
     if (s.player.scene === 'outdoor' && !s.sleeping && !s.paused) {
+      // The edge of town is solid too — without this you could walk off the map, where the camera
+      // (clamped to the map) can't follow, and vanish off the side of the screen.
+      const edge = TILE_PX * 0.35;
       const collides = (x: number, y: number) => {
+        if (x < edge || y < edge || x > world.worldW - edge || y > world.worldH - edge) return true;
         const b = insideAnyBuilding(x, y);
         return !!b; // buildings are solid except through their own door gap, handled above
       };
+      // An old save could have left you past the edge of town: step back inside first.
+      s.player.x = Math.min(Math.max(s.player.x, edge + 1), world.worldW - edge - 1);
+      s.player.y = Math.min(Math.max(s.player.y, edge + 1), world.worldH - edge - 1);
       const mover = this.store.exhausted ? { ...this.mover, maxSpeed: this.mover.maxSpeed * 0.65 } : this.mover;
       const { movedTiles } = stepMovement(s.player, input, dt, mover, collides);
       this.store.tick(dt, movedTiles, 'walk');
@@ -106,8 +113,12 @@ export class GameLoop {
       this.store.tick(dt, 0);
     }
 
+    // The camera may look a little past the edge of town (a strip of countryside is drawn there), so
+    // someone at the very edge — Home, the Supermarket, the Clinic — still sits clear of the HUD
+    // instead of being pinned against the side of a small phone screen.
+    const pad = world.edgePad ?? TILE_PX * 3;
     this.camera.update(s.player.x, s.player.y, dt, {
-      minX: 0, minY: 0, maxX: world.worldW, maxY: world.worldH, viewW: viewport.w, viewH: viewport.h,
+      minX: -pad, minY: -pad, maxX: world.worldW + pad, maxY: world.worldH + pad, viewW: viewport.w, viewH: viewport.h,
     });
   }
 

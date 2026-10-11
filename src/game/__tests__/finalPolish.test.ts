@@ -13,6 +13,8 @@ import { at } from '../../lib/clock';
 import { MONEY_FACTS, factsFor } from '../../lib/content/moneyFacts';
 import { repliesFor, splitAtQuestion } from '../../lib/smallTalk';
 import { stepMovement } from '../../lib/render';
+import { GameLoop } from '../../lib/loop';
+import { TILE_PX, getInterior, interiorBlocked, INTERIOR_TILE_PX } from '../../lib/world';
 
 function newGame(path: LifePath = 'school'): GameStore {
   const cfg = getLifePath(path);
@@ -159,4 +161,52 @@ test('Joystick: a tiny wobble of the thumb does not move you (dead zone)', () =>
 test('Joystick: diagonal at full push is no faster than straight (top speed)', () => {
   const d = walk(Math.SQRT1_2, Math.SQRT1_2), s = walk(1, 0);
   assert.ok(Math.hypot(d.vx, d.vy) <= Math.hypot(s.vx, s.vy) * 1.01);
+});
+
+// ── Last polish: edge of town, and who is in your house ────────────────────────────────────────
+
+test('Edge of town: you cannot walk off the map, and the camera can still centre on the edge buildings', () => {
+  const store = newGame();
+  store.advance(at(0, 9, 0) - store.state.minutes);
+  if (store.state.player.scene !== 'outdoor') store.exitPlace();
+  const loop = new GameLoop(store);
+  const world = { worldW: 60 * TILE_PX, worldH: 44 * TILE_PX };
+  store.state.player.x = 0.6 * TILE_PX; store.state.player.y = 9.6 * TILE_PX;
+  let ts = 1000;
+  for (let i = 0; i < 120; i++) {
+    loop.frame(ts += 16, { up: false, down: false, left: true, right: false }, { w: 390, h: 844 }, world);
+  }
+  assert.ok(store.state.player.x > 0, 'still on the map');
+  // A phone-width screen: the camera is allowed past the edge, so the player is not pinned to the side.
+  assert.ok(loop.camera.x < 195, 'the camera looks a little past the edge of town');
+  assert.ok(Math.abs(loop.camera.x - store.state.player.x) < TILE_PX * 3.2);
+  // An old save left past the edge is brought back in.
+  store.state.player.x = -5 * TILE_PX;
+  loop.frame(ts += 16, { up: false, down: false, left: false, right: false }, { w: 390, h: 844 }, world);
+  assert.ok(store.state.player.x > 0);
+});
+
+test('Home: only people who live there are inside — and they stand somewhere sensible', () => {
+  const room = getInterior('interior_home')!;
+  for (const path of ['school', 'university', 'international', 'working'] as LifePath[]) {
+    const store = newGame(path);
+    const allowed = path === 'school' ? ['mum'] : path === 'university' ? ['sam'] : [];
+    for (let i = 0; i < 7 * 24 * 2; i++) {
+      store.advance(30);
+      if (store.state.player.scene !== 'interior_home') { if (store.state.player.scene !== 'outdoor') store.exitPlace(); store.goHome(); }
+      for (const e of store.interiorNpcs()) {
+        assert.ok(allowed.includes(e.npc.id), `${path}: ${e.npc.id} should not be standing in your home`);
+        assert.ok(!interiorBlocked(room, e.x / INTERIOR_TILE_PX, e.y / INTERIOR_TILE_PX), `${e.npc.id} stands inside furniture`);
+      }
+    }
+  }
+});
+
+test('Home: someone left over from another life in an old save is cleared out on load', () => {
+  const store = newGame('school');
+  const raw = JSON.parse(store.serialize());
+  raw.npcs.sam = { ...raw.npcs.mum, id: 'sam', place: 'home', moving: false };
+  const back = GameStore.hydrate(JSON.stringify(raw))!;
+  assert.equal(back.state.npcs.sam, undefined);
+  assert.ok(!back.interiorNpcs().some(e => e.npc.id === 'sam'));
 });
