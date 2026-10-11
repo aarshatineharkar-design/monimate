@@ -791,7 +791,7 @@ export class GameStore {
         const base = flags.find(f => f.startsWith('friends_base:'))?.split(':').map(Number) ?? [0, 0, 0];
         const j = s.world.relationships.Jordan ?? 0, r = s.world.relationships.Riley ?? 0;
         const onTrack = j >= base[1] && r >= base[2] && !flags.includes('birthday_declined');
-        const judged = !!this.pendingLevelSummary || this.runtime(this.rules.recap)?.state === 'completed';
+        const judged = !!this.pendingLevelSummary || this.runtime(this.recapId)?.state === 'completed';
         return { def, achieved: judged && onTrack, progress: onTrack ? (judged ? 1 : 0.5) : 0,
           detail: `${onTrack ? 'On track' : 'Someone feels let down'} · Jordan ❤${j} · Riley ❤${r}` };
       }
@@ -810,7 +810,7 @@ export class GameStore {
       }
       case 'l2_patience': {
         const slips = IMPULSE_FLAGS.filter(x => flags.includes(x)).length;
-        const judged = !!this.pendingLevelSummary || this.runtime(this.rules.recap)?.state === 'completed';
+        const judged = !!this.pendingLevelSummary || this.runtime(this.recapId)?.state === 'completed';
         return { def, achieved: judged && slips === 0, progress: slips ? 0 : judged ? 1 : 0.5,
           detail: slips ? `${slips} impulse buy${slips === 1 ? '' : 's'} this week` : 'No impulse buys so far' };
       }
@@ -825,7 +825,7 @@ export class GameStore {
         const plan = this.budgetPlan(), act = this.budgetActuals();
         if (!plan) return { def, achieved: false, progress: 0, detail: 'Make a budget plan (Budget app, Monday)' };
         const over = (['food', 'transport', 'fun'] as const).filter(k => act[k] > plan[k] + 0.5);
-        const judged = !!this.pendingLevelSummary || this.runtime(this.rules.recap)?.state === 'completed';
+        const judged = !!this.pendingLevelSummary || this.runtime(this.recapId)?.state === 'completed';
         return { def, achieved: judged && over.length === 0, progress: over.length ? 0.2 : judged ? 1 : 0.6,
           detail: over.length ? `Over budget on ${over.join(' & ')}` : 'On budget so far — check the Bank app' };
       }
@@ -865,7 +865,7 @@ export class GameStore {
         const sam = s.world.relationships.Sam ?? 0, mei = s.world.relationships.Mei ?? 0;
         const club = flags.includes('wk_club_joined');
         const onTrack = sam >= base[1] && mei >= 1 && club;
-        const judged = !!this.pendingLevelSummary || this.runtime(this.rules.recap)?.state === 'completed';
+        const judged = !!this.pendingLevelSummary || this.runtime(this.recapId)?.state === 'completed';
         const progress = (club ? 0.5 : 0) + (mei >= 1 ? 0.25 : 0) + (sam >= base[1] ? 0.25 : 0);
         return { def, achieved: judged && onTrack, progress: judged && onTrack ? 1 : Math.min(0.9, progress),
           detail: `${club ? 'In a club' : 'No club yet'} · Sam ❤${sam} · Mei ❤${mei}` };

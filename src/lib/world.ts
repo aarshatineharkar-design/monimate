@@ -724,7 +724,7 @@ export const BUS_ROUTE = {
     { stopId: 'stop_mall',   offsetMin: 21 },
     { stopId: 'stop_south',  offsetMin: 34 },
   ],
-  dwellMin: 1,
+  dwellMin: 3,
 };
 
 /** Headway (minutes between loop starts) for a given minute-of-day and day-of-week. More frequent in school peaks. */

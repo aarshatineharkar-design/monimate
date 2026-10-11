@@ -385,6 +385,8 @@ function GameCanvas({ supabase, player, initialState, notice, onChangePath }: {
   const loopRef = useRef<GameLoop | null>(null);
   const [, forceTick] = useState(0);
   const [dialogueLines, setDialogueLines] = useState<{ npc?: string; text: string } | null>(null);
+  const dialogueLinesRef = useRef<{ npc?: string; text: string } | null>(null);
+  dialogueLinesRef.current = dialogueLines;
   useEffect(() => {
     if (!dialogueLines) return;
     const t = setTimeout(() => setDialogueLines(null), 4000);
@@ -430,6 +432,13 @@ function GameCanvas({ supabase, player, initialState, notice, onChangePath }: {
   const [isTouch, setIsTouch] = useState(false);
   const [voiceOn, setVoiceOn] = useState(true);
   const [skipSignal, setSkipSignal] = useState(0); // bumped by the touch "SKIP" button to fast-forward dialogue
+  const [lessonToast, setLessonToast] = useState<string | null>(null);
+  const lessonToastTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const showLesson = useCallback((lesson: string) => {
+    if (lessonToastTimer.current) clearTimeout(lessonToastTimer.current);
+    setLessonToast(lesson);
+    lessonToastTimer.current = setTimeout(() => setLessonToast(null), 5000);
+  }, []);
   useEffect(() => () => stopSpeaking(), []); // stop any speech mid-line if the page/component unmounts
 
   // Detect a touch/coarse-pointer device (phone/tablet) so we can show on-screen controls.
@@ -542,7 +551,10 @@ function GameCanvas({ supabase, player, initialState, notice, onChangePath }: {
       keysRef.current.add(key);
       if (phoneOpenRef.current) return; // the phone has the keyboard (its own Esc/back handling)
       if (key === 'escape' && store.state.player.scene !== 'outdoor' && store.state.player.scene !== 'bus') loop.exit();
-      if (key === 'e') { if (!tryStartHelpParentsActivity()) handleInteract(); }
+      if (key === 'e') {
+        if (dialogueLinesRef.current) { stopSpeaking(); setDialogueLines(null); }
+        else if (!tryStartHelpParentsActivity()) handleInteract();
+      }
       if (key === 'j') setPhoneApp(a => (a === 'today' ? null : 'today'));
       if (key === 'p') setPhoneApp(a => (a ? null : 'home'));
     };
@@ -873,6 +885,21 @@ function GameCanvas({ supabase, player, initialState, notice, onChangePath }: {
         ))}
       </div>
 
+      {/* 💡 Financial lesson callout — appears after a mission choice that has a lesson */}
+      {lessonToast && (
+        <div onClick={() => setLessonToast(null)} style={{
+          position: 'absolute', bottom: isTouch ? 210 : 70, left: '50%', transform: 'translateX(-50%)',
+          zIndex: 50, background: 'linear-gradient(135deg, #1a2a1a 0%, #0d1a0d 100%)',
+          border: '2px solid #4caf50', borderRadius: 12, padding: '10px 16px',
+          width: 'min(340px, 88vw)', boxShadow: '0 4px 20px rgba(76,175,80,0.3)',
+          animation: 'mmPop 200ms ease-out', cursor: 'pointer',
+        }}>
+          <div style={{ fontSize: 11, color: '#4caf50', fontWeight: 700, letterSpacing: 1, marginBottom: 4 }}>💡 MONEY LESSON</div>
+          <div style={{ fontSize: 13, color: '#e8f5e9', lineHeight: 1.5 }}>{lessonToast}</div>
+          <div style={{ fontSize: 10, opacity: 0.5, marginTop: 4 }}>tap to dismiss</div>
+        </div>
+      )}
+
       {!isTouch && s.player.scene !== 'outdoor' && s.player.scene !== 'bus' && (
         <div style={hud.exitHint}>Press ESC to go outside</div>
       )}
@@ -1081,7 +1108,7 @@ function GameCanvas({ supabase, player, initialState, notice, onChangePath }: {
           balance={store.cash}
           voiceOn={voiceOn}
           skipSignal={skipSignal}
-          onChoose={(c) => { store.applyChoice(actionable.def.id, c); setDialogueLines(null); }}
+          onChoose={(c) => { store.applyChoice(actionable.def.id, c); setDialogueLines(null); if (c.lesson) showLesson(c.lesson); }}
           style={isTouch ? { bottom: 196 } : undefined}
         />
       )}
@@ -1217,30 +1244,51 @@ function DialoguePanel({ speaker, lines, choices, onChoose, balance, voiceOn, sk
   // Reveal one line at a time (tap/click to advance) instead of dumping the whole exchange at
   // once — reads like an actual back-and-forth instead of a wall of text with buttons under it.
   const [shown, setShown] = useState(1);
+  const [charCount, setCharCount] = useState(0);
   const key = speaker + '|' + lines.join('|');
-  useEffect(() => { setShown(1); }, [key]);
+  useEffect(() => { setShown(1); setCharCount(0); }, [key]);
   const skipSignalRef = useRef(skipSignal);
   useEffect(() => {
     if (skipSignal !== undefined && skipSignal !== skipSignalRef.current) {
       skipSignalRef.current = skipSignal;
       setShown(lines.length);
+      setCharCount(lines[lines.length - 1]?.length ?? 0);
     }
   }, [skipSignal, lines.length]);
+  // Typewriter: animate current line character by character
+  const currentLine = lines[shown - 1] ?? '';
+  const typewriterDone = charCount >= currentLine.length;
+  useEffect(() => {
+    setCharCount(0);
+    if (!currentLine) return;
+    let i = 0;
+    const interval = setInterval(() => {
+      i++;
+      setCharCount(i);
+      if (i >= currentLine.length) clearInterval(interval);
+    }, 22); // ~22ms per char ≈ comfortable reading speed
+    return () => clearInterval(interval);
+  }, [key, shown]); // eslint-disable-line react-hooks/exhaustive-deps
   useEffect(() => {
     if (voiceOn) speakLine(speaker, lines[shown - 1] ?? '');
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [key, shown, voiceOn]);
-  const atEnd = shown >= lines.length;
+  const atEnd = shown >= lines.length && typewriterDone;
   // Choices appear right where the player was clicking to advance; ignore clicks on them for a
   // moment so a fast click-through can't pick an option by accident.
   const choicesShownAt = useRef(0);
   useEffect(() => { if (atEnd) choicesShownAt.current = performance.now(); }, [atEnd, key]);
   const choiceReady = () => performance.now() - choicesShownAt.current > 350;
+  const handlePanelClick = () => {
+    if (!typewriterDone) { setCharCount(currentLine.length); return; } // finish typing first
+    if (!atEnd) setShown(n => n + 1);
+  };
   return (
-    <div style={{ ...hud.dialogue, ...style }} onClick={() => { if (!atEnd) setShown(n => n + 1); }}>
+    <div style={{ ...hud.dialogue, ...style }} onClick={handlePanelClick}>
       {speaker && <div style={{ fontWeight: 700, color: '#ffd700', marginBottom: 4 }}>{speaker}</div>}
-      {lines.slice(0, shown).map((l, i) => <div key={i} style={{ marginBottom: 4 }}>{l}</div>)}
-      {!atEnd && <div style={{ fontSize: 11, opacity: 0.6, marginTop: 6 }}>▾ tap to continue</div>}
+      {lines.slice(0, shown - 1).map((l, i) => <div key={i} style={{ marginBottom: 4 }}>{l}</div>)}
+      {currentLine && <div style={{ marginBottom: 4 }}>{currentLine.slice(0, charCount)}{!typewriterDone && <span style={{ opacity: 0.7 }}>▌</span>}</div>}
+      {!atEnd && typewriterDone && <div style={{ fontSize: 11, opacity: 0.6, marginTop: 6 }}>▾ tap to continue</div>}
       {atEnd && choices && (
         <div style={{ display: 'flex', flexDirection: 'column', gap: 6, marginTop: 10 }}>
           {choices.map(c => {

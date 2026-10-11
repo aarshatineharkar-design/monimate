@@ -66,7 +66,7 @@ test('Switching: School and University keep separate saves, each resumes where i
   const backToUni = await loadSave(sb, 'u1', 'university');
   assert.equal(backToUni!.lifePath, 'university');
   assert.equal(Math.floor(backToUni!.minutes), at(0, 11, 0));
-  assert.equal(GameStore.hydrate(JSON.stringify(backToUni))!.rules.weekStart, 'uni_payday');
+  assert.deepEqual([GameStore.hydrate(JSON.stringify(backToUni))!.rules.weekStart].flat()[0], 'uni_payday');
 });
 
 test('Switching: the path picker lists every saved path with its day and money', async () => {

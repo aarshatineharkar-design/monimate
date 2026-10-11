@@ -84,7 +84,8 @@ test('University path: its own cast, names, rules and money', () => {
   // No School content leaks in, and no automatic rent (rent is a weekly decision).
   assert.ok(!store.defs.some(d => d.id === 'pocket_money' || d.id === 'lunch_break'));
   assert.ok(!store.state.finance.expenses.recurring.some(r => r.id === 'rent'));
-  assert.equal(store.rules.weekStart, 'uni_payday');
+  // One weekStart mission per University level; Level 1 opens with uni_payday.
+  assert.equal([store.rules.weekStart].flat()[0], 'uni_payday');
 });
 
 // ── Route A: the organised student — goal: a $150 safety buffer ──────────────
@@ -249,9 +250,9 @@ test('University Week C: a student who stays in all week still reaches Sunday, a
   const sm = store.pendingLevelSummary!;
   assert.equal(sm.daysAttended, 0);
   assert.equal(sm.goal!.achieved, false);
-  // Next Monday: StudyLink pays again and last week's flags are gone.
+  // Next Monday: Level 2 begins — StudyLink pays again and last week's flags are gone.
   advanceTo(store, 7, 7, 1);
-  choose(store, 'uni_payday', 'take');
+  choose(store, 'l2_payday', 'take');
   assert.ok(!store.state.world.flags.some(f => f.startsWith('wk_') && !f.startsWith('wk_start_')), 'week flags cleared on payday');
 });
 
