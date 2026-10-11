@@ -207,6 +207,15 @@ export class GameStore {
 
   /** This path's rules (goals, cast, timetable, week start/recap) — see pathRules.ts. */
   readonly rules: PathRules;
+  /** The recap mission ID for the current level (derived from rules.recap). */
+  private get recapId(): string {
+    const r = this.rules.recap;
+    if (Array.isArray(r)) {
+      const lvl = this.state.level ?? 1;
+      return r[Math.min(lvl - 1, r.length - 1)];
+    }
+    return r;
+  }
   /** The NPCs who exist on this path. */
   private cast: typeof NPCS;
 
@@ -638,6 +647,41 @@ export class GameStore {
       this.earn(1, 'interest', 'Mum\'s savings bonus');
       this.moveToSavings(1);
     }
+    // ── L4–L6 flag-setting effects ────────────────────────────────────────────
+    // These effects simply push a flag into world.flags (which the recap and other
+    // missions use as predicates). They are distinct from rewards.flag, which is set
+    // when the mission *completes*; these fire when a specific choice is made.
+    const flagEffects: Partial<Record<NonNullable<MissionChoice['effect']>, string>> = {
+      tax_code_me: 'tax_code_me',
+      tax_code_m: 'tax_code_m',
+      tax_code_fixed: 'tax_code_fixed',
+      extra_shift_taken: 'extra_shift_taken',
+      goal_phone: 'goal_phone',
+      goal_kiwisaver: 'goal_kiwisaver',
+      goal_trip: 'goal_trip',
+      sneakers_bought: 'sneakers_bought',
+      sneakers_flip: 'sneakers_flip',
+      kiwisaver_joined: 'kiwisaver_joined',
+      auto_save_on: 'auto_save_on',
+      goal_reached: 'goal_reached',
+      wk_compound_seen: 'wk_compound_seen',
+      wk_index_understood: 'wk_index_understood',
+      wk_insurance_lesson: 'wk_insurance_lesson',
+      wk_future_letter_save: 'wk_future_letter_save',
+      wk_future_letter_invest: 'wk_future_letter_invest',
+      wk_l6_complete: 'wk_l6_complete',
+      payday_save_half: 'payday_save_half',
+      payday_save_all: 'payday_save_all',
+      myir_setup: 'myir_setup',
+      plant_job_taken: 'plant_job_taken',
+      emergency_buffer_set: 'emergency_buffer_set',
+      scam_reported: 'scam_reported',
+      // International effects
+      nz_bank_account: 'nz_bank_account',
+      visa_rules_known: 'visa_rules_known',
+    };
+    const flagName = flagEffects[effect as keyof typeof flagEffects];
+    if (flagName && !this.state.world.flags.includes(flagName)) this.state.world.flags.push(flagName);
   }
 
   // ══ END OF DAY ═══════════════════════════════════════════════════════════
@@ -1436,35 +1480,40 @@ export class GameStore {
     }
     if (choice.minutes > 0) this.advance(choice.minutes);
 
-    if (choice.finish) this.completeMission(rt, def, choice.id);
+    if (choice.finish) this.completeMission(rt, def, choice.id, choice.flags);
     else { rt.stepIndex = Math.min(rt.stepIndex + 1, def.steps.length - 1); this.touch(true); }
     this.syncGoals();
     return true;
   }
 
-  completeMission(rt: MissionRuntime, def: MissionDef, outcome: string) {
+  completeMission(rt: MissionRuntime, def: MissionDef, outcome: string, choiceFlags?: string[]) {
     if (rt.state === 'completed') return;
     const s = this.state;
     rt.state = 'completed'; rt.finishedAt = s.minutes; rt.outcome = outcome;
     s.xp += def.rewards.xp;
     if (def.rewards.money) this.earn(def.rewards.money, 'mission_reward', def.name, def.id);
-    if (def.rewards.flag && !s.world.flags.includes(def.rewards.flag)) s.world.flags.push(def.rewards.flag);
+    // rewards.flag for non-weekStart missions; weekStart missions set it after stripping old wk_ flags below.
+    const weekStartIds = [this.rules.weekStart].flat();
+    if (def.rewards.flag && !weekStartIds.includes(def.id) && !s.world.flags.includes(def.rewards.flag)) s.world.flags.push(def.rewards.flag);
     s.today.missionsCompleted.push(def.id);
     this.emit({ type: 'mission_completed', missionId: def.id });
 
     // "Make It to Friday" story hooks — real numbers, not scripted ones.
-    if (def.id === this.rules.weekStart) {
+    if (weekStartIds.includes(def.id)) {
       // A new week: last week's story flags and goal no longer count.
       s.world.flags = s.world.flags.filter(f => f === 'got_pocket_money' || f === 'week_started' || f === 'pocket_money_done'
         || !WEEK_FLAG_PREFIXES.some(p => f.startsWith(p)));
+      // Re-apply flags that were set by the weekStart choice itself (first-week arrival flags like wk_money_arrived, wk_paid).
+      for (const f of choiceFlags ?? []) if (!s.world.flags.includes(f)) s.world.flags.push(f);
       if (!s.world.flags.includes('pocket_money_done')) s.world.flags.push('pocket_money_done');
+      if (def.rewards.flag && !s.world.flags.includes(def.rewards.flag)) s.world.flags.push(def.rewards.flag);
       this.weekStartBalance = s.finance.accounts.cash;
       // survives a reload mid-week, since the instance field above doesn't persist with the save
       s.world.flags = s.world.flags.filter(f => !f.startsWith('wk_start_balance:') && !f.startsWith('wk_start_savings:'));
       s.world.flags.push(`wk_start_balance:${s.finance.accounts.cash}`);
       s.world.flags.push(`wk_start_savings:${s.finance.accounts.savings}`);
     }
-    if (def.id === this.rules.recap) {
+    if ([this.rules.recap].flat().includes(def.id)) {
       this.buildLevelSummary(s);
       const sm = this.pendingLevelSummary!;
       s.levelsCompleted = Math.max(s.levelsCompleted ?? 0, sm.level);
@@ -1521,7 +1570,10 @@ export class GameStore {
     const sm = this.pendingLevelSummary, lvl = sm.level;
     sm.highlights = s.lifePath === 'university' ? this.universityHighlights(daysAttended, daysTotal)
       : lvl === 2 ? this.schoolL2Highlights()
-      : lvl >= 3 ? this.schoolL3Highlights()
+      : lvl === 3 ? this.schoolL3Highlights()
+      : lvl === 4 ? this.schoolL4Highlights()
+      : lvl === 5 ? this.schoolL5Highlights()
+      : lvl >= 6 ? this.schoolL6Highlights()
       : [];
     // Stars: 1 for finishing the week, 1 for the goal, 1 for a clean week (nothing that went badly)
     // that still ended with money in your pocket.
@@ -1593,6 +1645,65 @@ export class GameStore {
     if (has('wk_ten_trip')) line('🎫', 'Bought a 10-trip card before the fare rise', 'good');
     if (s.finance.expenses.recurring.some(r => r.id === 'game_premium')) line('🎮', 'Pixel Racer Premium is still charging $6.99 a week', 'bad');
     else if (has('wk_trial_cancelled')) line('🎮', 'Cancelled the free trial before it charged', 'good');
+    return out;
+  }
+
+  /** School Level 4 — "Earning Money": payslip, tax code, extra shift, payday decision. */
+  private schoolL4Highlights(): RecapLine[] {
+    const s = this.state, f = s.world.flags, has = (x: string) => f.includes(x);
+    const out: RecapLine[] = [];
+    const line = (icon: string, text: string, tone: RecapLine['tone']) => out.push({ icon, text, tone });
+    if (has('tax_code_m') && !has('tax_code_me')) line('📋', 'Got the tax code right first time (M)', 'good');
+    else if (has('tax_code_fixed')) line('📋', 'Fixed the tax code after the IRD letter', 'neutral');
+    else if (has('tax_code_me')) line('📋', 'Wrong tax code (ME) — IRD will catch up at year end', 'bad');
+    if (has('wk_payday_received')) {
+      if (has('payday_save_all')) line('💰', 'Saved your entire first payslip', 'good');
+      else if (has('payday_save_half')) line('💰', 'Saved half your wages — good start', 'good');
+      else line('💰', 'Spent the whole payslip — nothing saved', 'bad');
+    } else line('💰', 'Never collected the payslip', 'bad');
+    if (has('wk_extra_shift_done')) line('⏰', 'Picked up the extra shift — extra $30', 'good');
+    else if (has('extra_shift_taken')) line('⏰', 'Agreed to the cover shift but didn\'t show up', 'bad');
+    if (has('myir_setup')) line('🏛️', 'Set up a myIR account', 'good');
+    if (has('wk_job_started')) line('💼', 'Completed your first week at the Dairy', 'good');
+    return out;
+  }
+
+  /** School Level 5 — "Bigger Goals": goal selection, temptation, auto-save. */
+  private schoolL5Highlights(): RecapLine[] {
+    const s = this.state, f = s.world.flags, has = (x: string) => f.includes(x);
+    const out: RecapLine[] = [];
+    const line = (icon: string, text: string, tone: RecapLine['tone']) => out.push({ icon, text, tone });
+    if (has('goal_reached')) {
+      if (has('goal_phone')) line('📱', 'Reached the $120 phone goal', 'good');
+      else if (has('goal_trip')) line('🌋', 'Funded the Rotorua trip', 'good');
+      else if (has('goal_kiwisaver')) line('🌿', 'Signed up for KiwiSaver', 'good');
+      else line('🏆', 'Reached your savings goal', 'good');
+    } else line('🎯', 'Didn\'t reach the goal this week', 'bad');
+    if (has('wk_temptation_faced')) {
+      if (has('sneakers_bought')) line('👟', 'Bought the limited-edition sneakers — savings dipped', 'bad');
+      else if (has('sneakers_flip')) line('👟', 'Tried to flip the sneakers — risky with savings money', 'neutral');
+      else line('👟', 'Said no to the limited-edition drop — stayed on track', 'good');
+    }
+    if (has('kiwisaver_joined')) line('🌿', 'Signed up for KiwiSaver — $521/year from the government', 'good');
+    if (has('auto_save_on')) line('⚙️', 'Set up automated savings — paying yourself first', 'good');
+    if (has('wk_kiwisaver_taught')) line('📚', 'Learned how KiwiSaver works', 'good');
+    return out;
+  }
+
+  /** School Level 6 — "Smart Money": compound interest, index funds, insurance, future planning. */
+  private schoolL6Highlights(): RecapLine[] {
+    const s = this.state, f = s.world.flags, has = (x: string) => f.includes(x);
+    const out: RecapLine[] = [];
+    const line = (icon: string, text: string, tone: RecapLine['tone']) => out.push({ icon, text, tone });
+    if (has('wk_compound_seen')) line('📈', 'Saw the compound interest demo — $1/day → $37,000', 'good');
+    if (has('wk_index_understood')) line('📊', 'Understood what an index fund is', 'good');
+    if (has('wk_insurance_lesson')) line('🔒', 'Saw what happens without insurance (Jordan\'s bike)', 'good');
+    if (has('wk_future_letter_save')) line('✉️', 'Wrote future-you a letter about saving early', 'good');
+    else if (has('wk_future_letter_invest')) line('✉️', 'Wrote future-you a letter about investing', 'good');
+    else if (has('wk_l6_complete')) line('✉️', 'Wrote the letter to future you', 'neutral');
+    if (has('scam_reported')) line('🚨', 'Reported the scam to Netsafe', 'good');
+    else if (has('emergency_buffer_set')) line('🆘', 'Set a $50 emergency buffer', 'good');
+    if (has('wk_l6_complete')) line('🎓', 'Finished the Smart Money week', 'good');
     return out;
   }
 

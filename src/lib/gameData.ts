@@ -41,7 +41,75 @@ export const L3_WEEK_GOALS: WeekGoalDef[] = [
   { id: 'l3_trip', emoji: '🏛️', name: 'Go on the trip, owe nobody' },
   { id: 'l3_packed', emoji: '🥪', name: 'Pack your lunch 4 days' },
 ];
-const ALL_WEEK_GOALS = [...WEEK_GOALS, ...UNI_WEEK_GOALS, ...L2_WEEK_GOALS, ...L3_WEEK_GOALS];
+/** University Level 2 ("Student Budget") goals. */
+export const UNI_L2_WEEK_GOALS: WeekGoalDef[] = [
+  { id: 'l2_frugal', emoji: '📊', name: 'Spend less than $80 on food' },
+  { id: 'l2_ird', emoji: '🪪', name: 'Get your IRD number sorted' },
+  { id: 'l2_savings100', emoji: '💰', name: 'Save $100 this week', target: 100 },
+  { id: 'l2_flat_peace', emoji: '🤝', name: 'Resolve the flatmate drama' },
+];
+/** University Level 3 ("Independence") goals. */
+export const UNI_L3_WEEK_GOALS: WeekGoalDef[] = [
+  { id: 'l3_kiwisaver_goal', emoji: '🥝', name: 'Opt into KiwiSaver' },
+  { id: 'l3_taxreturn', emoji: '📋', name: 'File your tax return' },
+  { id: 'l3_bond', emoji: '🏠', name: 'Win the bond dispute' },
+  { id: 'l3_insurance', emoji: '🛡️', name: 'Get laptop insurance sorted' },
+];
+/** University Level 4 ("Financial Challenges") goals. */
+export const UNI_L4_WEEK_GOALS: WeekGoalDef[] = [
+  { id: 'l4_no_card', emoji: '✂️', name: 'No new credit card debt' },
+  { id: 'l4_invest', emoji: '📈', name: 'Start investing with Sharesies' },
+  { id: 'l4_grad', emoji: '🎓', name: 'Plan for graduation costs' },
+  { id: 'l4_debtfree', emoji: '💳', name: 'Make a loan repayment plan' },
+];
+/** University Level 5 ("Graduate Year") goals. */
+export const UNI_L5_WEEK_GOALS: WeekGoalDef[] = [
+  { id: 'l5_uni_loan', emoji: '🎓', name: 'Make an extra loan repayment' },
+  { id: 'l5_uni_deposit', emoji: '🏠', name: 'Start a house deposit fund', target: 200 },
+  { id: 'l5_uni_car', emoji: '🚗', name: 'Research buying a car' },
+  { id: 'l5_uni_budget', emoji: '📊', name: 'Build a proper monthly budget' },
+];
+/** School Level 4 ("Earning Money") goals. */
+export const L4_WEEK_GOALS: WeekGoalDef[] = [
+  { id: 'l4_save_wages', emoji: '🐷', name: 'Save half your wages', target: 13 },
+  { id: 'l4_right_tax', emoji: '📋', name: 'Get the tax code right first time' },
+  { id: 'l4_extra_shift', emoji: '⏰', name: 'Pick up the extra shift' },
+  { id: 'l4_myir', emoji: '🏛️', name: 'Set up a myIR account' },
+];
+/** School Level 5 ("Bigger Goals") goals. */
+export const L5_WEEK_GOALS: WeekGoalDef[] = [
+  { id: 'l5_phone', emoji: '📱', name: 'Save $120 for a new phone', target: 120 },
+  { id: 'l5_kiwisaver', emoji: '🌿', name: 'Sign up for KiwiSaver' },
+  { id: 'l5_trip', emoji: '🌋', name: 'Fund the Rotorua trip ($150)', target: 150 },
+  { id: 'l5_auto', emoji: '⚙️', name: 'Set up automated saving' },
+];
+/** School Level 6 ("Smart Money") goals. */
+export const L6_WEEK_GOALS: WeekGoalDef[] = [
+  { id: 'l6_compound', emoji: '📈', name: 'Understand compound interest' },
+  { id: 'l6_kiwisaver', emoji: '🌿', name: 'Open KiwiSaver and invest your first $20', target: 20 },
+  { id: 'l6_emergency', emoji: '🆘', name: 'Build a $50 emergency buffer', target: 50 },
+  { id: 'l6_no_scam', emoji: '🚨', name: 'Spot and report the scam' },
+];
+/** International Student Level 1 ("Setup & Arrival") goals. */
+export const INTL_WEEK_GOALS: WeekGoalDef[] = [
+  { id: 'intl_budget', emoji: '📊', name: 'Track every cent this week' },
+  { id: 'intl_setup', emoji: '🏦', name: 'Get fully set up (bank + SIM)' },
+  { id: 'intl_cook', emoji: '🍳', name: 'Cook at home 4 days' },
+  { id: 'intl_social', emoji: '🤝', name: 'Meet 3 new people at orientation' },
+];
+/** Working Person Level 1 ("Income Management") goals. */
+export const WORK_WEEK_GOALS: WeekGoalDef[] = [
+  { id: 'work_save', emoji: '🏦', name: 'Save $100 this week', target: 100 },
+  { id: 'work_debt', emoji: '💳', name: 'Extra $50 on student loan', target: 50 },
+  { id: 'work_budget', emoji: '📊', name: 'Track all spending this week' },
+  { id: 'work_ks', emoji: '🥝', name: 'Boost KiwiSaver this week', target: 50 },
+];
+const ALL_WEEK_GOALS = [
+  ...WEEK_GOALS, ...UNI_WEEK_GOALS, ...UNI_L2_WEEK_GOALS, ...UNI_L3_WEEK_GOALS, ...UNI_L4_WEEK_GOALS, ...UNI_L5_WEEK_GOALS,
+  ...L2_WEEK_GOALS, ...L3_WEEK_GOALS,
+  ...L4_WEEK_GOALS, ...L5_WEEK_GOALS, ...L6_WEEK_GOALS,
+  ...INTL_WEEK_GOALS, ...WORK_WEEK_GOALS,
+];
 export const getWeekGoal = (id: string) => ALL_WEEK_GOALS.find(g => g.id === id);
 
 /** A savings target as authored in a life-path config. */
@@ -94,7 +162,7 @@ export const LIFE_PATHS: LifePathConfig[] = [
     goals: [
       // Replaced by the goal the player picks on Monday morning (UNI_WEEK_GOALS).
     ],
-    levelNames: ['First Week', 'Student Budget', 'Independence', 'Financial Challenges'],
+    levelNames: ['First Week', 'Student Budget', 'Independence', 'Financial Challenges', 'Graduate Year'],
     color: '#ffd700', available: true,
   },
   {

@@ -11,7 +11,13 @@ import type { GameEvent, GameState, MissionKind, MissionRuntime } from './types'
 import type { TransactionCategory } from '../game/types/transaction';
 import { DAILY_MISSIONS } from './dailyMissions';
 import { UNI_MISSIONS, UNI_DAILY } from './content/university';
-import { SCHOOL_L2, SCHOOL_L2_POOL, SCHOOL_L3, SCHOOL_L3_POOL } from './content/schoolLevels';
+import { SCHOOL_L2, SCHOOL_L2_POOL, SCHOOL_L3, SCHOOL_L3_POOL, SCHOOL_L4, SCHOOL_L4_POOL, SCHOOL_L5, SCHOOL_L5_POOL, SCHOOL_L6, SCHOOL_L6_POOL } from './content/schoolLevels';
+import { UNI_L2, UNI_L2_POOL, UNI_L3, UNI_L3_POOL, UNI_L4, UNI_L4_POOL } from './content/universityLevels';
+import { UNI_L5, UNI_L5_POOL } from './content/universityLevel5';
+// Tag L1 university missions as level-1 only so L2–L4 missions can override them.
+const UNI_L1: MissionDef[] = UNI_MISSIONS.map(d => d.levels ? d : { ...d, levels: [1] });
+import { INTL_MISSIONS, INTL_DAILY } from './content/international';
+import { WORK_MISSIONS, WORK_DAILY } from './content/working';
 import { markKey, hasMark, attendedToday, doneThisWeek, resolvedThisWeek, fromLevel } from './missionUtil';
 export { markKey, hasMark, fromLevel };
 
@@ -50,7 +56,21 @@ export interface MissionChoice {
     | 'student_loan_draw' | 'subscribe_sky' | 'bnpl_headphones'
     | 'open_kids_saver' | 'save_gift_10' | 'ten_trip_card' | 'tuck_tab_4' | 'pay_tab' | 'tab_late_fee'
     | 'premium_trial' | 'mark_attended' | 'packed_lunch_day' | 'buy_bike'
-    | 'save_coins' | 'budget_shift_food' | 'cancel_premium' | 'cousin_loan';
+    | 'save_coins' | 'budget_shift_food' | 'cancel_premium' | 'cousin_loan'
+    // L4 effects
+    | 'tax_code_m' | 'tax_code_me' | 'tax_code_fixed' | 'extra_shift_taken'
+    | 'payday_save_half' | 'payday_save_all' | 'myir_setup'
+    // L5 effects
+    | 'goal_phone' | 'goal_kiwisaver' | 'goal_trip' | 'kiwisaver_joined'
+    | 'sneakers_bought' | 'sneakers_flip' | 'auto_save_on' | 'goal_reached' | 'plant_job_taken'
+    // L6 effects
+    | 'wk_compound_seen' | 'wk_index_understood' | 'wk_insurance_lesson'
+    | 'wk_future_letter_save' | 'wk_future_letter_invest' | 'wk_l6_complete'
+    | 'emergency_buffer_set' | 'scam_reported'
+    // International effects
+    | 'nz_bank_account' | 'visa_rules_known'
+    // Working effects (none extra — uses mark_attended + emergency_buffer_set from above)
+    ;
   /** Hide this option when it doesn't make sense right now (e.g. packed lunch when you have none). */
   hideIf?: (s: GameState) => boolean;
   /** Energy this choice gives back (food, rest). */
@@ -200,6 +220,30 @@ export const SCHOOL_MISSIONS: MissionDef[] = [
           ],
           choices: [{ id: 'take', label: '💵 Deal (+$30)', sublabel: 'Lunches, bus, phone and fun — all yours to plan', category: 'income', cost: 30, minutes: 1, relationship: 1, consequence: '$30 lands. It feels like a lot. It is not.', flags: ['got_pocket_money', 'week_started'], finish: true }],
         },
+        4: {
+          lines: [
+            "Morning! Your $30 pocket money is in — but you\'ve got a job now too, remember.",
+            "Mr Lee wants you in at 4 today. First day at the Dairy!",
+            "Don\'t forget to fill in your tax code form — it tells IRD how much to take out of your wages.",
+          ],
+          choices: [{ id: 'take', label: '💵 Thanks Mum! (+$30)', sublabel: 'First week of work', category: 'income', cost: 30, minutes: 1, relationship: 1, consequence: '$30 in. First payslip incoming.', flags: ['got_pocket_money', 'week_started', 'pocket_money_paid'], finish: true }],
+        },
+        5: {
+          lines: [
+            "Morning — $30 for the week as usual.",
+            "You\'ve been earning a bit now. This week I want you to pick a real goal — something you\'ve actually been working toward.",
+            "Phone, Rotorua trip, KiwiSaver — your call. But pick one and protect it.",
+          ],
+          choices: [{ id: 'take', label: '💵 Thanks Mum! (+$30)', sublabel: 'Big goals week', category: 'income', cost: 30, minutes: 1, relationship: 1, consequence: '$30 in. Now pick a goal worth chasing.', flags: ['got_pocket_money', 'week_started', 'pocket_money_paid'], finish: true }],
+        },
+        6: {
+          lines: [
+            "Morning! $30 in — same as always.",
+            "Ms Patel has something special planned this week. Something to do with compound interest.",
+            "Just go in with an open mind. This stuff actually matters.",
+          ],
+          choices: [{ id: 'take', label: '💵 Thanks Mum! (+$30)', sublabel: 'Smart money week', category: 'income', cost: 30, minutes: 1, relationship: 1, consequence: '$30 in. Time to get smart.', flags: ['got_pocket_money', 'week_started', 'pocket_money_paid'], finish: true }],
+        },
       },
     }],
     rewards: { xp: 20, message: 'Pocket money in hand. The week begins — make it to Friday.', flag: 'pocket_money_done' },
@@ -239,6 +283,33 @@ export const SCHOOL_MISSIONS: MissionDef[] = [
             { id: 'save', label: '🐷 Save $8 of your $30', sublabel: 'Into savings by Sunday', cost: 0, minutes: 0, setsGoal: 'l3_save', consequence: 'Goal set: $8 saved.', finish: true },
             { id: 'trip', label: '🏛️ Go on the trip, owe nobody', sublabel: 'Museum Friday, no tabs', cost: 0, minutes: 0, setsGoal: 'l3_trip', consequence: 'Goal set: the trip, debt-free.', finish: true },
             { id: 'packed', label: '🥪 Pack your lunch 4 days', sublabel: 'Buy supplies Mon–Tue', cost: 0, minutes: 0, setsGoal: 'l3_packed', consequence: 'Goal set: four packed lunches.', finish: true },
+          ],
+        },
+        4: {
+          lines: ['Level 4: Earning Money.', 'You\'ve got a job now — what are you working toward?'],
+          choices: [
+            { id: 'save_wages', label: '🐷 Save half your wages', sublabel: 'Move half to savings on payday', cost: 0, minutes: 0, setsGoal: 'l4_save_wages', consequence: 'Goal set: half your wages into savings.', finish: true },
+            { id: 'right_tax', label: '📋 Get the tax code right', sublabel: 'M = standard first job', cost: 0, minutes: 0, setsGoal: 'l4_right_tax', consequence: 'Goal set: nail the tax code.', finish: true },
+            { id: 'extra_shift', label: '⏰ Pick up the extra shift', sublabel: 'Wednesday offer, Thursday shift', cost: 0, minutes: 0, setsGoal: 'l4_extra_shift', consequence: 'Goal set: the extra shift.', finish: true },
+            { id: 'myir', label: '🏛️ Set up a myIR account', sublabel: 'Free at ird.govt.nz', cost: 0, minutes: 0, setsGoal: 'l4_myir', consequence: 'Goal set: myIR registered.', finish: true },
+          ],
+        },
+        5: {
+          lines: ['Level 5: Bigger Goals.', 'You\'ve been earning. Time to aim for something real.'],
+          choices: [
+            { id: 'phone', label: '📱 Save $120 for a new phone', sublabel: 'Keep adding to savings', cost: 0, minutes: 0, setsGoal: 'l5_phone', consequence: 'Goal set: $120 phone.', finish: true },
+            { id: 'kiwisaver', label: '🌿 Sign up for KiwiSaver', sublabel: 'Government adds $521/year', cost: 0, minutes: 0, setsGoal: 'l5_kiwisaver', consequence: 'Goal set: KiwiSaver registered.', finish: true },
+            { id: 'trip', label: '🌋 Fund the Rotorua trip ($150)', sublabel: 'Payment due Friday', cost: 0, minutes: 0, setsGoal: 'l5_trip', consequence: 'Goal set: Rotorua.', finish: true },
+            { id: 'auto', label: '⚙️ Set up automated saving', sublabel: 'Let it happen on its own', cost: 0, minutes: 0, setsGoal: 'l5_auto', consequence: 'Goal set: automate it.', finish: true },
+          ],
+        },
+        6: {
+          lines: ['Level 6: Smart Money.', 'This week is about the long game. What do you want to understand?'],
+          choices: [
+            { id: 'compound', label: '📈 Understand compound interest', sublabel: 'The most powerful force in money', cost: 0, minutes: 0, setsGoal: 'l6_compound', consequence: 'Goal set: compound interest.', finish: true },
+            { id: 'kiwisaver', label: '🌿 Open KiwiSaver & invest $20', sublabel: 'Make your first investment', cost: 0, minutes: 0, setsGoal: 'l6_kiwisaver', consequence: 'Goal set: first investment.', finish: true },
+            { id: 'emergency', label: '🆘 Build a $50 emergency buffer', sublabel: 'Financial airbag', cost: 0, minutes: 0, setsGoal: 'l6_emergency', consequence: 'Goal set: $50 buffer.', finish: true },
+            { id: 'no_scam', label: '🚨 Spot and report the scam', sublabel: 'Scam arrives mid-week', cost: 0, minutes: 0, setsGoal: 'l6_no_scam', consequence: 'Goal set: scam-proof.', finish: true },
           ],
         },
       },
@@ -651,6 +722,9 @@ export const SCHOOL_MISSIONS: MissionDef[] = [
       byLevel: {
         2: { lines: ['So — did your money grow this week?', "Show me what's in your savings. And thank you for my birthday."] },
         3: { lines: ["Let's see the budget app, then.", 'Plan versus reality — how close did you get?'] },
+        4: { lines: ['First week of work done!', 'Did you get the tax code right? And — did you save any of the payslip?'] },
+        5: { lines: ['Big goal week.', 'Did you reach it? And — did anything tempt you to dip into savings?'] },
+        6: { lines: ["So — compound interest. Index funds. Insurance. A lot to take in.", "Tell me what actually stuck."] },
       },
       choices: [{ id: 'reflect', label: '💬 Look back on the week', sublabel: 'See how it went', cost: 0, minutes: 20, relationship: 2, consequence: 'Mum listens, and you both look at how the week actually went.', flags: ['level1_complete'], finish: true }],
     }],
@@ -660,8 +734,11 @@ export const SCHOOL_MISSIONS: MissionDef[] = [
 
 export function missionDefs(path: GameState['lifePath']): MissionDef[] {
   return [
-    ...SCHOOL_MISSIONS, ...SCHOOL_L2, ...SCHOOL_L3, ...UNI_MISSIONS,
-    ...DAILY_MISSIONS, ...SCHOOL_L2_POOL, ...SCHOOL_L3_POOL, ...UNI_DAILY,
+    ...SCHOOL_MISSIONS, ...SCHOOL_L2, ...SCHOOL_L3, ...SCHOOL_L4, ...SCHOOL_L5, ...SCHOOL_L6, ...UNI_L1, ...UNI_L2, ...UNI_L3, ...UNI_L4, ...UNI_L5,
+    ...INTL_MISSIONS, ...WORK_MISSIONS,
+    ...DAILY_MISSIONS, ...SCHOOL_L2_POOL, ...SCHOOL_L3_POOL, ...SCHOOL_L4_POOL, ...SCHOOL_L5_POOL, ...SCHOOL_L6_POOL, ...UNI_DAILY,
+    ...UNI_L2_POOL, ...UNI_L3_POOL, ...UNI_L4_POOL, ...UNI_L5_POOL,
+    ...INTL_DAILY, ...WORK_DAILY,
   ].filter(d => d.paths.includes(path));
 }
 export const getDef = (defs: MissionDef[], id: string) => defs.find(d => d.id === id);

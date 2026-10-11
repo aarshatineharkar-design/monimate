@@ -119,14 +119,15 @@ test('Levels: skipping the Sunday recap means replaying the same level', () => {
   assert.equal(store.state.levelsCompleted, 0);
 });
 
-test('Levels: the last level built repeats, and the recap says what is coming next', () => {
-  const store = newGame(maxLevel('school'));
+test('Levels: the recap previews the next built level, and maxLevel reflects all built levels', () => {
+  // At level 3 (Budgeting), the recap should tease level 4 (Earning Money) as a new level.
+  const store = newGame(3);
   const rt = store.runtime('friday_recap')!;
   store.advance(at(SUN, 16, 0) - store.state.minutes);
   rt.state = 'active';
   store.applyChoice('friday_recap', store.def('friday_recap')!.steps[0].choices![0]);
-  assert.deepEqual(store.pendingLevelSummary!.next, { level: 4, name: 'Earning Money', isNew: false });
-  assert.equal(maxLevel('school'), 3);
+  assert.deepEqual(store.pendingLevelSummary!.next, { level: 4, name: 'Earning Money', isNew: true });
+  assert.equal(maxLevel('school'), 6);
 });
 
 test('Unlocks: International and Working need 5 finished levels in BOTH School and University', () => {

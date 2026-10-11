@@ -834,3 +834,556 @@ export const SCHOOL_L3_POOL: MissionDef[] = [
     rewards: { xp: 3, message: 'Haircut sorted.' },
   },
 ];
+
+// ═══ LEVEL 4 — EARNING MONEY ═══════════════════════════════════════════════
+/**
+ * Level 4 — "Earning Money": the player gets a part-time job at the Dairy, earns their first
+ * real payslip, fills in a tax code (M = standard, ME = no secondary), sees PAYE deducted,
+ * and decides whether to spend or save their wages. A co-worker calls in sick and they can
+ * pick up an extra shift. IRD sends a letter if the code is wrong.
+ */
+export const SCHOOL_L4: MissionDef[] = [
+  // Monday: pocket money ($30) + goal pick, then Mum tells you Mr Lee called
+  {
+    id: 'l4_job_starts', kind: 'main', priority: 200, name: 'First day at work', emoji: '💼',
+    journalText: 'Mr Lee called — you start your part-time job at the Dairy today (4–6 PM). You need to fill in a tax code form.',
+    storySetup: 'Mum: "Mr Lee from the Dairy called — you start today!"',
+    destination: 'dairy', paths: SCHOOL, repeat: 'weekly', levels: [4],
+    window: { days: [0], from: hm(15, 35), until: hm(17, 0), spanDays: 0 },
+    trigger: { type: 'time' },
+    requires: s => hasFlag(s, 'pocket_money_paid'),
+    steps: [{
+      id: 's1', place: 'dairy', waypoint: 'Start shift',
+      speaker: 'Mr Lee', npcId: 'shopkeeper',
+      lines: ["Welcome aboard! Before you start I need your tax code. Most people use 'M' — it's the standard one.", "If you already have another job you'd use 'ME'. Any questions?"],
+      choices: [
+        { id: 'code_m', label: '📋 Tax code M (standard)', sublabel: 'Right for your first job', cost: 0, minutes: 2, consequence: 'You fill in M. Perfect.', effect: 'tax_code_m', finish: false },
+        { id: 'code_me', label: '📋 Tax code ME', sublabel: 'For secondary jobs', cost: 0, minutes: 2, consequence: 'You fill in ME — that might cause issues.', effect: 'tax_code_me', finish: false },
+        { id: 'ask', label: '🤔 Ask what it means', sublabel: 'Good move', cost: 0, minutes: 3, consequence: 'Mr Lee explains. You choose M.', lesson: 'Tax codes tell IRD how much tax to take. M is right when this is your only or main job.', effect: 'tax_code_m', finish: false },
+      ],
+    }, {
+      id: 's2', place: 'dairy', waypoint: 'Finish shift',
+      speaker: 'Mr Lee', npcId: 'shopkeeper',
+      lines: ["Good first shift! You worked 2 hours at $15/hour. I'll pay you weekly — keep an eye on your payslip."],
+      choices: [{ id: 'ok', label: '✅ Got it', sublabel: 'Start saving', cost: 0, minutes: 2, consequence: 'You head home ready for the week ahead.', finish: true }],
+    }],
+    rewards: { xp: 15, message: 'First shift done! $30 coming on payday.', flag: 'wk_job_started' },
+  },
+  // Tuesday: IRD letter arrives if wrong tax code
+  {
+    id: 'l4_ird_letter', kind: 'main', priority: 180, name: 'IRD letter', emoji: '📬',
+    journalText: 'IRD sent a letter about your tax code. You can fix it now or leave it.',
+    storySetup: 'A letter arrived from IRD.',
+    paths: SCHOOL, repeat: 'weekly', levels: [4],
+    window: { days: [1], from: hm(8, 0), until: hm(18, 0) },
+    trigger: { type: 'time' },
+    requires: s => hasFlag(s, 'tax_code_me'),
+    steps: [{
+      id: 's1', place: 'home', waypoint: 'Read letter', remote: true,
+      speaker: 'Mum', npcId: 'mum',
+      lines: ["A letter from IRD. It says your tax code might be wrong — you ticked ME but this looks like your first job.", "You should probably fix it with Mr Lee before payday."],
+      choices: [
+        { id: 'fix', label: '✅ Fix it now', sublabel: 'Talk to Mr Lee', cost: 0, minutes: 10, consequence: 'You switch to M. No tax surprise.', effect: 'tax_code_fixed', lesson: 'IRD can adjust your tax at year-end, but it\'s easier to get it right from the start.', finish: true },
+        { id: 'ignore', label: '🤷 Leave it for now', sublabel: 'Might cost you', cost: 0, minutes: 0, consequence: "You leave it. IRD will sort it — eventually. Might be a surprise.", finish: true },
+      ],
+    }],
+    rewards: { xp: 8, message: 'Tax codes sorted.' },
+  },
+  // Wednesday: co-worker calls in sick — extra shift opportunity
+  {
+    id: 'l4_extra_shift', kind: 'main', priority: 170, name: 'Extra shift', emoji: '⏰',
+    journalText: 'Mr Lee needs someone to cover a sick co-worker tomorrow after school (4–6 PM, +$30). But you had plans.',
+    storySetup: 'Mr Lee just texted asking if you can cover.',
+    paths: SCHOOL, repeat: 'weekly', levels: [4],
+    window: { days: [2], from: hm(15, 35), until: hm(18, 0) },
+    trigger: { type: 'time' },
+    requires: s => hasFlag(s, 'wk_job_started'),
+    steps: [{
+      id: 's1', place: 'home', waypoint: 'Reply to Mr Lee', remote: true,
+      speaker: 'Mr Lee', npcId: 'shopkeeper',
+      lines: ["Hey, Mia's sick tomorrow. Any chance you can cover? It's 4–6, same pay. Let me know ASAP."],
+      choices: [
+        { id: 'yes', label: '✅ Yes, I\'ll do it', sublabel: '+$30 · miss plans', cost: 0, minutes: 2, consequence: "Mr Lee: 'Brilliant, thanks!' Extra $30 on payday.", effect: 'extra_shift_taken', finish: true },
+        { id: 'no', label: '❌ Can\'t make it', sublabel: 'Keep your plans', cost: 0, minutes: 2, consequence: "He thanks you for being honest. No guilt.", finish: true },
+      ],
+    }],
+    rewards: { xp: 5, message: '' },
+  },
+  // Thursday: extra shift (if taken)
+  {
+    id: 'l4_extra_shift_work', kind: 'main', priority: 160, name: 'Cover shift', emoji: '🏪',
+    journalText: 'The cover shift at the Dairy — 4 to 6 PM.',
+    storySetup: 'Time to head to the Dairy.',
+    paths: SCHOOL, repeat: 'weekly', levels: [4],
+    window: { days: [3], from: hm(15, 35), until: hm(17, 0), spanDays: 0 },
+    trigger: { type: 'time' },
+    requires: s => hasFlag(s, 'extra_shift_taken'),
+    steps: [{
+      id: 's1', place: 'dairy', waypoint: 'Work shift',
+      speaker: 'Mr Lee', npcId: 'shopkeeper',
+      lines: ['Good timing. Two hours — same as Monday. Thanks again for covering.'],
+      choices: [{ id: 'work', label: '💪 Work the shift', sublabel: '+$30 wages', cost: 30, minutes: 120, consequence: 'Another two hours done. Nice extra on payday.', finish: true }],
+    }],
+    rewards: { xp: 10, message: 'Extra shift done!', flag: 'wk_extra_shift_done' },
+  },
+  // Friday: payday — payslip shows gross, PAYE, net
+  {
+    id: 'l4_payday', kind: 'main', priority: 190, name: 'Payday', emoji: '💰',
+    journalText: 'Payday! Mr Lee hands you your payslip. Gross pay minus PAYE tax = what you actually get.',
+    storySetup: 'Mr Lee texted: "Payslip ready, come grab it."',
+    paths: SCHOOL, repeat: 'weekly', levels: [4],
+    window: { days: [4], from: hm(15, 35), until: hm(18, 0) },
+    trigger: { type: 'time' },
+    requires: s => hasFlag(s, 'wk_job_started'),
+    steps: [{
+      id: 's1', place: 'dairy', waypoint: 'Collect payslip',
+      speaker: 'Mr Lee', npcId: 'shopkeeper',
+      lines: [],
+      byLevel: {
+        4: { lines: ["Here's your payslip. Gross pay $30 for 2 hours — $4.35 PAYE tax taken out automatically, so your take-home is $25.65.", "If you did the extra shift add another $25.65. The tax is taken out the same way. That's how PAYE works — you never see the tax money, it goes straight to IRD."] },
+      },
+      choices: [
+        { id: 'save_half', label: '🐷 Save half', sublabel: 'Smart move', cost: 0, minutes: 5, consequence: 'Half goes to the piggy bank. The rest is yours.', effect: 'payday_save_half', finish: true },
+        { id: 'spend', label: '🛍️ Spend it all', sublabel: 'You earned it', cost: 0, minutes: 5, consequence: 'All spent. Worth it?', finish: true },
+        { id: 'save_all', label: '💪 Save it all', sublabel: 'Maximum saving', cost: 0, minutes: 5, consequence: "All of it saved. Iron willpower.", effect: 'payday_save_all', finish: true },
+      ],
+    }],
+    rewards: { xp: 12, message: 'Payslip explained!', flag: 'wk_payday_received' },
+  },
+  // Sunday: recap calls out tax code, payslip, saving decisions
+  {
+    id: 'l4_recap', kind: 'main', priority: 100, name: 'Sunday night with Mum', emoji: '📅',
+    journalText: 'Sunday night — Mum wants to hear about your first week of work.',
+    storySetup: 'Mum: "Tell me everything about the job!"',
+    paths: SCHOOL, repeat: 'weekly', levels: [4],
+    window: { days: [6], from: hm(17, 0), until: hm(21, 0) },
+    trigger: { type: 'time' },
+    steps: [{
+      id: 's1', place: 'home', waypoint: 'Talk to Mum', remote: true,
+      speaker: 'Mum', npcId: 'mum',
+      lines: ["First pay packet! How did it feel seeing PAYE come out?", "Did you save any of it?"],
+      choices: [
+        { id: 'reflect', label: '😊 Tell Mum everything', sublabel: 'Open chat', cost: 0, minutes: 15, consequence: 'Good chat.', finish: true },
+      ],
+    }],
+    rewards: { xp: 10, message: 'Week 4 done!' },
+  },
+];
+
+export const SCHOOL_L4_POOL: MissionDef[] = [
+  {
+    id: 'l4p_overtime', pool: 'after_school', kind: 'side', priority: 40, name: 'Overtime at the Dairy', emoji: '🕐',
+    journalText: 'Mr Lee asks if you can stay an extra 30 minutes to help restock. Half-hour at $15/h.',
+    storySetup: 'Mr Lee: "Any chance you can stay a bit?"', paths: SCHOOL, repeat: 'daily', levels: fromLevel(4),
+    window: { days: [0, 1, 2, 3, 4], from: hm(16, 0), until: hm(18, 30) }, trigger: { type: 'time' },
+    requires: s => hasFlag(s, 'wk_job_started'),
+    steps: [{
+      id: 's1', place: 'dairy', waypoint: 'Mr Lee needs help', speaker: 'Mr Lee', npcId: 'shopkeeper',
+      lines: ["Would you mind staying 30 minutes to restock the drinks fridge? I'll pay you for it."],
+      choices: [
+        { id: 'yes', label: '✅ Stay and help', sublabel: '+$7.50', cost: 7.5, minutes: 30, consequence: 'Nice extra.', finish: true },
+        { id: 'no', label: '❌ Can\'t tonight', sublabel: 'Head home', cost: 0, minutes: 2, consequence: 'Mr Lee nods.', finish: true },
+      ],
+    }],
+    rewards: { xp: 4, message: '' },
+  },
+  {
+    id: 'l4p_budget_app', pool: 'after_school', kind: 'side', priority: 30, name: 'Budget app', emoji: '📱',
+    journalText: 'Riley shows you a free budgeting app that tracks spending by category.',
+    storySetup: 'Riley: "Have you seen this app?"', paths: SCHOOL, repeat: 'daily', levels: fromLevel(4),
+    window: { days: WK, from: hm(13, 0), until: hm(15, 30) }, trigger: { type: 'time' },
+    steps: [{
+      id: 's1', place: 'home', waypoint: 'Check app with Riley', remote: true, speaker: 'Riley', npcId: 'riley',
+      lines: ["There's this free app — you put in your income and it tracks where your money goes by category. Want me to show you?"],
+      choices: [
+        { id: 'yes', label: '✅ Set it up now', sublabel: 'Riley +1', cost: 0, minutes: 5, relationship: 1, consequence: 'Set up in 5 minutes. Really useful.', lesson: 'A budget app doesn\'t change what you spend — it just shows you the truth.', finish: true },
+        { id: 'later', label: '⏩ Maybe later', sublabel: 'Not now', cost: 0, minutes: 0, consequence: 'Maybe next time.', finish: true },
+      ],
+    }],
+    rewards: { xp: 3, message: '' },
+  },
+  {
+    id: 'l4p_flat_white', pool: 'after_school', kind: 'side', priority: 25, name: 'The flat white habit', emoji: '☕',
+    journalText: 'Jordan wants to get a coffee after school every day this week — $5 each. You\'d spend $25 on coffee.',
+    storySetup: 'Jordan: "Come on, just one!"', paths: SCHOOL, repeat: 'daily', levels: fromLevel(4),
+    window: { days: WK, from: hm(15, 0), until: hm(16, 30) }, trigger: { type: 'time' },
+    steps: [{
+      id: 's1', place: 'home', waypoint: 'Jordan texts', remote: true, speaker: 'Jordan', npcId: 'jordan',
+      lines: ["Café after school? Just a flat white. Five bucks."],
+      choices: [
+        { id: 'go', label: '☕ Join Jordan', sublabel: '-$5', cost: -5, minutes: 45, relationship: 1, consequence: 'Good, but five of these is $25.', finish: true },
+        { id: 'skip', label: '🏠 Head home', sublabel: 'Save the $5', cost: 0, minutes: 0, consequence: 'Saved $5. Jordan understands.', finish: true },
+      ],
+    }],
+    rewards: { xp: 3, message: '' },
+  },
+  {
+    id: 'l4p_ird_myir', pool: 'after_school', kind: 'side', priority: 35, name: 'Set up myIR', emoji: '🏛️',
+    journalText: 'Ms Patel says everyone who earns money should have a myIR account to check their tax.',
+    storySetup: 'Ms Patel: "Does anyone have a myIR account?"', paths: SCHOOL, repeat: 'daily', levels: fromLevel(4),
+    window: { days: [1, 2, 3], from: hm(9, 0), until: hm(15, 30) }, trigger: { type: 'time' },
+    steps: [{
+      id: 's1', place: 'home', waypoint: 'Set up myIR', remote: true, speaker: 'Mum', npcId: 'mum',
+      lines: ["Your teacher's right — myIR is free and you can see all your tax history in one place. Want help setting it up?"],
+      choices: [
+        { id: 'set_up', label: '✅ Set it up', sublabel: 'Free · takes 10 min', cost: 0, minutes: 10, consequence: "Done. You can see your tax history now.", lesson: 'myIR lets you update your tax code, check refunds and see your income history. Free at ird.govt.nz.', effect: 'myir_setup', finish: true },
+        { id: 'not_now', label: '⏩ Not right now', sublabel: '', cost: 0, minutes: 0, consequence: 'Maybe later.', finish: true },
+      ],
+    }],
+    rewards: { xp: 5, message: 'myIR registered.' },
+  },
+];
+
+// ═══ LEVEL 5 — BIGGER GOALS ═══════════════════════════════════════════════════
+/**
+ * Level 5 — "Bigger Goals": the player saves toward a bigger target ($120 phone, KiwiSaver sign-up,
+ * or helping fund a school trip), encounters temptation to dip into savings, gets a one-off bonus,
+ * and discovers the power of automated saving.
+ */
+export const SCHOOL_L5: MissionDef[] = [
+  // Monday: pocket money + pick a big goal
+  {
+    id: 'l5_big_goal', kind: 'main', priority: 200, name: 'Pick your big goal', emoji: '🎯',
+    journalText: 'You\'ve been saving for a while. This week pick a real target: a new phone ($120), KiwiSaver, or the school trip to Rotorua ($150 due Friday).',
+    storySetup: 'Mum: "What\'s the plan this week?"',
+    paths: SCHOOL, repeat: 'weekly', levels: [5],
+    window: { days: [0], from: hm(7, 0), until: hm(9, 0) },
+    trigger: { type: 'time' },
+    requires: s => hasFlag(s, 'pocket_money_paid'),
+    steps: [{
+      id: 's1', place: 'home', waypoint: 'Tell Mum your goal', remote: true,
+      speaker: 'Mum', npcId: 'mum',
+      lines: ["You've saved up a bit now. What's the goal this week — are you going for the phone, or something bigger?"],
+      choices: [
+        { id: 'phone', label: '📱 Save for a $120 phone', sublabel: '$120 target', cost: 0, minutes: 2, consequence: 'Phone it is. $120 to go.', effect: 'goal_phone', finish: true },
+        { id: 'kiwisaver', label: '🌿 Sign up for KiwiSaver', sublabel: 'Long-term move', cost: 0, minutes: 2, consequence: 'Long-term thinking. Nice.', effect: 'goal_kiwisaver', finish: true },
+        { id: 'trip', label: '🌋 Pay for the Rotorua trip', sublabel: '$150 due Friday', cost: 0, minutes: 2, consequence: 'The trip is on. $150 by Friday.', effect: 'goal_trip', finish: true },
+      ],
+    }],
+    rewards: { xp: 8, message: 'Goal set!' },
+  },
+  // Tuesday: KiwiSaver lesson at school
+  {
+    id: 'l5_kiwisaver', kind: 'main', priority: 170, name: 'KiwiSaver explained', emoji: '🌿',
+    journalText: 'Ms Patel explains KiwiSaver in class — a retirement savings scheme with a government kickstart.',
+    storySetup: 'Ms Patel: "Who here knows what KiwiSaver is?"',
+    paths: SCHOOL, repeat: 'weekly', levels: [5],
+    window: { days: [1], from: hm(9, 0), until: hm(15, 30) },
+    trigger: { type: 'time' },
+    steps: [{
+      id: 's1', place: 'home', waypoint: 'Ask Mum about KiwiSaver', remote: true,
+      speaker: 'Mum', npcId: 'mum',
+      lines: ["Ms Patel taught you about KiwiSaver? It's a big deal — the government puts in $521 a year just for joining, and when you work your employer adds money too.", "You can join at any age. Once the money is in, you can't take it out until you're 65 or buying your first house."],
+      choices: [
+        { id: 'sign_up', label: '✅ I want to sign up', sublabel: 'Free · long-term', cost: 0, minutes: 10, consequence: 'Mum helps you sign up online. $0 now, but big later.', effect: 'kiwisaver_joined', lesson: 'The government member tax credit adds up to $521/year. Sign up at any age — it\'s free.', finish: true },
+        { id: 'later', label: '⏩ Too far away', sublabel: 'Not yet', cost: 0, minutes: 2, consequence: "Fair enough — it's a long game.", finish: true },
+      ],
+    }],
+    rewards: { xp: 10, message: 'KiwiSaver registered!', flag: 'wk_kiwisaver_taught' },
+  },
+  // Wednesday: savings temptation
+  {
+    id: 'l5_temptation', kind: 'main', priority: 160, name: 'The limited-edition drop', emoji: '👟',
+    journalText: 'Jordan texts — limited-edition sneakers just dropped online. $90. Your savings would cover it. The trip payment is Friday.',
+    storySetup: 'Jordan: "BRO. The new drops are live."',
+    paths: SCHOOL, repeat: 'weekly', levels: [5],
+    window: { days: [2], from: hm(16, 0), until: hm(20, 0) },
+    trigger: { type: 'time' },
+    steps: [{
+      id: 's1', place: 'home', waypoint: 'Check the drop', remote: true,
+      speaker: 'Jordan', npcId: 'jordan',
+      lines: ["Dude they're already selling out. $90 and they'll be worth double in a month. You've got the savings right?"],
+      choices: [
+        { id: 'buy', label: '👟 Buy them ($90)', sublabel: 'Dip into savings', cost: -90, minutes: 15, consequence: 'They look amazing. But the trip money is gone.', effect: 'sneakers_bought', finish: true },
+        { id: 'wait', label: '⏸️ Wait — I need my savings', sublabel: 'Stay on track', cost: 0, minutes: 5, consequence: 'They sell out. You kept your savings.', lesson: 'Opportunity cost: every time you spend on one thing, you give up something else. Protect your goals.', finish: true },
+        { id: 'sell', label: '🔄 Buy and flip them', sublabel: 'Risky plan', cost: -90, minutes: 15, consequence: "Jordan says he knows a buyer. You're gambling your savings.", effect: 'sneakers_flip', finish: true },
+      ],
+    }],
+    rewards: { xp: 8, message: 'Held the line.', flag: 'wk_temptation_faced' },
+  },
+  // Thursday: payday + automated savings prompt
+  {
+    id: 'l5_auto_save', kind: 'main', priority: 175, name: 'Automate your savings', emoji: '⚙️',
+    journalText: 'Payday again. Mr Lee mentions the bank\'s automatic transfer — set it and forget it.',
+    storySetup: 'Mr Lee: "You know the bank can transfer automatically, right?"',
+    paths: SCHOOL, repeat: 'weekly', levels: [5],
+    window: { days: [3], from: hm(15, 35), until: hm(18, 0) },
+    trigger: { type: 'time' },
+    requires: s => hasFlag(s, 'wk_job_started'),
+    steps: [{
+      id: 's1', place: 'dairy', waypoint: 'Talk to Mr Lee',
+      speaker: 'Mr Lee', npcId: 'shopkeeper',
+      lines: ["When I first started working I spent everything. Then I set up an automatic $20 transfer to savings every payday.", "I didn't miss the money because I never saw it. You can do the same with your Kids Saver."],
+      choices: [
+        { id: 'set_up', label: '⚙️ Set up auto-transfer', sublabel: '$10 every payday', cost: 0, minutes: 5, consequence: 'Done — every payslip, $10 goes straight to savings.', effect: 'auto_save_on', lesson: 'Paying yourself first: save before you can spend it. Even $5 a week adds up to $260 a year.', finish: true },
+        { id: 'manual', label: '🖐️ I\'ll do it manually', sublabel: 'Stay in control', cost: 0, minutes: 2, consequence: "Fair. Discipline is just as good.", finish: true },
+      ],
+    }],
+    rewards: { xp: 10, message: 'Savings automated!', flag: 'wk_payday_received' },
+  },
+  // Friday: trip payment due (or phone purchase)
+  {
+    id: 'l5_goal_day', kind: 'main', priority: 180, name: 'Goal day', emoji: '🏆',
+    journalText: 'Friday — did you reach your goal? Trip payment due at 3 PM.',
+    storySetup: 'The finish line.',
+    paths: SCHOOL, repeat: 'weekly', levels: [5],
+    window: { days: [4], from: hm(8, 0), until: hm(15, 0) },
+    trigger: { type: 'time' },
+    steps: [{
+      id: 's1', place: 'home', waypoint: 'Goal check-in', remote: true,
+      speaker: 'Mum', npcId: 'mum',
+      lines: ["Friday already! Did you reach your goal?"],
+      choices: [
+        { id: 'yes', label: '✅ I made it!', sublabel: 'Goal reached', cost: 0, minutes: 5, consequence: 'You made it. That feeling of reaching a goal you planned for is unbeatable.', effect: 'goal_reached', finish: true },
+        { id: 'nearly', label: '😅 Almost there', sublabel: 'Close', cost: 0, minutes: 5, consequence: "So close. You'll get there next week.", finish: true },
+        { id: 'no', label: '😬 Didn\'t make it', sublabel: 'Spent too much', cost: 0, minutes: 5, consequence: "It happens. Next time, save first.", finish: true },
+      ],
+    }],
+    rewards: { xp: 12, message: 'Week 5 done!', flag: 'wk_goal_day' },
+  },
+  // Sunday recap
+  {
+    id: 'l5_recap', kind: 'main', priority: 100, name: 'Sunday night with Mum', emoji: '📅',
+    journalText: 'Sunday — reflect on the week\'s saving progress with Mum.',
+    storySetup: 'Time to talk to Mum.',
+    paths: SCHOOL, repeat: 'weekly', levels: [5],
+    window: { days: [6], from: hm(17, 0), until: hm(21, 0) },
+    trigger: { type: 'time' },
+    steps: [{
+      id: 's1', place: 'home', waypoint: 'Talk to Mum', remote: true,
+      speaker: 'Mum', npcId: 'mum',
+      lines: ["Big week! Tell me about it — did you reach the goal?"],
+      choices: [{ id: 'reflect', label: '😊 Tell Mum everything', sublabel: 'Open chat', cost: 0, minutes: 15, consequence: 'Good talk.', finish: true }],
+    }],
+    rewards: { xp: 10, message: 'Week 5 done!' },
+  },
+];
+
+export const SCHOOL_L5_POOL: MissionDef[] = [
+  {
+    id: 'l5p_price_compare', pool: 'after_school', kind: 'side', priority: 35, name: 'Price comparison', emoji: '🔍',
+    journalText: 'Riley and Jordan both want the same games console. One checks prices online first; the other buys in-store.',
+    storySetup: 'Riley: "Always check online first."', paths: SCHOOL, repeat: 'daily', levels: fromLevel(5),
+    window: { days: WK, from: hm(12, 30), until: hm(15, 0) }, trigger: { type: 'time' },
+    steps: [{
+      id: 's1', place: 'home', waypoint: 'Join the conversation', remote: true, speaker: 'Riley', npcId: 'riley',
+      lines: ["Jordan paid $299 in-store. I waited and got it for $239 on sale online. Same console.", "Takes 5 minutes to compare prices. Always worth it."],
+      choices: [
+        { id: 'agree', label: '✅ Makes total sense', sublabel: '', cost: 0, minutes: 5, consequence: 'Riley: "You\'ll save hundreds over your lifetime doing this."', lesson: 'Price comparison takes 5 minutes and can save $60+ on a single item. Pricespy.co.nz is great for NZ.', finish: true },
+        { id: 'shrug', label: '🤷 Depends on the item', sublabel: '', cost: 0, minutes: 2, consequence: 'Sometimes in-store is worth it.', finish: true },
+      ],
+    }],
+    rewards: { xp: 4, message: '' },
+  },
+  {
+    id: 'l5p_second_job', pool: 'after_school', kind: 'side', priority: 30, name: 'Second job offer', emoji: '💼',
+    journalText: 'A neighbour asks if you\'d water their plants for $5 a day while they\'re away. Easy $25.',
+    storySetup: 'Mrs Chen from next door.', paths: SCHOOL, repeat: 'daily', levels: fromLevel(5),
+    window: { days: [0, 1], from: hm(15, 30), until: hm(18, 0) }, trigger: { type: 'time' },
+    steps: [{
+      id: 's1', place: 'home', waypoint: 'Talk to Mrs Chen', remote: true, speaker: 'Mum', npcId: 'mum',
+      lines: ["Mrs Chen next door asked if you'd water her plants while she's away this week. $5 a day, 10 minutes."],
+      choices: [
+        { id: 'yes', label: '✅ Yes please', sublabel: '+$5 per day', cost: 5, minutes: 10, consequence: 'Easy money and she keeps the plants alive.', effect: 'plant_job_taken', finish: true },
+        { id: 'no', label: '❌ Too busy', sublabel: '', cost: 0, minutes: 2, consequence: "Mrs Chen understands.", finish: true },
+      ],
+    }],
+    rewards: { xp: 4, message: '' },
+  },
+  {
+    id: 'l5p_savings_goal_check', pool: 'weekend', kind: 'side', priority: 25, name: 'Progress check', emoji: '📊',
+    journalText: 'Mum asks how close you are to your goal.',
+    storySetup: 'Mum: "How\'s the saving going?"', paths: SCHOOL, repeat: 'daily', levels: fromLevel(5),
+    window: { days: WEEKEND, from: hm(10, 0), until: hm(14, 0) }, trigger: { type: 'time' },
+    steps: [{
+      id: 's1', place: 'home', waypoint: 'Update Mum', remote: true, speaker: 'Mum', npcId: 'mum',
+      lines: ["How are you tracking? Sometimes just saying the number out loud keeps you on track."],
+      choices: [
+        { id: 'update', label: '📣 Tell her', sublabel: '', cost: 0, minutes: 5, consequence: 'It helps to say it out loud.', lesson: 'Telling someone your goal makes you 33% more likely to achieve it (commitment device).', finish: true },
+      ],
+    }],
+    rewards: { xp: 3, message: '' },
+  },
+  {
+    id: 'l5p_invest_lesson', pool: 'morning', kind: 'side', priority: 38, name: 'What is investing?', emoji: '📈',
+    journalText: 'Ms Patel asks the class what the difference is between saving and investing.',
+    storySetup: 'Ms Patel: "Today: saving vs investing."', paths: SCHOOL, repeat: 'daily', levels: fromLevel(5),
+    window: { days: [1, 2, 3], from: hm(9, 0), until: hm(14, 0) }, trigger: { type: 'time' },
+    steps: [{
+      id: 's1', place: 'school', waypoint: 'Pay attention', speaker: 'Ms Patel', npcId: 'teacher',
+      lines: ["Saving keeps your money safe — low risk, low return. Investing puts it to work — higher risk, higher potential return.", "The key question: when will you need the money? Short-term: save. Long-term: consider investing."],
+      choices: [
+        { id: 'listen', label: '✅ Got it', sublabel: '', cost: 0, minutes: 20, consequence: 'Good lesson.', lesson: 'Saving vs investing: saving is safe (bank, 4%); investing is riskier but can grow faster (shares, index funds). Time horizon is the key question.', finish: true },
+      ],
+    }],
+    rewards: { xp: 6, message: '' },
+  },
+];
+
+// ═══ LEVEL 6 — SMART MONEY ════════════════════════════════════════════════════
+/**
+ * Level 6 — "Smart Money": index funds, insurance basics, compound interest over 30 years,
+ * a realistic scenario where skipping insurance leads to a costly repair, and planning for a
+ * "future you" version of today's decisions.
+ */
+export const SCHOOL_L6: MissionDef[] = [
+  // Monday: pocket money + intro to compound interest demo
+  {
+    id: 'l6_compound', kind: 'main', priority: 200, name: 'The compound effect', emoji: '📈',
+    journalText: 'Ms Patel runs a 30-year compound interest demo. $1 a day saved at 7% = $37,000. The room goes quiet.',
+    storySetup: 'Ms Patel: "I want to show you something."',
+    paths: SCHOOL, repeat: 'weekly', levels: [6],
+    window: { days: [0], from: hm(9, 0), until: hm(15, 30) },
+    trigger: { type: 'time' },
+    requires: s => hasFlag(s, 'pocket_money_paid'),
+    steps: [{
+      id: 's1', place: 'school', waypoint: 'Watch the demo',
+      speaker: 'Ms Patel', npcId: 'teacher',
+      lines: ["If you save $1 a day from age 16 to 46 and earn 7% a year, you end up with over $37,000.", "Not from a lucky moment — from $1 a day, and time. The earlier you start, the less you need to save."],
+      choices: [
+        { id: 'amazed', label: '🤯 That\'s unreal', sublabel: '', cost: 0, minutes: 20, consequence: 'You actually stop and think about this one.', lesson: 'Compound interest: interest earns interest on itself. $1/day × 30 years × 7% = $37,000+. Starting at 16 vs 26 can mean $100,000 difference.', effect: 'wk_compound_seen', finish: true },
+        { id: 'sceptical', label: '🤔 Is that real?', sublabel: '', cost: 0, minutes: 20, consequence: 'Ms Patel shows you the maths. It\'s real.', lesson: 'Compound interest is real and powerful. The formula: A = P(1 + r/n)^(nt). Time is the biggest variable.', effect: 'wk_compound_seen', finish: true },
+      ],
+    }],
+    rewards: { xp: 12, message: 'Compound interest clicked.', flag: 'wk_compound_seen' },
+  },
+  // Tuesday: index funds
+  {
+    id: 'l6_index_fund', kind: 'main', priority: 175, name: 'What\'s an index fund?', emoji: '📊',
+    journalText: 'Riley\'s mum works at a bank and explained index funds at dinner. Riley tells you at lunch.',
+    storySetup: 'Riley: "Okay so my mum explained this thing..."',
+    paths: SCHOOL, repeat: 'weekly', levels: [6],
+    window: { days: [1], from: hm(12, 0), until: hm(18, 0) },
+    trigger: { type: 'time' },
+    steps: [{
+      id: 's1', place: 'home', waypoint: 'Listen to Riley', remote: true,
+      speaker: 'Riley', npcId: 'riley',
+      lines: ["Instead of buying one company's shares (risky), an index fund buys a tiny piece of hundreds of companies.", "It's way cheaper to run than a managed fund, and most managed funds don't beat it anyway. Mum says index funds are what most people should start with."],
+      choices: [
+        { id: 'interested', label: '✅ Makes sense', sublabel: '', cost: 0, minutes: 10, consequence: "Riley: 'Exactly. Simple, cheap, diversified.'", lesson: 'Index fund: a fund that tracks a market index (like the NZ Top 50). Low fees (~0.2%) and historically outperforms most active fund managers over 10+ years.', effect: 'wk_index_understood', finish: true },
+        { id: 'confused', label: '😕 Still confused', sublabel: '', cost: 0, minutes: 10, consequence: "Riley explains it a different way.", lesson: 'Think of an index fund like buying a little bit of every shop in a big mall, instead of betting all your money on just one.', finish: true },
+      ],
+    }],
+    rewards: { xp: 10, message: 'Index funds explained.' },
+  },
+  // Wednesday: insurance scenario — Jordan's bike gets stolen
+  {
+    id: 'l6_insurance', kind: 'main', priority: 170, name: 'Jordan\'s stolen bike', emoji: '🔒',
+    journalText: 'Jordan\'s $400 bike was stolen from school. No insurance. They\'re devastated.',
+    storySetup: 'Jordan\'s not at lunch.',
+    paths: SCHOOL, repeat: 'weekly', levels: [6],
+    window: { days: [2], from: hm(13, 0), until: hm(18, 0) },
+    trigger: { type: 'time' },
+    steps: [{
+      id: 's1', place: 'home', waypoint: 'Check on Jordan', remote: true,
+      speaker: 'Jordan', npcId: 'jordan',
+      lines: ["My bike's gone. Someone cut the lock at school. $400 bike and I had no insurance.", "Mum's furious. We can't afford to replace it. I have to catch the bus for the rest of the year."],
+      choices: [
+        { id: 'sympathise', label: '😢 That\'s awful', sublabel: '', cost: 0, minutes: 10, consequence: "Jordan: 'Yeah. Should have insured it. $4 a month would've covered it.'", lesson: 'Contents insurance can cover a bike. At $4–10/month, one claim pays for years of premiums. Risk transfer: you pay a small certain cost to avoid a big uncertain one.', effect: 'wk_insurance_lesson', finish: true },
+        { id: 'advice', label: '💡 You should insure it next time', sublabel: '', cost: 0, minutes: 10, consequence: "Jordan: 'I know. Too late now.'", lesson: 'Insurance is buying protection. Premium = you pay monthly; Excess = what you pay on a claim. Only insure things you can\'t afford to replace yourself.', effect: 'wk_insurance_lesson', finish: true },
+      ],
+    }],
+    rewards: { xp: 8, message: 'Insurance lesson landed.', flag: 'wk_insurance_lesson' },
+  },
+  // Thursday: "letter to future me" exercise
+  {
+    id: 'l6_future_me', kind: 'main', priority: 160, name: 'Letter to future you', emoji: '✉️',
+    journalText: 'Ms Patel\'s homework: write a letter to yourself at age 30 about money. What do you wish your 30-year-old self knew?',
+    storySetup: 'Ms Patel: "Tonight\'s homework is unusual."',
+    paths: SCHOOL, repeat: 'weekly', levels: [6],
+    window: { days: [3], from: hm(16, 0), until: hm(20, 0) },
+    trigger: { type: 'time' },
+    steps: [{
+      id: 's1', place: 'home', waypoint: 'Write the letter', remote: true,
+      speaker: 'Mum', npcId: 'mum',
+      lines: ["Ms Patel wants you to write to your future self. I did this when I was your age.", "I wrote that I wished I'd started KiwiSaver earlier and not bought so many things I didn't need."],
+      choices: [
+        { id: 'write_save', label: '✍️ Start saving early', sublabel: '', cost: 0, minutes: 20, consequence: "Good advice. 30-year-old you will thank you.", lesson: 'The best financial letter you can write to future-you: start KiwiSaver, avoid credit card debt, and spend on experiences not things.', effect: 'wk_future_letter_save', finish: true },
+        { id: 'write_enjoy', label: '✍️ Enjoy life more', sublabel: 'Balance matters', cost: 0, minutes: 20, consequence: "Balance matters too.", lesson: 'Frugality is a tool, not a goal. The goal is a life well lived — money is just the fuel.', finish: true },
+        { id: 'write_invest', label: '✍️ Invest earlier', sublabel: '', cost: 0, minutes: 20, consequence: "You know about compound interest now.", effect: 'wk_future_letter_invest', finish: true },
+      ],
+    }],
+    rewards: { xp: 10, message: 'Letter written.' },
+  },
+  // Sunday: full recap — the smart money week
+  {
+    id: 'l6_recap', kind: 'main', priority: 100, name: 'Sunday night with Mum', emoji: '📅',
+    journalText: 'Sunday — the big reflection with Mum on everything you\'ve learned this week.',
+    storySetup: 'Mum: "Sit down — I want to hear everything."',
+    paths: SCHOOL, repeat: 'weekly', levels: [6],
+    window: { days: [6], from: hm(17, 0), until: hm(21, 0) },
+    trigger: { type: 'time' },
+    steps: [{
+      id: 's1', place: 'home', waypoint: 'Big talk with Mum', remote: true,
+      speaker: 'Mum', npcId: 'mum',
+      lines: ["This week was different, wasn't it? Compound interest, index funds, insurance... it's a lot.", "But you get it now, right? This stuff isn't taught well enough. You're ahead of most adults."],
+      choices: [
+        { id: 'reflect', label: '💡 It clicked this week', sublabel: '', cost: 0, minutes: 20, consequence: 'Mum: "That\'s my kid."', effect: 'wk_l6_complete', finish: true },
+        { id: 'overwhelmed', label: '😵 A lot to take in', sublabel: '', cost: 0, minutes: 15, consequence: 'Mum: "That\'s okay. It took me years."', finish: true },
+      ],
+    }],
+    rewards: { xp: 15, message: 'Level 6 complete!', flag: 'wk_l6_complete' },
+  },
+];
+
+export const SCHOOL_L6_POOL: MissionDef[] = [
+  {
+    id: 'l6p_scam_email', pool: 'after_school', kind: 'side', priority: 45, name: 'Suspicious email', emoji: '🚨',
+    journalText: 'An email arrives: "You\'ve won $500! Click here to claim." It looks real.',
+    storySetup: 'You open your email and see it.', paths: SCHOOL, repeat: 'daily', levels: fromLevel(6),
+    window: { days: WK, from: hm(16, 0), until: hm(19, 0) }, trigger: { type: 'time' },
+    steps: [{
+      id: 's1', place: 'home', waypoint: 'Read the email', remote: true, speaker: 'Mum', npcId: 'mum',
+      lines: ["Ooh, what's this? '$500 prize — click to claim.' Does this look right to you?"],
+      choices: [
+        { id: 'delete', label: '🗑️ Delete it — it\'s a scam', sublabel: 'Good instinct', cost: 0, minutes: 2, consequence: "Correct. No one's giving away $500 for free.", lesson: 'Scam signs: unexpected prize, urgency, clicking links, providing personal info. If it seems too good to be true, it is.', finish: true },
+        { id: 'click', label: '😬 Click to see what happens', sublabel: 'Risky', cost: 0, minutes: 5, consequence: "Mum grabs the phone. It was a phishing page — you got out in time.", lesson: 'Phishing pages steal your login or card details. Never click "claim your prize" links in email.', finish: true },
+        { id: 'report', label: '📣 Report it', sublabel: 'Netsafe', cost: 0, minutes: 5, consequence: "You forward it to Netsafe. Good citizen.", lesson: 'netsafe.org.nz lets you report scams in NZ. It helps protect others.', effect: 'scam_reported', finish: true },
+      ],
+    }],
+    rewards: { xp: 5, message: 'Scam spotted.' },
+  },
+  {
+    id: 'l6p_credit_card', pool: 'morning', kind: 'side', priority: 38, name: 'Credit card offer', emoji: '💳',
+    journalText: 'A bank ad pops up: "Student credit card — $500 limit, 19.9% interest." Ms Patel uses it as a teaching moment.',
+    storySetup: 'Ms Patel shows the class an ad.', paths: SCHOOL, repeat: 'daily', levels: fromLevel(6),
+    window: { days: [0, 1, 2, 3, 4], from: hm(9, 0), until: hm(15, 30) }, trigger: { type: 'time' },
+    steps: [{
+      id: 's1', place: 'school', waypoint: 'Listen to Ms Patel', speaker: 'Ms Patel', npcId: 'teacher',
+      lines: ["This card charges 19.9% interest a year. If you spend $500 and only pay the minimum, you'd pay it back over 3 years and pay $175 in interest on top.", "Credit cards aren't evil — but they're expensive if you carry a balance."],
+      choices: [
+        { id: 'understand', label: '✅ Got it', sublabel: '', cost: 0, minutes: 20, consequence: 'Good.', lesson: '19.9% APR: borrow $500, carry a balance, it costs ~$100/year. Pay it off every month and it\'s free. The danger is minimum payments.', finish: true },
+      ],
+    }],
+    rewards: { xp: 5, message: '' },
+  },
+  {
+    id: 'l6p_buy_shares', pool: 'after_school', kind: 'side', priority: 32, name: 'Jordan buys shares', emoji: '📈',
+    journalText: 'Jordan bought $20 of a meme stock. It\'s down 40% in a day.',
+    storySetup: 'Jordan: "I thought I\'d be rich by now."', paths: SCHOOL, repeat: 'daily', levels: fromLevel(6),
+    window: { days: WK, from: hm(13, 0), until: hm(16, 0) }, trigger: { type: 'time' },
+    steps: [{
+      id: 's1', place: 'home', waypoint: 'Talk to Jordan', remote: true, speaker: 'Jordan', npcId: 'jordan',
+      lines: ["I bought this stock because TikTok said it would 10x. Lost $8 in one day. Down 40%.", "Maybe the index fund thing is smarter."],
+      choices: [
+        { id: 'sympathise', label: '😬 Yeah… TikTok tips', sublabel: '', cost: 0, minutes: 10, consequence: 'You both agree: index funds over tips.', lesson: 'Social media stock tips: almost always move the stock after the influencer already sold. Diversification beats speculation.', finish: true },
+      ],
+    }],
+    rewards: { xp: 4, message: '' },
+  },
+  {
+    id: 'l6p_emergency_fund', pool: 'morning', kind: 'side', priority: 40, name: 'Emergency fund', emoji: '🆘',
+    journalText: 'Ms Patel asks: "What would you do if your phone broke tomorrow — do you have a backup plan?"',
+    storySetup: 'Ms Patel: "What\'s your plan B?"', paths: SCHOOL, repeat: 'daily', levels: fromLevel(6),
+    window: { days: [0, 1, 2, 3, 4], from: hm(9, 0), until: hm(15, 30) }, trigger: { type: 'time' },
+    steps: [{
+      id: 's1', place: 'school', waypoint: 'Class discussion', speaker: 'Ms Patel', npcId: 'teacher',
+      lines: ["An emergency fund is money you don't touch unless something breaks or you lose income.", "Adults should have 3 months of expenses saved. Your version: don't let your savings go below $50 — that's your buffer."],
+      choices: [
+        { id: 'set_buffer', label: '✅ Set my buffer to $50', sublabel: 'Keep $50 untouched', cost: 0, minutes: 5, consequence: 'Good rule.', lesson: 'Emergency fund: 3 months of expenses for adults. For you: keep $50 untouched. It\'s your financial airbag.', effect: 'emergency_buffer_set', finish: true },
+        { id: 'skip', label: '🤷 I\'ll figure it out', sublabel: '', cost: 0, minutes: 5, consequence: 'You close the app.', finish: true },
+      ],
+    }],
+    rewards: { xp: 6, message: 'Buffer set.' },
+  },
+];
