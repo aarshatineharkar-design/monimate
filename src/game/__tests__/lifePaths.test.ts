@@ -21,6 +21,10 @@ function fakeSupabase() {
   const rows = new Map<string, { user_id: string; life_path: string; game_minutes: number; state: { finance: { accounts: { cash: number } } }; updated_at: string }>();
   const client = {
     rows,
+    auth: {
+      async getSession() { return { data: { session: { user: { id: 'u1' } } } }; },
+      async refreshSession() { return { data: { session: { user: { id: 'u1' } } } }; },
+    },
     from() {
       const filters: Record<string, string> = {};
       let deleting = false;

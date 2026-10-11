@@ -16,6 +16,10 @@ function safeNext(raw: FormDataEntryValue | null): string {
   const next = typeof raw === 'string' ? raw : '';
   return next.startsWith('/') && !next.startsWith('//') ? next : '/game';
 }
+/** Mark the arrival as a fresh sign-in, so the game starts this play session (see GameGate). */
+function withFresh(path: string): string {
+  return `${path}${path.includes('?') ? '&' : '?'}fresh=1`;
+}
 
 export async function signIn(_prev: AuthFormState, formData: FormData): Promise<AuthFormState> {
   const email = String(formData.get('email') ?? '').trim().toLowerCase();
@@ -30,7 +34,7 @@ export async function signIn(_prev: AuthFormState, formData: FormData): Promise<
     }
     return { error: 'Wrong email or password.' };
   }
-  redirect(safeNext(formData.get('next')));
+  redirect(withFresh(safeNext(formData.get('next'))));
 }
 
 export async function signUp(_prev: AuthFormState, formData: FormData): Promise<AuthFormState> {
@@ -48,7 +52,7 @@ export async function signUp(_prev: AuthFormState, formData: FormData): Promise<
     password,
     options: {
       data: { username },                              // read by the handle_new_user() trigger
-      emailRedirectTo: `${origin}/auth/confirm?next=/game`,
+      emailRedirectTo: `${origin}/auth/confirm`,
     },
   });
   if (error) {
@@ -63,9 +67,13 @@ export async function signUp(_prev: AuthFormState, formData: FormData): Promise<
     return { error: 'That email already has an account — switch to CONTINUE and sign in.' };
   }
 
-  // If "Confirm email" is OFF in Supabase, signUp returns a live session: go straight in.
-  if (data.session) redirect('/game');
-  return { info: `Nearly there — we sent a confirmation link to ${email}. Check spam too.`, resendTo: email };
+  // Every new player confirms their email and then signs in. (If "Confirm email" is switched off in
+  // Supabase, signUp hands back a live session — sign it out so the flow is the same either way.)
+  if (data.session) {
+    await supabase.auth.signOut();
+    return { info: 'Account created! Sign in below to start playing.' };
+  }
+  return { info: `Nearly there — we sent a confirmation link to ${email}. Click it, then sign in here. (Check spam too.)`, resendTo: email };
 }
 
 export async function resendConfirmation(_prev: AuthFormState, formData: FormData): Promise<AuthFormState> {
@@ -76,7 +84,7 @@ export async function resendConfirmation(_prev: AuthFormState, formData: FormDat
   const { error } = await supabase.auth.resend({
     type: 'signup',
     email,
-    options: { emailRedirectTo: `${origin}/auth/confirm?next=/game` },
+    options: { emailRedirectTo: `${origin}/auth/confirm` },
   });
   if (error) {
     return {

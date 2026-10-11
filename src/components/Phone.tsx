@@ -15,9 +15,10 @@ import { ACHIEVEMENTS, isUnlocked } from '../lib/achievements';
 import { DAY_NAMES, formatTime, parts, at, MIN_PER_DAY } from '../lib/clock';
 import { PLACES, isOpen, closedReason, distanceMetres, doorTile, pxToTile, BUS_STOPS, nextBusAt } from '../lib/world';
 import { askMentorChat } from '../lib/mentor';
+import { FACT_KIND_LABEL } from '../lib/content/moneyFacts';
 import { speakLine } from '../lib/tts';
 
-export type PhoneApp = 'home' | 'messages' | 'bank' | 'goals' | 'today' | 'calendar' | 'map' | 'contacts' | 'kai' | 'settings';
+export type PhoneApp = 'home' | 'messages' | 'bank' | 'goals' | 'today' | 'calendar' | 'map' | 'contacts' | 'notes' | 'kai' | 'settings';
 
 const APPS: { id: Exclude<PhoneApp, 'home'>; icon: string; name: string; color: string }[] = [
   { id: 'messages', icon: '💬', name: 'Messages', color: '#3fb950' },
@@ -27,6 +28,7 @@ const APPS: { id: Exclude<PhoneApp, 'home'>; icon: string; name: string; color: 
   { id: 'calendar', icon: '📅', name: 'Calendar', color: '#f78166' },
   { id: 'map', icon: '🗺️', name: 'Map', color: '#56d4dd' },
   { id: 'contacts', icon: '❤️', name: 'Friends', color: '#ff7b9c' },
+  { id: 'notes', icon: '📚', name: 'Money Notes', color: '#e3b341' },
   { id: 'kai', icon: '🧑‍🏫', name: 'Kai', color: '#79c0ff' },
   { id: 'settings', icon: '⚙️', name: 'Settings', color: '#8b949e' },
 ];
@@ -86,6 +88,7 @@ export default function Phone(props: PhoneProps) {
                 {app === 'calendar' && <CalendarApp store={store} />}
                 {app === 'map' && <MapApp store={store} />}
                 {app === 'contacts' && <ContactsApp store={store} />}
+                {app === 'notes' && <NotesApp store={store} />}
                 {app === 'kai' && <KaiApp store={store} voiceOn={props.voiceOn} />}
                 {app === 'settings' && <SettingsApp {...props} />}
               </div>
@@ -134,58 +137,149 @@ function HomeScreen({ store, inboxCount, open }: { store: GameStore; inboxCount:
 }
 
 // ── Messages ────────────────────────────────────────────────────────────────
+/** A messaging app like the real ones: a list of conversations (one per person), then a thread
+ *  with bubbles, day separators, "typing…" when something new arrives, and quick replies. */
 function MessagesApp({ store, voiceOn }: { store: GameStore; voiceOn: boolean }) {
-  const inbox = store.phoneInbox();
-  const history = store.messageHistory();
-  const [justReplied, setJustReplied] = useState<string | null>(null);
-  const shownAt = useRef(performance.now());
-  const first = inbox[0];
-  useEffect(() => {
-    if (first && voiceOn) speakLine(first.step.speaker, first.step.lines.join(' '));
-    shownAt.current = performance.now();
-  }, [first?.def.id, first?.rt.stepIndex, voiceOn]); // eslint-disable-line react-hooks/exhaustive-deps
-
-  const reply = (missionId: string, c: MissionChoice) => {
-    if (performance.now() - shownAt.current < 350) return; // no accidental taps as a message arrives
-    if (store.applyChoice(missionId, c)) setJustReplied(c.consequence);
-  };
+  const threads = store.chatThreads();
+  const [open, setOpen] = useState<string | null>(null);
+  // Jump straight into the only conversation waiting on a reply.
+  const waiting = threads.filter(t => t.unread > 0);
+  const contact = open ?? (waiting.length === 1 && threads.length === 1 ? waiting[0].contact : null);
+  if (contact) return <ChatThread store={store} contact={contact} voiceOn={voiceOn} onBack={() => setOpen(null)} />;
   return (
     <div>
-      {justReplied && <div style={st.consequence}>{justReplied}</div>}
-      {inbox.length === 0 && <div style={st.empty}>No new messages.</div>}
-      {inbox.map(({ def, step }) => (
-        <div key={def.id} style={st.thread}>
-          <div style={st.from}><span style={st.avatar}>{avatarFor(step.speaker, def.emoji)}</span> {step.speaker ?? def.name}</div>
-          {step.lines.map((l, i) => <div key={i} style={st.bubble}>{l}</div>)}
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 6, marginTop: 8 }}>
-            {step.choices!.map(c => {
-              const affordable = c.cost >= 0 || store.canAfford(-c.cost);
-              return (
-                <button key={c.id} disabled={!affordable} onClick={() => reply(def.id, c)}
-                  style={{ ...st.replyBtn, ...(affordable ? {} : { opacity: 0.45, cursor: 'not-allowed' }) }}>
-                  <div>{c.label}{!affordable && <span style={{ color: '#ff8080' }}> — can't afford</span>}</div>
-                  {c.sublabel && <div style={{ fontSize: 10, opacity: 0.7 }}>{c.sublabel}</div>}
-                </button>
-              );
-            })}
-          </div>
-        </div>
-      ))}
-      {history.length > 0 && <div style={st.section}>EARLIER TODAY</div>}
-      {history.map(h => (
-        <div key={h.id} style={{ ...st.thread, opacity: 0.75 }}>
-          <div style={st.from}><span style={st.avatar}>{avatarFor(h.from, h.emoji)}</span> {h.from} <span style={{ opacity: 0.6, fontWeight: 400 }}>· {formatTime(h.at)}</span></div>
-          <div style={st.bubble}>{h.text}</div>
-          {h.reply && <div style={{ ...st.bubble, ...st.mine }}>{h.reply}</div>}
-          {h.result && <div style={{ fontSize: 11, opacity: 0.7, marginTop: 4 }}>{h.result}</div>}
-        </div>
+      {threads.length === 0 && <div style={st.empty}>No messages yet.</div>}
+      {threads.map(t => (
+        <button key={t.contact} style={st.convRow} onClick={() => setOpen(t.contact)}>
+          <span style={st.convAvatar}>{avatarFor(t.contact, '💬')}</span>
+          <span style={{ flex: 1, minWidth: 0, textAlign: 'left' }}>
+            <span style={{ display: 'flex', justifyContent: 'space-between', gap: 6 }}>
+              <b style={{ fontSize: 13 }}>{t.contact}</b>
+              <span style={{ fontSize: 10, opacity: 0.6, whiteSpace: 'nowrap' }}>{whenLabel(store, t.last.at)}</span>
+            </span>
+            <span style={{ display: 'flex', justifyContent: 'space-between', gap: 6, alignItems: 'center' }}>
+              <span style={{ ...st.preview, fontWeight: t.unread ? 700 : 400, opacity: t.unread ? 1 : 0.65 }}>
+                {t.last.me ? 'You: ' : ''}{t.last.text}
+              </span>
+              {t.unread > 0 && <span style={st.unread}>{t.unread}</span>}
+            </span>
+          </span>
+        </button>
       ))}
     </div>
   );
 }
+
+function ChatThread({ store, contact, voiceOn, onBack }: { store: GameStore; contact: string; voiceOn: boolean; onBack: () => void }) {
+  const entries = store.chatWith(contact);
+  const pending = store.pendingFrom(contact);
+  const ask = pending[0];
+  const scroller = useRef<HTMLDivElement>(null);
+  const shownAt = useRef(0);
+  // "typing…" for a moment when a new message from them lands, then it appears
+  const [typing, setTyping] = useState(false);
+  const lastCount = useRef(entries.length);
+  useEffect(() => {
+    const grew = entries.length > lastCount.current;
+    const lastIsTheirs = entries.length > 0 && !entries[entries.length - 1].me && !entries[entries.length - 1].note;
+    lastCount.current = entries.length;
+    if (!grew || !lastIsTheirs) return;
+    setTyping(true);
+    const t = setTimeout(() => setTyping(false), 900);
+    return () => clearTimeout(t);
+  }, [entries.length]); // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => { scroller.current?.scrollTo({ top: scroller.current.scrollHeight, behavior: 'smooth' }); }, [entries.length, typing, ask?.def.id]);
+  useEffect(() => {
+    if (ask && voiceOn) speakLine(ask.step.speaker, ask.step.lines.join(' '));
+    shownAt.current = performance.now();
+  }, [ask?.def.id, ask?.rt.stepIndex, voiceOn]); // eslint-disable-line react-hooks/exhaustive-deps
+  const reply = (missionId: string, c: MissionChoice) => {
+    // eslint-disable-next-line react-hooks/purity -- runs on tap, not during render
+    if (performance.now() - shownAt.current < 350) return; // no accidental taps as a message arrives
+    store.applyChoice(missionId, c);
+  };
+  const visible = typing ? entries.slice(0, -1) : entries;
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
+      <style>{'@keyframes mmBlink { 0%,100% { opacity: .25 } 50% { opacity: 1 } } .mm-typing { animation: mmBlink 1s ease-in-out infinite; letter-spacing: 2px }'}</style>
+      <div style={st.threadBar}>
+        <button style={st.threadBack} onClick={onBack}>‹ Chats</button>
+        <span style={st.convAvatar}>{avatarFor(contact, '💬')}</span>
+        <b style={{ fontSize: 13 }}>{contact}</b>
+      </div>
+      <div ref={scroller} style={st.threadScroll}>
+        {visible.map((e, i) => {
+          const day = parts(e.at).day;
+          const sep = i === 0 || day !== parts(visible[i - 1].at).day;
+          return (
+            <div key={i}>
+              {sep && <div style={st.daySep}>{dayLabel(store, e.at)}</div>}
+              {e.note
+                ? <div style={st.noteLine}>{e.text}</div>
+                : <div style={{ display: 'flex', justifyContent: e.me ? 'flex-end' : 'flex-start' }}>
+                    <div style={{ ...st.bubble, ...(e.me ? st.mine : {}) }}>
+                      {e.text}
+                      <span style={st.stamp}>{formatTime(e.at)}{e.me ? ' ✓✓' : ''}</span>
+                    </div>
+                  </div>}
+            </div>
+          );
+        })}
+        {typing && <div style={{ ...st.bubble, width: 46 }}><span className="mm-typing">•••</span></div>}
+      </div>
+      {ask && !typing && (
+        <div style={st.replyTray}>
+          <div style={{ fontSize: 10, opacity: 0.6, marginBottom: 4 }}>REPLY</div>
+          {ask.step.choices!.map(c => {
+            const affordable = c.cost >= 0 || store.canAfford(-c.cost);
+            return (
+              <button key={c.id} disabled={!affordable} onClick={() => reply(ask.def.id, c)}
+                style={{ ...st.replyChip, ...(affordable ? {} : { opacity: 0.45, cursor: 'not-allowed' }) }}>
+                <div>{c.label}{!affordable && <span style={{ color: '#ff8080' }}> — can&apos;t afford</span>}</div>
+                {c.sublabel && <div style={{ fontSize: 10, opacity: 0.7 }}>{c.sublabel}</div>}
+              </button>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+const WEEKDAY = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday'];
+function dayLabel(store: GameStore, at: number): string {
+  const today = parts(store.state.minutes).day, d = parts(at).day;
+  return d === today ? 'Today' : d === today - 1 ? 'Yesterday' : WEEKDAY[parts(at).dayOfWeek];
+}
+function whenLabel(store: GameStore, at: number): string {
+  return parts(at).day === parts(store.state.minutes).day ? formatTime(at) : dayLabel(store, at).slice(0, 3);
+}
 function avatarFor(speaker: string | undefined, fallback: string): string {
-  const map: Record<string, string> = { Mum: '👩', Jordan: '🧢', Riley: '🎒', 'Ms Patel': '👩‍🏫', 'Mr Lee': '🧔', Grandma: '👵', 'Mrs Kaur': '👵🏽', Library: '📕', 'Route 1': '🚌', StreamBox: '📺', ShopNow: '🛍️', 'Class chat': '💬', Goals: '🎯', 'Coach Rangi': '🏀', Mobile: '📶', 'Unknown number': '❓', 'Pixel Racer': '🏎️', Council: '♻️', Buyer: '📦', Neighbour: '🏡', Arjun: '📐', 'Post Office': '📮', FoodNow: '🛵', StudyLink: '🎓', Sam: '🧑', Mei: '👩‍🎓', 'Dr Hughes': '👨‍🏫', Leah: '☕', 'Student Job Search': '💼', Moodle: '💻', 'Clubs Council': '🎪', 'Psych Dept': '🧪', 'Class group': '💬', Alarm: '⏰', 'Your bank': '🏦', PayLater: '💳', 'Your list': '🛒', Bookshop: '📕', 'Student Café': '🍱' };
+  const map: Record<string, string> = { Mum: '👩', Jordan: '🧢', Riley: '🎒', 'Ms Patel': '👩‍🏫', 'Mr Lee': '🧔', Grandma: '👵', 'Mrs Kaur': '👵🏽', Library: '📕', 'Route 1': '🚌', StreamBox: '📺', ShopNow: '🛍️', 'Class chat': '💬', Goals: '🎯', 'Coach Rangi': '🏀', Mobile: '📶', 'Unknown number': '❓', 'Pixel Racer': '🏎️', Council: '♻️', Buyer: '📦', Neighbour: '🏡', Arjun: '📐', 'Post Office': '📮', FoodNow: '🛵', StudyLink: '🎓', Sam: '🧑', Mei: '👩‍🎓', 'Dr Hughes': '👨‍🏫', Leah: '☕', 'Student Job Search': '💼', Moodle: '💻', 'Clubs Council': '🎪', 'Psych Dept': '🧪', 'Class group': '💬', Alarm: '⏰', 'Your bank': '🏦', PayLater: '💳', 'Your list': '🛒', Bookshop: '📕', 'Student Café': '🍱', Reminders: '📝', Grandad: '👴', 'Mr Tipene': '🚗', Dairy: '🥛', Mere: '📱', School: '🏫', 'Book-fair seller': '📚', 'Mrs Ngata': '📚', 'Officer Tane': '👮', Hemi: '📮', 'Council worker': '♻️', 'Dr Lin': '🧪' };
   return (speaker && map[speaker]) || fallback;
+}
+
+// ── Money Notes: every end-of-day money card you've met ─────────────────────
+function NotesApp({ store }: { store: GameStore }) {
+  const facts = store.factsLearned().slice().reverse();
+  const [open, setOpen] = useState<string | null>(null);
+  return (
+    <div>
+      <div style={{ fontSize: 11, opacity: 0.7, marginBottom: 8 }}>A new card arrives at the end of every day. {facts.length} learned so far.</div>
+      {facts.length === 0 && <div style={st.empty}>Finish your first day to get your first money card.</div>}
+      {facts.map(f => {
+        const k = FACT_KIND_LABEL[f.kind];
+        const isOpen = open === f.id;
+        return (
+          <button key={f.id} onClick={() => setOpen(isOpen ? null : f.id)} style={{ ...st.thread, display: 'block', width: '100%', textAlign: 'left', color: '#fff', cursor: 'pointer', borderColor: isOpen ? k.color : '#2a2d36' }}>
+            <div style={{ fontSize: 9, letterSpacing: 1, color: k.color }}>{k.icon} {k.label}</div>
+            <div style={{ fontWeight: 700, fontSize: 13, marginTop: 2 }}>{f.title}</div>
+            {isOpen && <div style={{ fontSize: 12, lineHeight: 1.45, marginTop: 6, opacity: 0.9 }}>{f.body}</div>}
+            {isOpen && f.example && <div style={{ fontSize: 11, marginTop: 6, padding: '6px 8px', background: '#0d1117', borderRadius: 6 }}>{f.example}</div>}
+          </button>
+        );
+      })}
+    </div>
+  );
 }
 
 // ── Bank ────────────────────────────────────────────────────────────────────
@@ -230,7 +324,7 @@ function BankApp({ store }: { store: GameStore }) {
       </div>
       {plan && (
         <>
-          <div style={st.section}>THIS WEEK'S BUDGET</div>
+          <div style={st.section}>THIS WEEK&apos;S BUDGET</div>
           {([['food', '🍎', 'Food'], ['transport', '🚌', 'Transport'], ['fun', '🎮', 'Fun & shopping'], ['save', '🐷', 'Saved']] as const).map(([k, icon, label]) => {
             const used = Math.max(0, act[k]), cap = Math.max(plan[k], 0.01), over = k !== 'save' && used > plan[k] + 0.5;
             const done = k === 'save' && used >= plan[k];
@@ -289,13 +383,13 @@ function GoalsApp({ store }: { store: GameStore }) {
     <div>
       {g ? (
         <div style={{ ...st.bigCard, borderColor: g.achieved ? '#3fb950' : '#f0c038' }}>
-          <div style={{ fontSize: 11, opacity: 0.7 }}>THIS WEEK'S GOAL</div>
+          <div style={{ fontSize: 11, opacity: 0.7 }}>THIS WEEK&apos;S GOAL</div>
           <div style={{ fontSize: 18, fontWeight: 700, margin: '4px 0' }}>{g.def.emoji} {g.def.name}</div>
           <div style={st.barTrack}><div style={{ ...st.barFill, width: `${g.progress * 100}%`, background: g.achieved ? '#3fb950' : '#f0c038' }} /></div>
           <div style={{ fontSize: 12, marginTop: 6 }}>{g.achieved ? '✓ Done!' : g.detail}</div>
           <div style={{ fontSize: 11, opacity: 0.7, marginTop: 8 }}>{store.rules.goalTips[g.def.id]}</div>
         </div>
-      ) : <div style={st.empty}>You'll pick a goal on Monday morning.</div>}
+      ) : <div style={st.empty}>You&apos;ll pick a goal on Monday morning.</div>}
       <div style={st.section}>ACHIEVEMENTS — {unlocked}/{ACHIEVEMENTS.length}</div>
       {ACHIEVEMENTS.map(a => {
         const on = isUnlocked(s, a.id);
@@ -494,6 +588,18 @@ const st: Record<string, React.CSSProperties> = {
   avatar: { width: 24, height: 24, borderRadius: 12, background: '#2a2d36', display: 'inline-flex', alignItems: 'center', justifyContent: 'center' },
   bubble: { background: '#2a2d36', borderRadius: '12px 12px 12px 4px', padding: '7px 10px', fontSize: 12, marginBottom: 5, lineHeight: 1.35, maxWidth: '88%' },
   mine: { background: '#1f6feb', marginLeft: 'auto', borderRadius: '12px 12px 4px 12px' },
+  convRow: { display: 'flex', gap: 10, alignItems: 'center', width: '100%', background: 'transparent', border: 'none', borderBottom: '1px solid #21262d', color: '#fff', padding: '10px 6px', cursor: 'pointer', fontFamily: 'monospace' },
+  convAvatar: { width: 34, height: 34, borderRadius: 17, background: '#21262d', display: 'inline-flex', alignItems: 'center', justifyContent: 'center', fontSize: 18, flexShrink: 0 },
+  preview: { fontSize: 11, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', display: 'block', maxWidth: 200 },
+  unread: { background: '#3fb950', color: '#0d1117', borderRadius: 10, fontSize: 10, fontWeight: 700, padding: '1px 7px' },
+  threadBar: { display: 'flex', alignItems: 'center', gap: 8, padding: '4px 2px 8px', borderBottom: '1px solid #21262d' },
+  threadBack: { background: 'none', border: 'none', color: '#58a6ff', fontFamily: 'monospace', fontSize: 12, cursor: 'pointer', padding: 0 },
+  threadScroll: { flex: 1, overflowY: 'auto', padding: '8px 2px' },
+  daySep: { textAlign: 'center', fontSize: 10, opacity: 0.55, margin: '8px 0 6px' },
+  noteLine: { textAlign: 'center', fontSize: 10, fontStyle: 'italic', opacity: 0.6, margin: '2px 12px 8px' },
+  stamp: { display: 'block', fontSize: 9, opacity: 0.5, textAlign: 'right', marginTop: 2 },
+  replyTray: { borderTop: '1px solid #21262d', paddingTop: 8, display: 'flex', flexDirection: 'column', gap: 6 },
+  replyChip: { textAlign: 'left', background: '#1c2440', border: '1px solid #3a4a7a', borderRadius: 14, color: '#fff', padding: '7px 11px', cursor: 'pointer', fontFamily: 'monospace', fontSize: 12 },
   replyBtn: { textAlign: 'left', background: '#1c2440', border: '1px solid #3a4a7a', borderRadius: 10, color: '#fff', padding: '8px 10px', cursor: 'pointer', fontFamily: 'monospace', fontSize: 12 },
   consequence: { background: '#12351c', border: '1px solid #3fb950', borderRadius: 10, padding: '8px 10px', fontSize: 12, marginBottom: 10 },
   empty: { opacity: 0.6, fontSize: 12, textAlign: 'center', padding: 16 },

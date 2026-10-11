@@ -71,6 +71,10 @@ export interface DayRecord {
   decisions?: DecisionRecord[];
 }
 
+/** One line in a phone conversation. `me` = something the player sent; `note` = a status line
+ *  ("No reply", what happened) rather than a message. */
+export interface ChatEntry { contact: string; at: number; text: string; me?: boolean; note?: boolean }
+
 /** A hands-on errand: walk to each point (in order for a walk, any order for a pick-up). */
 export interface ErrandActivity {
   missionId: string;
@@ -177,6 +181,10 @@ export interface GameState {
   /** A hands-on errand in progress — walking Biscuit round the park, picking up litter. Optional so
    *  older saves load. */
   errand?: ErrandActivity;
+  /** Phone conversations, oldest first (capped). Optional so older saves load. */
+  chatLog?: ChatEntry[];
+  /** Which incoming phone messages are already in the log (mission:step:day). */
+  chatLogged?: string[];
   weekDays: DayRecord[];
   weeks: WeekRecord[];
   lifePath: 'school' | 'university' | 'international' | 'working';

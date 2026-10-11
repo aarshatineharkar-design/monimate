@@ -44,7 +44,7 @@ import {
 import type { MissionStep } from './missions';
 import { DAILY_POOLS } from './dailyMissions';
 import type {
-  ActivityTag, DayRecord, DecisionRecord, GameEvent, GameState, MissionRuntime, NpcRuntime, PlaceId, SceneId, WeekRecord,
+  ActivityTag, ChatEntry, DayRecord, DecisionRecord, GameEvent, GameState, MissionRuntime, NpcRuntime, PlaceId, SceneId, WeekRecord,
 } from './types';
 import { ACHIEVEMENTS, checkAchievements } from './achievements';
 import { LIFE_EVENTS, rollLifeEvent } from './lifeEvents';
@@ -55,6 +55,7 @@ import {
   ERRAND_HOSTS, DOG_WALK_ROUTE, LITTER_SPOTS,
 } from './world';
 import { HOME_JOBS, JOB_BONUS, type HomeJob } from './content/homeJobs';
+import { factsFor, MONEY_FACTS, type MoneyFact } from './content/moneyFacts';
 import { verdictFor } from './content/verdicts';
 import type { ShopItemDef } from './world';
 
@@ -150,6 +151,11 @@ export interface GoalStatus {
 
 /** Flags that describe one week. Cleared when the next week's pocket money arrives, so last
  *  week's arcade trip can't count toward this week's goal. */
+/** Who a phone message is from, as a contact. Notes-to-self ("You", "Your list") share one thread. */
+export function contactName(speaker: string): string {
+  return speaker === 'You' || speaker === 'Your list' ? 'Reminders' : speaker;
+}
+
 const fmtHm = (m: number) => { const h = Math.floor(m / 60), mm = m % 60; return `${h % 12 === 0 ? 12 : h % 12}:${String(mm).padStart(2, '0')} ${h >= 12 ? 'PM' : 'AM'}`; };
 
 const WEEK_FLAG_PREFIXES = [
@@ -187,6 +193,8 @@ export class GameStore {
   toastQueue: { id: string; name: string; emoji: string }[] = [];
   /** summaries waiting to be shown */
   pendingDaySummary: DayRecord | null = null;
+  /** The "Did you know?" money card for the day that just ended (shown after the day recap). */
+  pendingFact: MoneyFact | null = null;
   pendingWeekSummary: WeekRecord | null = null;
   /** Set once, when "Made It to Friday" completes — real numbers pulled from state at that moment,
    *  not scripted text, so the recap reflects whatever the player actually decided all week. */
@@ -411,6 +419,7 @@ export class GameStore {
     this.updateNpcTargets();
     this.economyOnMinute(p);
     this.pitchJobOnMinute(p);
+    this.logIncomingMessages();
 
     if (p.minuteOfDay === PASS_OUT_AT && !s.sleeping) this.sleep(true);
   }
@@ -1291,6 +1300,17 @@ export class GameStore {
   }
 
   /** The closest NPC in talking range: outdoors a visible NPC within ~1.4 tiles, indoors within ~1.8. */
+  /** How far (in tiles) this person is from you, or Infinity if they are not where you are. */
+  npcDistanceTiles(npcId: string): number {
+    const s = this.state, pl = s.player;
+    if (pl.scene === 'outdoor') {
+      const npc = s.npcs[npcId];
+      return npc && npc.visible ? Math.hypot(npc.x - pl.x, npc.y - pl.y) / TILE_PX : Infinity;
+    }
+    const e = this.interiorNpcs().find(x => x.npc.id === npcId);
+    return e ? Math.hypot(e.x - pl.x, e.y - pl.y) / INTERIOR_TILE_PX : Infinity;
+  }
+
   npcNearPlayer(): NpcRuntime | null {
     const s = this.state, pl = s.player;
     let best: NpcRuntime | null = null, bestD = Infinity;
@@ -1581,6 +1601,76 @@ export class GameStore {
     this.touch(true);
   }
 
+  // ══ MONEY CARDS ═══════════════════════════════════════════════════════════
+  /** The next card for this path and level: one you haven't seen, in the order they build on each
+   *  other; once you've seen them all, a refresher. Marks it seen. */
+  private nextFact(): MoneyFact | null {
+    const s = this.state;
+    const pool = factsFor(s.lifePath, s.level ?? 1);
+    if (!pool.length) return null;
+    const fresh = pool.find(f => !s.world.flags.includes(`fact:${f.id}`));
+    const pick = fresh ?? pool[Math.floor(this.dayRandom('fact')() * pool.length)];
+    if (!s.world.flags.includes(`fact:${pick.id}`)) s.world.flags.push(`fact:${pick.id}`);
+    return pick;
+  }
+  dismissFact() { this.pendingFact = null; this.touch(true); }
+  /** Every card you've met, oldest first — the phone's Money Notes. */
+  factsLearned(): MoneyFact[] {
+    const seen = this.state.world.flags.filter(f => f.startsWith('fact:')).map(f => f.slice(5));
+    return seen.map(id => MONEY_FACTS.find(f => f.id === id)).filter((f): f is MoneyFact => !!f);
+  }
+
+  // ══ PHONE CONVERSATIONS ═══════════════════════════════════════════════════
+  private pushChat(e: ChatEntry) {
+    const log = (this.state.chatLog ??= []);
+    log.push(e);
+    if (log.length > 400) log.splice(0, log.length - 400);
+  }
+  /** Put newly arrived phone messages into their sender's conversation (once each). */
+  private logIncomingMessages() {
+    const s = this.state, day = parts(s.minutes).day;
+    const seen = (s.chatLogged ??= []);
+    for (const m of this.phoneInbox()) {
+      const key = `${m.def.id}:${m.rt.stepIndex}:${day}`;
+      if (seen.includes(key)) continue;
+      seen.push(key);
+      const contact = contactName(m.step.speaker ?? m.def.name);
+      for (const line of m.step.lines) this.pushChat({ contact, at: s.minutes, text: line });
+    }
+    if (seen.length > 200) seen.splice(0, seen.length - 200);
+  }
+  /** Your reply, then their answer (or what happened). */
+  private logReply(contact: string, choice: MissionChoice) {
+    const at = this.state.minutes;
+    this.pushChat({ contact, at, text: choice.label.replace(/\s*\(.*\)$/, ''), me: true });
+    const quoted = /^([^:"]{2,24}):\s*["“](.+)["”]\s*$/.exec(choice.consequence);
+    if (quoted && contactName(quoted[1].trim()) === contact) this.pushChat({ contact, at, text: quoted[2] });
+    else if (choice.consequence) this.pushChat({ contact, at, text: choice.consequence, note: true });
+  }
+  /** Everyone you have a conversation with, most recent first, with unanswered messages counted. */
+  chatThreads(): { contact: string; last: ChatEntry; unread: number }[] {
+    this.logIncomingMessages();
+    const log = this.state.chatLog ?? [];
+    const latest = new Map<string, ChatEntry>();
+    for (const e of log) latest.set(e.contact, e);
+    const pending = new Map<string, number>();
+    for (const m of this.phoneInbox()) {
+      const c = contactName(m.step.speaker ?? m.def.name);
+      pending.set(c, (pending.get(c) ?? 0) + 1);
+    }
+    return [...latest.entries()]
+      .map(([contact, last]) => ({ contact, last, unread: pending.get(contact) ?? 0 }))
+      .sort((a, b) => (b.unread ? 1 : 0) - (a.unread ? 1 : 0) || b.last.at - a.last.at);
+  }
+  /** One conversation, oldest first. */
+  chatWith(contact: string): ChatEntry[] {
+    return (this.state.chatLog ?? []).filter(e => e.contact === contact);
+  }
+  /** Messages in this conversation still waiting for your reply. */
+  pendingFrom(contact: string) {
+    return this.phoneInbox().filter(m => contactName(m.step.speaker ?? m.def.name) === contact);
+  }
+
   // ══ DECISIONS ════════════════════════════════════════════════════════════
   /** Log a choice into today's record with its money verdict, and queue it for the decision card.
    *  Only real decisions are kept: ones with a verdict or a lesson. */
@@ -1717,6 +1807,7 @@ export class GameStore {
     }
     if (choice.social) s.today.socialActivities += 1;
     rt.outcome = choice.id;
+    if (step?.remote) this.logReply(contactName(step.speaker ?? def.name), choice);
     this.recordDecision({
       key: `${def.id}:${choice.id}`, title: def.name, choice: choice.label,
       consequence: choice.consequence, lesson: choice.lesson, amount: choice.cost,
@@ -1732,6 +1823,7 @@ export class GameStore {
 
     if (choice.finish) this.completeMission(rt, def, choice.id, choice.flags);
     else { rt.stepIndex = Math.min(rt.stepIndex + 1, def.steps.length - 1); this.touch(true); }
+    this.logIncomingMessages();
     this.syncGoals();
     return true;
   }
@@ -1997,6 +2089,10 @@ export class GameStore {
 
   private onMissionExpired(def: MissionDef, rt: MissionRuntime) {
     const s = this.state;
+    const unanswered = def.steps[rt.stepIndex];
+    if (unanswered?.remote && unanswered.choices?.length) {
+      this.pushChat({ contact: contactName(unanswered.speaker ?? def.name), at: s.minutes, text: def.onExpire?.message ?? 'No reply', note: true });
+    }
     if (s.errand?.missionId === def.id) {
       delete s.errand;
       const host = def.steps.map(st => st.host).find(Boolean);
@@ -2153,6 +2249,7 @@ export class GameStore {
     if (newP.dayOfWeek === 0 && s.weekDays.length >= 1) this.finalizeWeek();
     s.today = emptyDay(newP.day, s.finance.accounts.cash);
     this.pendingDaySummary = record;
+    this.pendingFact = this.nextFact();
     this.emit({ type: 'day_start', day: newP.day, minutes: s.minutes });
     this.evaluateMissions();
     this.evaluateAchievements();

@@ -16,10 +16,18 @@ const mem = new Map<string, string>();
   setItem: (k: string, v: string) => void mem.set(k, String(v)),
   removeItem: (k: string) => void mem.delete(k),
 };
-function fakeSupabase(opts: { offline?: boolean } = {}) {
+function fakeSupabase(opts: { offline?: boolean; signedInAs?: string | null; rlsUntilRefresh?: boolean } = {}) {
   const rows = new Map<string, { state: unknown; updated_at: string }>();
+  let session: string | null = opts.signedInAs === undefined ? 'u1' : opts.signedInAs;
+  let rls = !!opts.rlsUntilRefresh;
   const client = {
     rows,
+    upserts: 0,
+    auth: {
+      async getSession() { return { data: { session: session ? { user: { id: session } } : null } }; },
+      async refreshSession() { rls = false; return { data: { session: session ? { user: { id: session } } : null } }; },
+      signOut() { session = null; },
+    },
     from() {
       const filters: Record<string, string> = {};
       const q = {
@@ -30,7 +38,9 @@ function fakeSupabase(opts: { offline?: boolean } = {}) {
           return { data: rows.get(`${filters.user_id}|${filters.life_path}`) ?? null, error: null };
         },
         async upsert(row: { user_id: string; life_path: string; state: unknown; updated_at: string }) {
+          client.upserts++;
           if (opts.offline) return { error: { message: 'offline' } };
+          if (rls || row.user_id !== session) return { error: { code: '42501', message: 'new row violates row-level security policy for table "game_saves"' } };
           rows.set(`${row.user_id}|${row.life_path}`, { state: row.state, updated_at: row.updated_at });
           return { error: null };
         },
@@ -38,7 +48,7 @@ function fakeSupabase(opts: { offline?: boolean } = {}) {
       return q;
     },
   };
-  return client as unknown as SupabaseClient & { rows: typeof rows };
+  return client as unknown as SupabaseClient & { rows: typeof rows; upserts: number; auth: { signOut(): void } };
 }
 const SCHOOL = getLifePath('school');
 const freshState = (cash = 0) => {
@@ -89,4 +99,25 @@ test('Legacy import: a save from the old email-based login is picked up once, th
   mem.set('monimate_save_aarsh@test.nz_school', JSON.stringify(freshState(4)));
   assert.equal(takeLegacySave('Aarsh@Test.nz', 'school')?.finance.accounts.cash, 4);
   assert.equal(takeLegacySave('aarsh@test.nz', 'school'), null);
+});
+
+test('Cloud save: after logging out, a save stays on this device and never hits the database', async () => {
+  const sb = fakeSupabase();
+  sb.auth.signOut();
+  assert.equal(await writeSave(sb, 'u1', freshState(3)), false);
+  assert.equal(sb.upserts, 0, 'no request that row-level security would reject');
+  assert.equal((await loadSave(sb, 'u1', 'school'))?.finance.accounts.cash, 3, 'local copy kept');
+});
+
+test('Cloud save: an expired login is refreshed once and the save goes through', async () => {
+  const sb = fakeSupabase({ rlsUntilRefresh: true });
+  assert.equal(await writeSave(sb, 'u1', freshState(7)), true);
+  assert.equal(sb.upserts, 2);
+  assert.ok(sb.rows.get('u1|school'));
+});
+
+test("Cloud save: never writes someone else's row", async () => {
+  const sb = fakeSupabase({ signedInAs: 'u2' });
+  assert.equal(await writeSave(sb, 'u1', freshState(1)), false);
+  assert.equal(sb.upserts, 0);
 });

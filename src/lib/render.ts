@@ -33,7 +33,12 @@ export class SmoothCamera {
 }
 
 // ── Smooth player movement (no grid snapping, accel/decel, corner-friendly) ─
-export interface MoveInput { up: boolean; down: boolean; left: boolean; right: boolean }
+export interface MoveInput {
+  up: boolean; down: boolean; left: boolean; right: boolean;
+  /** Analogue stick (touch joystick), each -1..1. When set, it replaces the four directions and its
+   *  length sets the speed — a small push walks slowly, a full push walks at full speed. */
+  ax?: number; ay?: number;
+}
 
 export interface MoverConfig { maxSpeed: number; accel: number; decel: number }
 export const DEFAULT_MOVER: MoverConfig = { maxSpeed: 4.4 * TILE_PX, accel: 26 * TILE_PX, decel: 34 * TILE_PX };
@@ -50,8 +55,14 @@ export function stepMovement(
 ): { movedTiles: number; moving: boolean } {
   let ix = (input.right ? 1 : 0) - (input.left ? 1 : 0);
   let iy = (input.down ? 1 : 0) - (input.up ? 1 : 0);
-  const len = Math.hypot(ix, iy);
+  let len = Math.hypot(ix, iy);
   if (len > 0) { ix /= len; iy /= len; }
+  const stick = Math.hypot(input.ax ?? 0, input.ay ?? 0);
+  if (stick > 0.12) {
+    const mag = Math.min(1, (stick - 0.12) / 0.78);   // small dead zone, full speed near the rim
+    ix = ((input.ax ?? 0) / stick) * mag; iy = ((input.ay ?? 0) / stick) * mag;
+    len = mag;
+  }
 
   const targetVx = ix * cfg.maxSpeed, targetVy = iy * cfg.maxSpeed;
   const rate = len > 0 ? cfg.accel : cfg.decel;

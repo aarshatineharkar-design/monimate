@@ -2,7 +2,7 @@
  * Next.js 16 proxy (this is what used to be called middleware.ts).
  * 1. Refreshes the Supabase session cookie on every request.
  * 2. Sends signed-out players who try to open /game to /login.
- * 3. Sends signed-in players who open /login straight to /game.
+ * (Signed-in players can still open /login: every new play session starts with a sign-in.)
  */
 import { createServerClient } from '@supabase/ssr';
 import { NextResponse, type NextRequest } from 'next/server';
@@ -39,12 +39,6 @@ export default async function proxy(request: NextRequest) {
     const url = request.nextUrl.clone();
     url.pathname = '/login';
     url.searchParams.set('next', path);
-    return NextResponse.redirect(url);
-  }
-  if (signedIn && path === '/login') {
-    const url = request.nextUrl.clone();
-    url.pathname = '/game';
-    url.search = '';
     return NextResponse.redirect(url);
   }
 

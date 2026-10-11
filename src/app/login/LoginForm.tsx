@@ -7,13 +7,17 @@
 import { useActionState, useState } from 'react';
 import { signIn, signUp, resendConfirmation, type AuthFormState } from './actions';
 
-export default function LoginForm({ next, initialMode, initialError }: { next: string; initialMode: 'signin' | 'signup'; initialError?: string }) {
+export default function LoginForm({ next, initialMode, initialError, initialInfo }: { next: string; initialMode: 'signin' | 'signup'; initialError?: string; initialInfo?: string }) {
   const [mode, setMode] = useState(initialMode);
   const [signInState, signInAction, signingIn] = useActionState<AuthFormState, FormData>(signIn, {});
   const [signUpState, signUpAction, signingUp] = useActionState<AuthFormState, FormData>(signUp, {});
   const [resendState, resendAction, resending] = useActionState<AuthFormState, FormData>(resendConfirmation, {});
   const isSignup = mode === 'signup';
-  const state = isSignup ? signUpState : { ...signInState, error: signInState.error ?? (signInState.info ? undefined : initialError) };
+  const state = isSignup ? signUpState : {
+    ...signInState,
+    error: signInState.error ?? (signInState.info ? undefined : initialError),
+    info: signInState.info ?? (signInState.error ? undefined : initialInfo),
+  };
   const pending = signingIn || signingUp || resending;
   const resendTo = resendState.resendTo ?? state.resendTo;
 

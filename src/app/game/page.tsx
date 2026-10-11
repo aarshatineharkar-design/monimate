@@ -29,7 +29,8 @@ import {
 import { buildJournal, MissionChoice, MissionDef, trackedMission } from '../../lib/missions';
 import { dayToSummaryView, weekToSummaryView } from '../../lib/summary';
 import { HOME_JOBS, type HomeJob } from '../../lib/content/homeJobs';
-import { chatLinesFor } from '../../lib/smallTalk';
+import { chatLinesFor, splitAtQuestion, type ChatReply } from '../../lib/smallTalk';
+import { FACT_KIND_LABEL, type MoneyFact } from '../../lib/content/moneyFacts';
 const HOME_JOB_BY_ID = new Map(HOME_JOBS.map(j => [j.id, j]));
 import type { DayRecord, DecisionRecord, GameState, NpcRuntime } from '../../lib/types';
 import { formatDay, formatTime, parts } from '../../lib/clock';
@@ -132,11 +133,17 @@ interface Player {
 export default function MoniMateGame() {
   const supabase = useMemo(() => createClient(), []);
   const [player, setPlayer] = useState<Player | null>(null);
-  const [choosingPath, setChoosingPath] = useState(false);
+  // Every play session starts on the pathway screen (choose / continue a life) — never straight in.
+  const [choosingPath, setChoosingPath] = useState(true);
+  const [switchingFromGame, setSwitchingFromGame] = useState(false);
   const [loadError, setLoadError] = useState('');
 
   useEffect(() => {
     (async () => {
+      // A play session starts with signing in: arriving from the sign-in page (?fresh=1) starts one
+      // for this tab; reloading keeps it; opening the game fresh (new tab, browser restarted) asks
+      // the player to sign in again.
+      if (!(await startOrResumeSession(supabase))) return;
       const { data: { user } } = await supabase.auth.getUser();
       if (!user) { window.location.href = '/login?next=/game'; return; }
       const { data: prof, error } = await supabase
@@ -164,10 +171,11 @@ export default function MoniMateGame() {
   if (choosingPath || !currentPlayable) {
     return (
       <PathSelect
-        supabase={supabase} userId={player.id}
-        current={choosingPath && currentPlayable ? player.lifePath : null}
-        onChoose={choosePath}
-        onBack={choosingPath && currentPlayable ? () => setChoosingPath(false) : undefined}
+        supabase={supabase} userId={player.id} playerName={player.name}
+        current={switchingFromGame && currentPlayable ? player.lifePath : null}
+        onChoose={p => { setSwitchingFromGame(false); void choosePath(p); }}
+        onBack={switchingFromGame && currentPlayable ? () => { setSwitchingFromGame(false); setChoosingPath(false); } : undefined}
+        onLogout={() => { endPlaySession(); void signOut(); }}
       />
     );
   }
@@ -175,9 +183,32 @@ export default function MoniMateGame() {
     <GameLoader
       key={`${player.id}:${player.lifePath}`}
       supabase={supabase} player={player} notice={loadError}
-      onChangePath={() => setChoosingPath(true)}
+      onChangePath={() => { setSwitchingFromGame(true); setChoosingPath(true); }}
     />
   );
+}
+
+const SESSION_KEY = 'monimate_play_session';
+/** Begin (arriving from sign-in with ?fresh=1) or continue (a reload) this tab's play session.
+ *  Anything else — a new tab, a restarted browser, an old bookmark — signs out and goes to the
+ *  sign-in page, so every time someone starts the game they sign in first. */
+async function startOrResumeSession(supabase: SupabaseClient): Promise<boolean> {
+  const url = new URL(window.location.href);
+  let active = false;
+  try { active = window.sessionStorage.getItem(SESSION_KEY) === '1'; } catch { /* storage blocked */ }
+  if (url.searchParams.get('fresh') === '1') {
+    try { window.sessionStorage.setItem(SESSION_KEY, '1'); } catch { /* storage blocked */ }
+    url.searchParams.delete('fresh');
+    window.history.replaceState(null, '', url.pathname + url.search);
+    return true;
+  }
+  if (active) return true;
+  await supabase.auth.signOut();
+  window.location.href = '/login?next=/game&reason=start';
+  return false;
+}
+function endPlaySession() {
+  try { window.sessionStorage.removeItem(SESSION_KEY); } catch { /* storage blocked */ }
 }
 
 /** Loads the newest save (cloud or this device), importing an old pre-Supabase save once. */
@@ -212,9 +243,10 @@ const btnStyle: React.CSSProperties = { width: '100%', padding: 10, background: 
 
 /** "Where are you up to?" — one card per life path. Each path keeps its own save, so a card shows
  *  exactly where that life was left (week, day, time, money) and continues from there. */
-function PathSelect({ supabase, userId, current, onChoose, onBack }: {
+function PathSelect({ supabase, userId, current, onChoose, onBack, playerName, onLogout }: {
   supabase: SupabaseClient; userId: string; current: LifePath | null;
   onChoose: (p: LifePath) => void; onBack?: () => void;
+  playerName?: string; onLogout?: () => void;
 }) {
   const [saves, setSaves] = useState<Partial<Record<LifePath, SaveSummary>> | null>(null);
   const [confirmReset, setConfirmReset] = useState<LifePath | null>(null);
@@ -238,6 +270,12 @@ function PathSelect({ supabase, userId, current, onChoose, onBack }: {
       <div style={ps.wrap}>
         {onBack && current && (
           <button style={ps.back} onClick={onBack}>← Back to {LIFE_PATHS.find(p => p.id === current)?.name}</button>
+        )}
+        {(playerName || onLogout) && (
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8, fontFamily: 'monospace', color: '#cfd8e3', fontSize: 13 }}>
+            <span>👋 Kia ora, <b style={{ color: '#ffd23f' }}>{playerName}</b></span>
+            {onLogout && <button style={{ ...ps.back, position: 'static', margin: 0 }} onClick={onLogout}>Log out</button>}
+          </div>
         )}
         <h1 style={ps.title}>{current ? 'SWITCH LIFE' : 'CHOOSE YOUR LIFE'}</h1>
         <p style={ps.sub}>Every life keeps its own save. Switch whenever you like — each one waits exactly where you left it.</p>
@@ -358,12 +396,28 @@ function GameCanvas({ supabase, player, initialState, notice, onChangePath }: {
   // A short non-mission conversation (small talk, a purchase receipt, a bus notice). Its lines play
   // one after another in step with the voice; E / Enter / tap moves it on and it closes by itself
   // after the last line.
-  type Chat = { npc?: string; lines: string[]; chatWith?: string };
+  // When someone asks you something, the chat stops at the question with `replies` to pick from,
+  // and `rest` is what they were going to say next.
+  type Chat = { npc?: string; lines: string[]; chatWith?: string; replies?: ChatReply[] | null; rest?: string[] };
   const [dialogueLines, setChat] = useState<Chat | null>(null);
   const dialogueLinesRef = useRef<Chat | null>(null);
   dialogueLinesRef.current = dialogueLines;
   const setDialogueLines = useCallback((c: { npc?: string; text?: string; lines?: string[]; chatWith?: string } | null) => {
-    setChat(c ? { npc: c.npc, lines: c.lines ?? (c.text ? [c.text] : []), chatWith: c.chatWith } : null);
+    if (!c) { setChat(null); return; }
+    const all = c.lines ?? (c.text ? [c.text] : []);
+    // Only real conversations (small talk) ask you things; receipts and notices just play.
+    const split = c.chatWith ? splitAtQuestion(all) : { lines: all, replies: null, rest: [] };
+    setChat({ npc: c.npc, lines: split.lines, chatWith: c.chatWith, replies: split.replies, rest: split.rest });
+  }, []);
+  // You answered: your reply, their response, then the rest of what they had to say (which may hold
+  // another question).
+  const answerChat = useCallback((r: ChatReply) => {
+    const c = dialogueLinesRef.current;
+    if (!c) return;
+    const st = storeRef.current;
+    if (r.rel && c.chatWith && st) st.adjustRelationship(getNpcDef(c.chatWith)?.name ?? c.chatWith, r.rel);
+    const next = splitAtQuestion([r.response, ...(c.rest ?? [])]);
+    setChat({ npc: c.npc, chatWith: c.chatWith, lines: [`${PLAYER_LINE}${r.label}`, ...next.lines], replies: next.replies, rest: next.rest });
   }, []);
   // People you've just chatted with won't start the same small talk again for a while (game minutes).
   const chattedAtRef = useRef<Map<string, number>>(new Map());
@@ -494,10 +548,35 @@ function GameCanvas({ supabase, player, initialState, notice, onChangePath }: {
     return () => window.removeEventListener('resize', onResize);
   }, []);
 
-  // Touch-control helpers — reuse the same keysRef the keyboard handler reads from render.MoveInput,
-  // so pressing a virtual button is indistinguishable from holding the matching key.
-  const pressKey = useCallback((k: string) => keysRef.current.add(k), []);
-  const releaseKey = useCallback((k: string) => keysRef.current.delete(k), []);
+  // Touch: a floating joystick. Put a thumb down anywhere on the game and drag — the stick appears
+  // under it, and how far you drag sets how fast you walk. A quick tap (no drag) acts like E.
+  const JOY_RADIUS = 56;
+  const joyRef = useRef<{ id: number; ox: number; oy: number; dx: number; dy: number; t: number; moved: boolean } | null>(null);
+  const [joyView, setJoyView] = useState<{ ox: number; oy: number; dx: number; dy: number } | null>(null);
+  const tapActionRef = useRef<() => void>(() => {});
+  const onStickDown = useCallback((e: React.PointerEvent<HTMLCanvasElement>) => {
+    if (e.pointerType === 'mouse' || joyRef.current) return;
+    e.currentTarget.setPointerCapture(e.pointerId);
+    joyRef.current = { id: e.pointerId, ox: e.clientX, oy: e.clientY, dx: 0, dy: 0, t: performance.now(), moved: false };
+    setJoyView({ ox: e.clientX, oy: e.clientY, dx: 0, dy: 0 });
+  }, []);
+  const onStickMove = useCallback((e: React.PointerEvent<HTMLCanvasElement>) => {
+    const j = joyRef.current;
+    if (!j || j.id !== e.pointerId) return;
+    let vx = e.clientX - j.ox, vy = e.clientY - j.oy;
+    const d = Math.hypot(vx, vy);
+    if (d > 10) j.moved = true;
+    if (d > JOY_RADIUS) { vx = vx / d * JOY_RADIUS; vy = vy / d * JOY_RADIUS; }
+    j.dx = vx / JOY_RADIUS; j.dy = vy / JOY_RADIUS;
+    setJoyView({ ox: j.ox, oy: j.oy, dx: vx, dy: vy });
+  }, []);
+  const onStickUp = useCallback((e: React.PointerEvent<HTMLCanvasElement>) => {
+    const j = joyRef.current;
+    if (!j || j.id !== e.pointerId) return;
+    joyRef.current = null;
+    setJoyView(null);
+    if (!j.moved && performance.now() - j.t < 300) tapActionRef.current();
+  }, []);
 
   // Create the store once, from the loaded save if there is one. Older saves are upgraded by
   // GameStore.hydrate (lib/saveMigration.ts); anything unreadable starts a fresh game.
@@ -515,7 +594,8 @@ function GameCanvas({ supabase, player, initialState, notice, onChangePath }: {
 
   // Saving: every 30 s, when the tab is hidden, at the end of every day, and on leaving the page.
   // writeSave() writes this device first (instant) and then the cloud (best effort).
-  const save = useCallback(() => { void writeSave(supabase, player.id, store.state); }, [supabase, player.id, store]);
+  const loggingOutRef = useRef(false);
+  const save = useCallback(() => { if (!loggingOutRef.current) void writeSave(supabase, player.id, store.state); }, [supabase, player.id, store]);
   useEffect(() => {
     const id = setInterval(save, 30_000);
     const onHide = () => { if (document.visibilityState === 'hidden') save(); };
@@ -529,7 +609,12 @@ function GameCanvas({ supabase, player, initialState, notice, onChangePath }: {
     });
     return () => { clearInterval(id); document.removeEventListener('visibilitychange', onHide); offEvent(); save(); };
   }, [save, store]);
-  const logout = async () => { await writeSave(supabase, player.id, store.state); await signOut(); };
+  const logout = async () => {
+    loggingOutRef.current = true;
+    await writeSave(supabase, player.id, store.state);
+    endPlaySession();
+    await signOut();
+  };
   useEffect(() => { if (notice) pushToast({ icon: '⚠️', lines: [notice], ms: 8000 }); }, [notice, pushToast]);
 
   // Blueprint day loop: WAKE UP -> PHONE. The very first time, the phone opens by itself on Mum's message.
@@ -590,6 +675,7 @@ function GameCanvas({ supabase, player, initialState, notice, onChangePath }: {
       if ((e.target as HTMLElement)?.tagName === 'INPUT') return;
       keysRef.current.add(key);
       if (phoneOpenRef.current) return; // the phone has the keyboard (its own Esc/back handling)
+      if (key === 'escape' && dialogueLinesRef.current?.chatWith) { closeChat(); return; } // end the chat, stay put
       if (key === 'escape' && store.state.player.scene !== 'outdoor' && store.state.player.scene !== 'bus') loop.exit();
       if (key === 'e' || key === 'enter') {
         if (e.repeat) return; // holding the key down shouldn't skip a whole conversation
@@ -658,6 +744,11 @@ function GameCanvas({ supabase, player, initialState, notice, onChangePath }: {
       }
     }
   }, [store]);
+  // A quick tap on the map (touch) = E: move the conversation on if someone is talking, else interact.
+  tapActionRef.current = () => {
+    if (conversationOpenRef.current) setAdvanceSignal(n => n + 1);
+    else handleInteract();
+  };
 
   // Attend Class: runs through store.attendClass() (ActivitySystem on the live game).
   const attendClass = useCallback(() => {
@@ -693,6 +784,7 @@ function GameCanvas({ supabase, player, initialState, notice, onChangePath }: {
         down: keysRef.current.has('s') || keysRef.current.has('arrowdown'),
         left: keysRef.current.has('a') || keysRef.current.has('arrowleft'),
         right: keysRef.current.has('d') || keysRef.current.has('arrowright'),
+        ax: joyRef.current?.dx, ay: joyRef.current?.dy,
       };
       loop.frame(ts, input, { w: canvas.width, h: canvas.height }, { worldW: MAP_W * TILE_PX, worldH: MAP_H * TILE_PX });
       draw(ctx, canvas.width, canvas.height, store, loop);
@@ -757,7 +849,7 @@ function GameCanvas({ supabase, player, initialState, notice, onChangePath }: {
   // ── Pacing: one conversation at a time, each opening a beat after the last one closes ──
   // Nobody starts talking behind a full-screen card (day recap, goodnight, level summary…).
   const screenCovered = !!(dayCard || transition || store.pendingDaySummary || store.pendingWeekSummary
-    || store.pendingLevelSummary || confirmSwitch || showPiggy || jobsOpen || jobWork);
+    || store.pendingLevelSummary || store.pendingFact || confirmSwitch || showPiggy || jobsOpen || jobWork);
   modalOpenRef.current = screenCovered;
   const missionKey = actionable && !lifeEvent && !phoneApp && !screenCovered ? `${actionable.def.id}:${actionable.rt.stepIndex}` : null;
   const settledMission = useSettled(missionKey, 650);
@@ -767,9 +859,12 @@ function GameCanvas({ supabase, player, initialState, notice, onChangePath }: {
   const chatShown = !!dialogueLines && !actionable && !lifeEvent && !boardingAt && !screenCovered;
   conversationOpenRef.current = !!missionPanel || chatShown;
   busyRef.current = !!(missionPanel || chatShown || lifeEvent || boardingAt || transition || dayCard || store.pendingDaySummary
-    || store.pendingWeekSummary || store.pendingLevelSummary || phoneApp || decisionCard || confirmSwitch);
+    || store.pendingWeekSummary || store.pendingLevelSummary || store.pendingFact || phoneApp || decisionCard || confirmSwitch);
   // A mission conversation takes over from small talk (and the small talk doesn't come back after).
   useEffect(() => { if (settledMission && dialogueLinesRef.current) closeChat(); }, [settledMission, closeChat]);
+  // Walk away from someone mid-chat and the conversation ends (they won't keep asking your back).
+  const chatPartnerGone = !!dialogueLines?.chatWith && store.npcDistanceTiles(dialogueLines.chatWith) > 3.5;
+  useEffect(() => { if (chatPartnerGone) closeChat(); }, [chatPartnerGone, closeChat]);
   // "That's everything for today": once nothing is left and no other panel is open.
   const dayDoneNow = !dayCard && !transition && !actionable && !lifeEvent && !boardingAt && !daySummary
     && !weekSummary && !store.pendingLevelSummary && !jobWork && store.dayComplete();
@@ -797,28 +892,18 @@ function GameCanvas({ supabase, player, initialState, notice, onChangePath }: {
       <canvas
         ref={canvasRef} width={canvasSize.w} height={canvasSize.h}
         style={{ position: 'absolute', inset: 0, width: '100%', height: '100%', imageRendering: 'pixelated', touchAction: 'none' }}
+        onPointerDown={onStickDown} onPointerMove={onStickMove} onPointerUp={onStickUp} onPointerCancel={onStickUp}
       />
+      {joyView && (
+        <div style={{ position: 'absolute', left: joyView.ox - JOY_RADIUS, top: joyView.oy - JOY_RADIUS, width: JOY_RADIUS * 2, height: JOY_RADIUS * 2, borderRadius: '50%', background: 'rgba(255,255,255,0.10)', border: '2px solid rgba(255,255,255,0.35)', pointerEvents: 'none', zIndex: 30 }}>
+          <div style={{ position: 'absolute', left: JOY_RADIUS - 24 + joyView.dx, top: JOY_RADIUS - 24 + joyView.dy, width: 48, height: 48, borderRadius: '50%', background: 'rgba(255,255,255,0.55)', boxShadow: '0 2px 8px rgba(0,0,0,0.4)' }} />
+        </div>
+      )}
 
-      {/* On-screen touch controls (phone/tablet only) */}
+      {/* On-screen touch controls (phone/tablet only). Movement is the floating joystick: put a thumb
+          anywhere on the map and drag. A quick tap on the map does what E does. */}
       {isTouch && (
         <>
-          <div style={hud.dpad}>
-            <div style={hud.dpadRow}>
-              <div style={hud.dpadSpacer} />
-              <button style={hud.dpadBtn} onPointerDown={() => pressKey('w')} onPointerUp={() => releaseKey('w')} onPointerLeave={() => releaseKey('w')} onPointerCancel={() => releaseKey('w')}>▲</button>
-              <div style={hud.dpadSpacer} />
-            </div>
-            <div style={hud.dpadRow}>
-              <button style={hud.dpadBtn} onPointerDown={() => pressKey('a')} onPointerUp={() => releaseKey('a')} onPointerLeave={() => releaseKey('a')} onPointerCancel={() => releaseKey('a')}>◀</button>
-              <div style={hud.dpadSpacer} />
-              <button style={hud.dpadBtn} onPointerDown={() => pressKey('d')} onPointerUp={() => releaseKey('d')} onPointerLeave={() => releaseKey('d')} onPointerCancel={() => releaseKey('d')}>▶</button>
-            </div>
-            <div style={hud.dpadRow}>
-              <div style={hud.dpadSpacer} />
-              <button style={hud.dpadBtn} onPointerDown={() => pressKey('s')} onPointerUp={() => releaseKey('s')} onPointerLeave={() => releaseKey('s')} onPointerCancel={() => releaseKey('s')}>▼</button>
-              <div style={hud.dpadSpacer} />
-            </div>
-          </div>
           {missionPanel || chatShown ? (
             // While someone's talking, the button moves the conversation on one line at a time.
             <button style={hud.interactBtn} onPointerDown={() => setAdvanceSignal(n => n + 1)}>NEXT</button>
@@ -924,14 +1009,14 @@ function GameCanvas({ supabase, player, initialState, notice, onChangePath }: {
           same underlying buy path (buyNearbyShopItem()), just worded and gated as a collection. */}
       {nearbyItem && !actionable && (
         groceryNeedIdx >= 0 ? (
-          <div style={{ ...hud.buyPrompt, bottom: isTouch ? 196 : 12 }}>
+          <div style={{ ...hud.buyPrompt, bottom: isTouch ? 196 : 12, pointerEvents: 'auto', cursor: 'pointer' }} onClick={handleInteract}>
             {groceryAlreadyGot
               ? `✓ Already picked up ${nearbyItem.name} — find what's left on the list`
-              : `[E] Pick Up — ${nearbyItem.brand ? `${nearbyItem.brand} ` : ''}${nearbyItem.name} ($${nearbyItem.price.toFixed(2)})`}
+              : `${isTouch ? '👆 Tap to pick up' : '[E] Pick Up'} — ${nearbyItem.brand ? `${nearbyItem.brand} ` : ''}${nearbyItem.name} ($${nearbyItem.price.toFixed(2)})`}
           </div>
         ) : (
-          <div style={{ ...hud.buyPrompt, bottom: isTouch ? 196 : 12 }}>
-            E: Buy {nearbyItem.brand ? `${nearbyItem.brand} ` : ''}{nearbyItem.name} — ${nearbyItem.price.toFixed(2)}
+          <div style={{ ...hud.buyPrompt, bottom: isTouch ? 196 : 12, pointerEvents: 'auto', cursor: 'pointer' }} onClick={handleInteract}>
+            {isTouch ? '👆 Tap to buy' : 'E: Buy'} {nearbyItem.brand ? `${nearbyItem.brand} ` : ''}{nearbyItem.name} — ${nearbyItem.price.toFixed(2)}
             {!nearbyItem.affordable && <span style={{ color: '#ff8080' }}> (not enough money)</span>}
           </div>
         )
@@ -942,7 +1027,7 @@ function GameCanvas({ supabase, player, initialState, notice, onChangePath }: {
           already claiming the prompt slot. Reuses the same npcNearPlayer() proximity check
           handleInteract() already uses — no new detection logic, just a visible cue for it. */}
       {nearbyNpc && !actionable && !nearbyItem && !nearStopId && !dialogueLines && !lifeEvent && !boardingAt && !recentlyChatted(nearbyNpc.id) && !jobWork && (
-        <div style={{ ...hud.buyPrompt, bottom: isTouch ? 196 : 12 }}>{isTouch ? 'ACT' : '[E]'} Talk — {getNpcDef(nearbyNpc.id)?.name ?? nearbyNpc.id}</div>
+        <div style={{ ...hud.buyPrompt, bottom: isTouch ? 196 : 12, pointerEvents: 'auto', cursor: 'pointer' }} onClick={handleInteract}>{isTouch ? '👆 Tap to talk' : '[E] Talk'} — {getNpcDef(nearbyNpc.id)?.name ?? nearbyNpc.id}</div>
       )}
 
       {/* Phase 14 / Step 27: bus-stop prompt — arrived bus vs. a countdown to the next one. Step 27
@@ -953,7 +1038,7 @@ function GameCanvas({ supabase, player, initialState, notice, onChangePath }: {
           the player can see the whole route (BUS_ROUTE.name/fare, unchanged authoritative data)
           the moment they reach any stop — "make it obvious what the player can do here." */}
       {nearStopId && !actionable && !nearbyItem && (
-        <div style={{ ...hud.buyPrompt, bottom: isTouch ? 196 : 12 }}>
+        <div style={{ ...hud.buyPrompt, bottom: isTouch ? 196 : 12, pointerEvents: 'auto', cursor: 'pointer' }} onClick={handleInteract}>
           <div style={{ fontSize: 11, opacity: 0.8, marginBottom: 2 }}>
             🚏 {stopName(nearStopId)} · {BUS_ROUTE.name} · Fare ${store.busFare().toFixed(2)}{(s.world.rideCredits ?? 0) > 0 ? ` · 🎫 ${s.world.rideCredits} rides left` : ''}
           </div>
@@ -1090,6 +1175,9 @@ function GameCanvas({ supabase, player, initialState, notice, onChangePath }: {
           key={dialogueLines.lines.join('|')}
           speaker={dialogueLines.npc}
           lines={dialogueLines.lines}
+          choices={dialogueLines.replies?.map((r, i) => ({ id: `reply_${i}`, label: `💬 ${r.label}`, sublabel: '', cost: 0, minutes: 0, consequence: '' }))}
+          onChoose={(c) => { const r = dialogueLines.replies?.[Number(c.id.slice(6))]; if (r) answerChat(r); }}
+          numberKeys={!isTouch}
           voiceOn={voiceOn}
           advanceSignal={advanceSignal}
           onDone={closeChat}
@@ -1145,7 +1233,7 @@ function GameCanvas({ supabase, player, initialState, notice, onChangePath }: {
         <div style={hud.modalBackdrop}>
           <div style={{ ...hud.modal, width: 'min(380px, 92vw)', textAlign: 'center', animation: 'mmPop 260ms ease-out' }}>
             <div style={{ fontSize: 40 }}>✅</div>
-            <h2 style={{ margin: '4px 0' }}>That's everything for today!</h2>
+            <h2 style={{ margin: '4px 0' }}>That&apos;s everything for today!</h2>
             <div style={{ opacity: 0.7, fontSize: 13, marginBottom: 12 }}>{day} · {time}</div>
             <div style={{ textAlign: 'left', background: '#0d1117', borderRadius: 8, padding: '10px 12px', marginBottom: 10, maxHeight: 180, overflowY: 'auto' }}>
               {dayCard.done.map((t, i) => <div key={'d' + i} style={{ fontSize: 13, marginBottom: 3 }}>✓ {t.emoji} {t.name}</div>)}
@@ -1194,6 +1282,11 @@ function GameCanvas({ supabase, player, initialState, notice, onChangePath }: {
           onClose={() => store.dismissWeekSummary()} />
       )}
 
+      {/* The day's money card: after the recap, before the new day starts */}
+      {!daySummary && !weekSummary && !store.pendingLevelSummary && store.pendingFact && (
+        <MoneyFactCard fact={store.pendingFact} path={s.lifePath} onClose={() => store.dismissFact()} />
+      )}
+
       {/* "Make It to Friday" recap — real numbers computed at completion, not scripted */}
       {!daySummary && store.pendingLevelSummary && (
         <LevelSummaryModal summary={store.pendingLevelSummary} onClose={() => store.dismissLevelSummary()} />
@@ -1233,6 +1326,9 @@ function GameCanvas({ supabase, player, initialState, notice, onChangePath }: {
     </div>
   );
 }
+
+/** A line YOU said in a conversation (shown in your colour, not read in their voice). */
+const PLAYER_LINE = 'You: ';
 
 function DialoguePanel({ speaker, lines, choices, onChoose, balance, voiceOn, advanceSignal, onDone, numberKeys, hint, style }: {
   speaker?: string; lines: string[]; choices?: MissionChoice[]; onChoose?: (c: MissionChoice) => void;
@@ -1287,7 +1383,8 @@ function DialoguePanel({ speaker, lines, choices, onChoose, balance, voiceOn, ad
     if (!currentLine) { setSpoken(true); return; }
     let live = true;
     const finish = () => { if (live) setSpoken(true); };
-    const voiced = !!voiceOn && isSpeechSupported();
+    const mine = currentLine.startsWith(PLAYER_LINE);
+    const voiced = !!voiceOn && isSpeechSupported() && !mine;
     if (voiced) speakLine(speaker, currentLine, { onEnd: finish });
     const t = voiced ? null : setTimeout(finish, estimateSpeechMs(currentLine, speaker) * 0.8 + 400);
     return () => { live = false; if (t) clearTimeout(t); };
@@ -1367,9 +1464,9 @@ function DialoguePanel({ speaker, lines, choices, onChoose, balance, voiceOn, ad
           )}
         </div>
       )}
-      {lines.slice(0, shown - 1).map((l, i) => <div key={i} style={{ marginBottom: 4, opacity: 0.7 }}>{l}</div>)}
+      {lines.slice(0, shown - 1).map((l, i) => <div key={i} style={{ marginBottom: 4, opacity: 0.7, ...(l.startsWith(PLAYER_LINE) ? hud.playerLine : {}) }}>{l}</div>)}
       {currentLine && (
-        <div key={shown} style={{ marginBottom: 4, animation: 'mmLineIn 200ms ease-out' }}>
+        <div key={shown} style={{ marginBottom: 4, animation: 'mmLineIn 200ms ease-out', ...(currentLine.startsWith(PLAYER_LINE) ? hud.playerLine : {}) }}>
           {currentLine.slice(0, charCount)}{!typewriterDone && <span style={{ opacity: 0.7 }}>▌</span>}
         </div>
       )}
@@ -1392,7 +1489,7 @@ function DialoguePanel({ speaker, lines, choices, onChoose, balance, voiceOn, ad
               >
                 {numberKeys && <span style={{ fontSize: 10, opacity: 0.55, border: '1px solid rgba(255,255,255,0.3)', borderRadius: 3, padding: '0 4px', marginTop: 1 }}>{i + 1}</span>}
                 <span>
-                  <div>{c.label}{!affordable && <span style={{ color: '#ff8080', fontWeight: 400 }}> — can't afford</span>}</div>
+                  <div>{c.label}{!affordable && <span style={{ color: '#ff8080', fontWeight: 400 }}> — can&apos;t afford</span>}</div>
                   <div style={{ fontSize: 11, opacity: 0.7 }}>{c.sublabel}</div>
                 </span>
               </button>
@@ -1589,6 +1686,28 @@ function JobsBoard({ jobs, energy, weekJobs, bonusPaid, onDo, onClose }: {
   );
 }
 
+/** End-of-day money card: a fact, a money word or a real-life tip, pitched at this life path. */
+function MoneyFactCard({ fact, path, onClose }: { fact: MoneyFact; path: string; onClose: () => void }) {
+  const k = FACT_KIND_LABEL[fact.kind];
+  const who = path === 'school' ? 'for school life' : path === 'university' ? 'for uni life' : path === 'international' ? 'for studying in NZ' : 'for working life';
+  return (
+    <div style={hud.modalBackdrop}>
+      <div style={{ ...hud.modal, width: 'min(400px, 92vw)', border: `2px solid ${k.color}`, animation: 'mmPop 300ms ease-out', textAlign: 'left' }}>
+        <div style={{ fontSize: 11, fontWeight: 700, letterSpacing: 1.5, color: k.color }}>{k.icon} {k.label}</div>
+        <h2 style={{ margin: '6px 0 8px', fontSize: 20 }}>{fact.title}</h2>
+        <div style={{ fontSize: 14, lineHeight: 1.55 }}>{fact.body}</div>
+        {fact.example && (
+          <div style={{ marginTop: 10, padding: '8px 10px', borderRadius: 8, background: '#0d1117', borderLeft: `3px solid ${k.color}`, fontSize: 13, lineHeight: 1.5 }}>
+            {fact.example}
+          </div>
+        )}
+        <div style={{ fontSize: 11, opacity: 0.6, marginTop: 12 }}>📚 Saved to Money Notes on your phone · {who}</div>
+        <button style={{ ...btnStyle, marginTop: 12 }} onClick={onClose}>Got it</button>
+      </div>
+    </div>
+  );
+}
+
 /** The piggy bank at home: move cash into savings so it isn't spent by accident, and back out
  *  when you need it. Every move is a pair of transfers in the ledger. */
 function PiggyBank({ store, onClose }: { store: GameStore; onClose: () => void }) {
@@ -1709,7 +1828,7 @@ function LevelSummaryModal({ summary: sm, onClose }: { summary: LevelSummary; on
         </div>
         </>)}
         <div style={{ marginTop: 14, padding: '10px 12px', background: '#0d1117', borderRadius: 8, borderLeft: '3px solid #60b8ff' }}>
-          <div style={{ fontSize: 11, opacity: 0.6, marginBottom: 4 }}>🧑‍🏫 KAI'S TAKE</div>
+          <div style={{ fontSize: 11, opacity: 0.6, marginBottom: 4 }}>🧑‍🏫 KAI&apos;S TAKE</div>
           <div style={{ fontSize: 13, lineHeight: 1.4 }}>{mentorTake ?? 'Thinking it over…'}</div>
         </div>
         <button style={{ ...btnStyle, marginTop: 16 }} onClick={onClose}>Back to Sunday</button>
@@ -2314,16 +2433,7 @@ const hud: Record<string, React.CSSProperties> = {
     background: 'rgba(10,10,20,0.92)', border: '1px solid #444', borderRadius: 10, padding: 12,
     color: '#fff', fontFamily: 'monospace', zIndex: 15,
   },
-  dpad: {
-    position: 'absolute', left: 16, bottom: 16, display: 'flex', flexDirection: 'column', gap: 4,
-    zIndex: 25, touchAction: 'none', userSelect: 'none',
-  },
-  dpadRow: { display: 'flex', gap: 4 },
-  dpadSpacer: { width: 52, height: 52 },
-  dpadBtn: {
-    width: 52, height: 52, borderRadius: 10, background: 'rgba(255,255,255,0.18)', border: '1px solid rgba(255,255,255,0.35)',
-    color: '#fff', fontSize: 20, touchAction: 'none', userSelect: 'none', WebkitUserSelect: 'none',
-  },
+  playerLine: { color: '#8fd3ff', textAlign: 'right' as const, fontStyle: 'italic' as const },
   interactBtn: {
     position: 'absolute', right: 20, bottom: 30, width: 74, height: 74, borderRadius: '50%',
     background: 'rgba(63,185,80,0.75)', border: '2px solid rgba(255,255,255,0.5)', color: '#fff',

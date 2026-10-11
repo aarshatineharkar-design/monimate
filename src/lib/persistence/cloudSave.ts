@@ -47,22 +47,47 @@ export async function loadSave(supabase: SupabaseClient, userId: string, lifePat
   return data.state as GameState;
 }
 
-/** Save now. Local write is synchronous; the cloud write is best-effort and never throws. */
+/** Warn about a failing cloud save once per page load, not every 30 seconds. */
+let warnedCloudSave = false;
+
+/** The signed-in user this browser tab has right now (null when signed out or the session is gone). */
+async function sessionUserId(supabase: SupabaseClient): Promise<string | null> {
+  try {
+    const { data } = await supabase.auth.getSession();
+    return data.session?.user.id ?? null;
+  } catch { return null; }
+}
+
+/**
+ * Save now. Local write is synchronous; the cloud write is best-effort and never throws.
+ *
+ * Row-level security only lets a player write their OWN row (auth.uid() = user_id). A save that
+ * fires after logging out, or after the login quietly expired, used to hit Supabase with no user
+ * and fail with "new row violates row-level security policy". Now: no matching session → keep the
+ * local copy and skip the cloud; an RLS/JWT error → refresh the session once and retry.
+ */
 export async function writeSave(supabase: SupabaseClient, userId: string, state: GameState): Promise<boolean> {
   const savedAt = Date.now();
   writeLocal(userId, state.lifePath, state, savedAt);
-  const { error } = await supabase.from('game_saves').upsert(
-    {
-      user_id: userId,
-      life_path: state.lifePath,
-      save_version: state.version,
-      game_minutes: Math.floor(state.minutes),
-      state,
-      updated_at: new Date(savedAt).toISOString(),
-    },
-    { onConflict: 'user_id,life_path' },
-  );
-  if (error) console.warn('[save] cloud save failed, kept local copy:', error.message);
+  if ((await sessionUserId(supabase)) !== userId) return false;   // signed out / someone else: local only
+  const row = {
+    user_id: userId,
+    life_path: state.lifePath,
+    save_version: state.version,
+    game_minutes: Math.floor(state.minutes),
+    state,
+    updated_at: new Date(savedAt).toISOString(),
+  };
+  const upsert = () => supabase.from('game_saves').upsert(row, { onConflict: 'user_id,life_path' });
+  let { error } = await upsert();
+  if (error && /row-level security|JWT|jwt|42501|PGRST301/.test(`${error.code ?? ''} ${error.message}`)) {
+    const { data } = await supabase.auth.refreshSession();
+    if (data.session?.user.id === userId) ({ error } = await upsert());
+  }
+  if (error && !warnedCloudSave) {
+    warnedCloudSave = true;
+    console.info('[save] cloud save unavailable right now — your progress is safe on this device:', error.message);
+  }
   return !error;
 }
 

@@ -165,3 +165,140 @@ export function chatLinesFor(npcId: string, store: GameStore): string[] {
   return lines;
 }
 
+
+// ── Replying ────────────────────────────────────────────────────────────────────────────────────
+// When someone asks you something, you get to answer — small talk is a conversation, not a
+// monologue. Each question has two or three replies; each reply gets its own response (and the odd
+// small nudge to how that person feels about you). Questions without a table entry stay rhetorical.
+
+export interface ChatReply {
+  /** What you say. */
+  label: string;
+  /** What they say back. */
+  response: string;
+  /** Small change in how they feel about you (-1…+1). */
+  rel?: number;
+}
+
+const REPLIES: Record<string, ChatReply[]> = {
+  // Mum
+  'Have a good day, love. Got everything?': [
+    { label: 'Yep — lunch, bus money, the lot.', response: 'Look at you, organised! Off you go.', rel: 1 },
+    { label: 'Uh… I think so?', response: "Check your bag before the bus — buying lunch you forgot costs more than packing it." },
+  ],
+  'How was school?': [
+    { label: 'Pretty good actually!', response: "Love to hear it. Tell me about it over dinner.", rel: 1 },
+    { label: 'Long. Really long.', response: 'Those days happen. Put your feet up for a bit.' },
+    { label: 'We talked about money stuff.', response: 'Ooh, tell me! Half of what I know about money I learned the hard way.', rel: 1 },
+  ],
+  "Running low? There's paid work on the jobs board.": [
+    { label: "I'll take a look.", response: 'Good. Check which job pays best per hour, not just the biggest number.' },
+    { label: "I'm fine for now.", response: "Okay — just don't wait until you're at $0 to plan." },
+  ],
+  'Money tight this week? Happens to everyone.': [
+    { label: 'Yeah, a bit.', response: 'Write down where it went this week. Knowing is the first step to fixing it.' },
+    { label: "Nah, I've got a plan.", response: "That's my kid. A plan beats luck every time.", rel: 1 },
+  ],
+  "How's the fair fund going?": [
+    { label: 'Getting there!', response: 'Little bits each day add up. Keep going.', rel: 1 },
+    { label: "Honestly… it's not.", response: 'Try putting a bit aside first thing, before you can spend it. Pay yourself first.' },
+  ],
+  'Those headphones… are they worth a whole week of lunches?': [
+    { label: "Yes — I'll use them every day.", response: "Fair. If you'll use something a lot, it's worth more to you. Just be sure." },
+    { label: "Hmm. Maybe not.", response: 'Sleep on it. If you still want them next week, that tells you something.' },
+  ],
+  // Jordan
+  'Arcade later?? You in?': [
+    { label: "I'm in!", response: "Yes!! Bring coins, the claw machine's calling.", rel: 1 },
+    { label: "Can't — saving this week.", response: "Respect. I should probably do that too… probably won't 😂" },
+  ],
+  'Weekend plans? The fair is Saturday!': [
+    { label: 'Going to the fair for sure.', response: "Same! Let's meet at the gate.", rel: 1 },
+    { label: 'Depends what I can afford.', response: 'Smart. Entry is cheap, it is the rides and snacks that get you.' },
+  ],
+  "Broke too? Same. Payday can't come fast enough.": [
+    { label: 'Same. Lesson learned.', response: 'Next week we budget. For real this time.' },
+    { label: "Nah, I'm okay actually.", response: "Wait, how?? Teach me your ways." },
+  ],
+  'You seen Riley today?': [
+    { label: 'Yeah, earlier.', response: 'Cool — tell them I said hi.' },
+    { label: 'Not yet.', response: 'Probably at the library. Riley lives there.' },
+  ],
+  // Riley
+  "You're still coming to my birthday thing?": [
+    { label: "Wouldn't miss it!", response: "Yay! It's going to be fun.", rel: 1 },
+    { label: "I'll try — money's tight.", response: "That's okay. Honestly, just come — you don't have to bring anything big." },
+  ],
+  "Are you coming to the fair? I've saved $6 so far.": [
+    { label: "Yep, I'm saving too.", response: "Let's both hit our goal! Race you 😄", rel: 1 },
+    { label: 'Not sure yet.', response: 'Even $1 a day gets you there by Saturday.' },
+  ],
+  'Have you done the maths homework?': [
+    { label: 'Done it already.', response: 'Of course you have. Can I see question 4?', rel: 1 },
+    { label: "Haven't started 😬", response: 'Same. Library after school?' },
+  ],
+  "Didn't you say you were saving? 👀": [
+    { label: 'Yeah… that was a slip.', response: "We all do it. Just don't make it a habit." },
+    { label: 'It was worth it, trust me.', response: "If it was planned, fair enough. If not… 👀" },
+  ],
+  // Teacher
+  'Have you got your project supplies yet?': [
+    { label: 'Getting them today.', response: 'Good. Compare prices — the dairy and the supermarket differ more than you think.' },
+    { label: 'Not yet, sorry.', response: 'Due Thursday — leave yourself time to shop around.' },
+  ],
+  'Enjoying the fair? The raffle draws at one.': [
+    { label: "It's great!", response: 'Glad to hear it. Enjoy your weekend.' },
+    { label: 'Is the raffle worth it?', response: 'A raffle is a donation with a tiny prize chance. Buy a ticket for the cause, not the odds.' },
+  ],
+  // Sam
+  "Lecture at 10? I'm going back to sleep.": [
+    { label: "Come on, it's paid for!", response: "Ugh. You're right. That's like $40 a lecture in fees…", rel: 1 },
+    { label: 'Same, honestly.', response: 'Kindred spirits. See you at lunch.' },
+  ],
+  'Did you take my milk? …Fine, it was old anyway.': [
+    { label: "Sorry — I'll replace it.", response: 'Legend. Shared groceries only work if everyone pays in.', rel: 1 },
+    { label: 'Not me!', response: 'Then the flat has a milk thief. Great.' },
+  ],
+  "What's for dinner? Please say it's not noodles again.": [
+    { label: "Let's cook together.", response: 'Split the cost of a proper meal? Deal. Cheaper per person than takeaways.', rel: 1 },
+    { label: "Noodles. It's always noodles.", response: 'The student diet. Our wallets thank us, our bodies do not.' },
+  ],
+  'So… about that rent.': [
+    { label: "I'll sort it today.", response: 'Thanks. Late rent hurts the whole flat — and your reference for the next place.', rel: 1 },
+    { label: 'Can you give me a few days?', response: "A few days. Any longer and I'm short on my own bills." },
+  ],
+  'Broke? The Psych department pays $20 for studies. Easy money.': [
+    { label: "Ooh, I'll look into it.", response: 'Easiest $20 I ever made. Took half an hour.' },
+    { label: "I'm alright for now.", response: 'Fair. Good to know it exists though.' },
+  ],
+  // Mei
+  'Did you do the reading? I did the reading. Twice.': [
+    { label: 'Yep, all of it.', response: 'Finally, someone to talk about opportunity cost with!', rel: 1 },
+    { label: 'Skimmed it…', response: "Chapter 2's the important bit — what you give up is the real price." },
+  ],
+};
+
+/** Mum reacting to a splurge she saw on the bank app ("…Was it worth it?"). */
+const REACTIVE_REPLIES: [prefix: string, replies: ChatReply[]][] = [
+  ['The bank app pinged', [
+    { label: 'Honestly? Probably not.', response: "That's the lesson, love. Next time wait a day before you buy.", rel: 1 },
+    { label: 'Yeah, it was worth it.', response: 'If you thought it through, fine. Just make sure it fits your plan.' },
+  ]],
+];
+
+/** The replies you can give to this line, if it is a real question someone asked you. */
+export function repliesFor(line: string): ChatReply[] | null {
+  if (REPLIES[line]) return REPLIES[line];
+  for (const [prefix, r] of REACTIVE_REPLIES) if (line.startsWith(prefix)) return r;
+  return null;
+}
+
+/** Split a chat at its first question you can answer: the lines up to and including it, the replies,
+ *  and whatever they were going to say after. No question → every line, no replies. */
+export function splitAtQuestion(lines: string[]): { lines: string[]; replies: ChatReply[] | null; rest: string[] } {
+  for (let i = 0; i < lines.length; i++) {
+    const r = repliesFor(lines[i]);
+    if (r) return { lines: lines.slice(0, i + 1), replies: r, rest: lines.slice(i + 1) };
+  }
+  return { lines, replies: null, rest: [] };
+}
