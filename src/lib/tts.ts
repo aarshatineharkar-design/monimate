@@ -37,10 +37,21 @@ function pickVoice(speaker: string): SpeechSynthesisVoice | undefined {
   return pool[hash % pool.length];
 }
 
+/** Roughly how long a line takes to say out loud (ms) — used as a safety net when a browser never
+ *  fires `onend` (Chrome sometimes drops it), and as the reading time when voice is off. */
+export function estimateSpeechMs(text: string, speaker?: string): number {
+  const { rate } = fingerprint(speaker ?? 'Narrator');
+  return Math.round((380 + text.length * 62) / rate);
+}
+
 /** Speak one line as the given speaker. Cancels whatever was being said before — only one voice
- * talks at a time, and a new line always takes priority over a stale one. */
-export function speakLine(speaker: string | undefined, text: string) {
-  if (!supported() || !text) return;
+ * talks at a time, and a new line always takes priority over a stale one. `onEnd` fires exactly
+ * once when the line finishes, fails, or is cut off — so the dialogue box can move on in step with
+ * the voice instead of talking over it. */
+export function speakLine(speaker: string | undefined, text: string, opts?: { onEnd?: () => void }) {
+  let ended = false;
+  const end = () => { if (!ended) { ended = true; opts?.onEnd?.(); } };
+  if (!supported() || !text) { end(); return; }
   window.speechSynthesis.cancel();
   const utter = new SpeechSynthesisUtterance(text);
   const name = speaker ?? 'Narrator';
@@ -49,6 +60,10 @@ export function speakLine(speaker: string | undefined, text: string) {
   utter.rate = rate;
   const voice = pickVoice(name);
   if (voice) utter.voice = voice;
+  utter.onend = end;
+  utter.onerror = end;
+  // Safety net: never leave a conversation waiting on an `end` event that doesn't come.
+  setTimeout(end, estimateSpeechMs(text, name) + 2500);
   window.speechSynthesis.speak(utter);
 }
 

@@ -62,6 +62,9 @@ export interface FurniturePiece {
   tx: number; ty: number; tw: number; th: number; // tile position/size inside the room
   solid: boolean;
   sprite?: { src: string; sx: number; sy: number; sw: number; sh: number }; // real sliced art, if confirmed
+  /** Depth-sort line in tiles (default: the piece's bottom edge). Set it lower on screen for things
+   *  that sit ON another piece — fruit on a market table — so they draw over it. */
+  sortY?: number;
 }
 /** A door tile inside an interior. `toScene: 'outside'` steps back out through the building's real
  *  exterior door (store.exitPlace()); any other SceneId hops to another room in the same building,
@@ -88,18 +91,62 @@ export interface InteriorDef {
   links: InteriorLink[];
   furniture: FurniturePiece[];
   shopItems?: ShopItemDef[];
+  /** A 48x96 wallpaper strip from room_builder.png, tiled along the back wall above row 0. */
+  wall?: { sx: number; sy: number };
+  /** Things hung on the back wall (maps, boards, mirrors) — drawn on the wall strip, no collision. */
+  wallDecor?: { sprite: { src: string; sx: number; sy: number; sw: number; sh: number }; tx: number; tw: number; th: number }[];
 }
 
 const ROOM_BUILDER = '/sprites/interiors/room_builder.png';
 const FURNITURE = '/sprites/interiors/furniture.png';
 // Every crop below was located and visually confirmed against a labelled grid overlay of the
 // real Interiors_free_48x48 sheet (Modern Interiors Free v2.2) — no invented or mismatched art.
+
+/** Furniture-sheet crops used by the rooms below (sx, sy, sw, sh on furniture.png). */
+const F = (sx: number, sy: number, sw: number, sh: number) => ({ src: FURNITURE, sx, sy, sw, sh });
+const ART = {
+  shelfA: F(480, 3282, 96, 78), shelfB: F(576, 3282, 96, 78), shelfC: F(672, 3282, 96, 78), shelfD: F(480, 3450, 96, 78),
+  whiteRack: F(300, 860, 66, 105), displayFridges: F(96, 868, 190, 97),
+  desk: F(144, 192, 48, 48), deskPaper: F(144, 1737, 48, 53), deskBook: F(192, 1737, 48, 53), deskPlain: F(96, 1731, 48, 59),
+  readingDesk: F(246, 1749, 84, 41), bigDesk: F(357, 1713, 79, 77),
+  whiteboard: F(480, 1960, 96, 35), blackboard: F(630, 1960, 84, 50), locker: F(576, 1960, 45, 56),
+  plantBig: F(501, 2150, 54, 82), plantPot: F(582, 2190, 39, 45), palm: F(620, 2112, 88, 88),
+  sofaGrey: F(44, 3471, 151, 89), sofaBeige: F(192, 3471, 148, 89), sofaBrown: F(336, 3466, 142, 86),
+  worldMap: F(480, 3210, 96, 42), mirror: F(402, 3200, 60, 88), globe: F(578, 3212, 40, 40),
+  rugRed: F(342, 732, 180, 108), rugBlue: F(633, 1015, 72, 41), rugGreen: F(9, 2022, 129, 84), rugBlueBig: F(144, 2022, 144, 84),
+  tableBig: F(39, 482, 117, 112), tableLight: F(279, 482, 117, 112), longTable: F(351, 648, 114, 63),
+  chair: F(96, 1023, 47, 59), chairBlue: F(144, 1023, 47, 59),
+  lamp: F(528, 2566, 46, 74), wardrobe: F(342, 2316, 81, 102), cabinet: F(537, 2331, 81, 69),
+  bedBlue: F(276, 48, 116, 98), bedWhite: F(276, 146, 116, 94),
+  fruitGreen: F(3, 2568, 45, 32), fruitOrange: F(51, 2565, 42, 35), fruitBerry: F(99, 2565, 42, 35),
+  veg: F(3, 2670, 45, 30), citrus: F(51, 2670, 42, 30), plums: F(99, 2670, 42, 30),
+} as const;
+const MAILBOX = { src: '/sprites/props/mailbox.png', sx: 0, sy: 0, sw: 45, sh: 54 };
+/** Back-wall wallpaper strips on room_builder.png (each 48x96). */
+const WALL = {
+  pink: { sx: 48, sy: 240 }, cream: { sx: 48, sy: 336 }, mint: { sx: 48, sy: 432 }, oak: { sx: 48, sy: 528 },
+  walnut: { sx: 48, sy: 624 }, cedar: { sx: 48, sy: 720 }, slate: { sx: 48, sy: 816 }, stone: { sx: 48, sy: 912 },
+} as const;
+/** Floor tiles on room_builder.png. */
+const FLOOR = {
+  wood: { src: ROOM_BUILDER, sx: 0, sy: 768, sw: 48, sh: 48 },
+  brick: { src: ROOM_BUILDER, sx: 576, sy: 288, sw: 48, sh: 48 },
+  creamTile: { src: ROOM_BUILDER, sx: 576, sy: 384, sw: 48, sh: 48 },
+  tealTile: { src: ROOM_BUILDER, sx: 576, sy: 480, sw: 48, sh: 48 },
+  concrete: { src: ROOM_BUILDER, sx: 576, sy: 576, sw: 48, sh: 48 },
+  herringbone: { src: ROOM_BUILDER, sx: 576, sy: 672, sw: 48, sh: 48 },
+  rubber: { src: ROOM_BUILDER, sx: 720, sy: 576, sw: 48, sh: 48 },
+} as const;
+type Piece = FurniturePiece;
+const piece = (id: string, name: string, emoji: string, tx: number, ty: number, tw: number, th: number,
+  sprite: FurniturePiece['sprite'], solid = true): Piece => ({ id, name, emoji, tx, ty, tw, th, solid, sprite });
+
 export const INTERIORS: Record<string, InteriorDef> = {
   interior_home: {
     id: 'interior_home', name: 'Your Room',
     widthTiles: 9, heightTiles: 7,
     floorSprite: { src: ROOM_BUILDER, sx: 0, sy: 768, sw: 48, sh: 48 }, // confirmed real wood-floor cell
-    wallColor: '#3a3040',
+    wallColor: '#3a3040', wall: WALL.cream,
     spawn: { x: 4, y: 5 },
     links: [{ tile: { x: 4, y: 6 }, toScene: 'outside', label: 'Leave house' }],
     furniture: [
@@ -126,7 +173,7 @@ export const INTERIORS: Record<string, InteriorDef> = {
     id: 'interior_school_hall', name: 'School Hallway',
     widthTiles: 13, heightTiles: 5,
     floorSprite: { src: ROOM_BUILDER, sx: 528, sy: 240, sw: 48, sh: 48 },
-    wallColor: '#2c3a52',
+    wallColor: '#2c3a52', wall: WALL.slate,
     spawn: { x: 6, y: 3 },
     links: [
       { tile: { x: 6, y: 4 }, toScene: 'outside', label: 'Leave school' },
@@ -136,15 +183,17 @@ export const INTERIORS: Record<string, InteriorDef> = {
       { tile: { x: 11, y: 1 }, toScene: 'interior_school_gym', label: 'Enter gym' },
     ],
     furniture: [
-      { id: 'lockers', name: 'Lockers', emoji: '🔒', tx: 3, ty: 3, tw: 2, th: 1, solid: true },
-      { id: 'noticeboard', name: 'Notice Board', emoji: '📌', tx: 9, ty: 3, tw: 2, th: 1, solid: true },
+      piece('lockers1', 'Lockers', '🔒', 3, 2.8, 1, 1.2, ART.locker),
+      piece('lockers2', 'Lockers', '🔒', 4, 2.8, 1, 1.2, ART.locker),
+      piece('noticeboard', 'Notice Board', '📌', 9, 3, 2, 0.75, ART.whiteboard),
+      piece('plant', 'Plant', '🪴', 12.1, 2.9, 0.8, 0.95, ART.plantPot),
     ],
   },
   interior_school_classroom: {
     id: 'interior_school_classroom', name: 'Classroom',
     widthTiles: 9, heightTiles: 7,
     floorSprite: { src: ROOM_BUILDER, sx: 528, sy: 240, sw: 48, sh: 48 },
-    wallColor: '#2c3a52',
+    wallColor: '#2c3a52', wall: WALL.mint,
     spawn: { x: 4, y: 6 },
     links: [{ tile: { x: 4, y: 6.7 }, toScene: 'interior_school_hall', label: 'Back to hallway' }],
     furniture: [
@@ -166,7 +215,7 @@ export const INTERIORS: Record<string, InteriorDef> = {
     id: 'interior_school_cafeteria', name: 'Cafeteria',
     widthTiles: 9, heightTiles: 7,
     floorSprite: { src: ROOM_BUILDER, sx: 528, sy: 240, sw: 48, sh: 48 },
-    wallColor: '#4a3a2c',
+    wallColor: '#4a3a2c', wall: WALL.oak,
     spawn: { x: 4, y: 6 },
     links: [{ tile: { x: 4, y: 6.7 }, toScene: 'interior_school_hall', label: 'Back to hallway' }],
     furniture: [
@@ -186,7 +235,7 @@ export const INTERIORS: Record<string, InteriorDef> = {
     id: 'interior_school_library', name: 'Library',
     widthTiles: 9, heightTiles: 7,
     floorSprite: { src: ROOM_BUILDER, sx: 0, sy: 768, sw: 48, sh: 48 },
-    wallColor: '#2c4038',
+    wallColor: '#2c4038', wall: WALL.oak,
     spawn: { x: 4, y: 6 },
     links: [{ tile: { x: 4, y: 6.7 }, toScene: 'interior_school_hall', label: 'Back to hallway' }],
     furniture: [
@@ -201,13 +250,17 @@ export const INTERIORS: Record<string, InteriorDef> = {
   interior_school_gym: {
     id: 'interior_school_gym', name: 'Gym',
     widthTiles: 11, heightTiles: 8,
-    floorSprite: { src: ROOM_BUILDER, sx: 528, sy: 192, sw: 48, sh: 48 },
-    wallColor: '#3a2c2c',
+    floorSprite: FLOOR.wood, // was an empty cell on the sheet (sy 192), which drew a black floor
+    wallColor: '#3a2c2c', wall: WALL.stone,
     spawn: { x: 5, y: 7 },
     links: [{ tile: { x: 5, y: 7.7 }, toScene: 'interior_school_hall', label: 'Back to hallway' }],
     furniture: [
-      { id: 'bench1', name: 'Bench', emoji: '🪑', tx: 1, ty: 1, tw: 1, th: 1, solid: true },
-      { id: 'bench2', name: 'Bench', emoji: '🪑', tx: 9, ty: 1, tw: 1, th: 1, solid: true },
+      piece('bench1', 'Bench', '🪑', 0.6, 1, 2.4, 1.3, ART.longTable),
+      piece('bench2', 'Bench', '🪑', 8, 1, 2.4, 1.3, ART.longTable),
+      piece('mat1', 'Mat', '🟦', 1, 4, 3, 1.75, ART.rugBlueBig, false),
+      piece('mat2', 'Mat', '🟦', 7, 4, 3, 1.75, ART.rugBlueBig, false),
+      piece('lockers1', 'Lockers', '🔒', 0.3, 6, 1, 1.2, ART.locker),
+      piece('lockers2', 'Lockers', '🔒', 9.7, 6, 1, 1.2, ART.locker),
     ],
   },
   // Phase 10: the grocery store — the one interior your MVP loop actually needs to be real (Mission 4,
@@ -217,7 +270,7 @@ export const INTERIORS: Record<string, InteriorDef> = {
     id: 'interior_supermarket', name: 'Supermarket',
     widthTiles: 11, heightTiles: 8,
     floorSprite: { src: ROOM_BUILDER, sx: 0, sy: 768, sw: 48, sh: 48 },
-    wallColor: '#2c4a3a',
+    wallColor: '#2c4a3a', wall: WALL.mint,
     spawn: { x: 5, y: 7 },
     links: [{ tile: { x: 5, y: 7.7 }, toScene: 'outside', label: 'Leave store' }],
     furniture: [
@@ -262,7 +315,7 @@ export const INTERIORS: Record<string, InteriorDef> = {
     id: 'interior_shop', name: 'Shop Floor',
     widthTiles: 9, heightTiles: 7,
     floorSprite: { src: ROOM_BUILDER, sx: 528, sy: 240, sw: 48, sh: 48 },
-    wallColor: '#403020',
+    wallColor: '#403020', wall: WALL.stone,
     spawn: { x: 4, y: 5 },
     links: [{ tile: { x: 4, y: 6 }, toScene: 'outside', label: 'Leave shop' }],
     furniture: [], // generic fallback — buildings with no dedicated interior below still use this
@@ -273,7 +326,7 @@ export const INTERIORS: Record<string, InteriorDef> = {
     id: 'interior_cafe', name: 'Café',
     widthTiles: 9, heightTiles: 7,
     floorSprite: { src: ROOM_BUILDER, sx: 0, sy: 768, sw: 48, sh: 48 },
-    wallColor: '#4a3428',
+    wallColor: '#4a3428', wall: WALL.walnut,
     spawn: { x: 4, y: 5 },
     links: [{ tile: { x: 4, y: 6 }, toScene: 'outside', label: 'Leave café' }],
     furniture: [
@@ -293,7 +346,7 @@ export const INTERIORS: Record<string, InteriorDef> = {
     id: 'interior_bank', name: 'Bank',
     widthTiles: 9, heightTiles: 7,
     floorSprite: { src: ROOM_BUILDER, sx: 528, sy: 240, sw: 48, sh: 48 },
-    wallColor: '#26343f',
+    wallColor: '#26343f', wall: WALL.slate,
     spawn: { x: 4, y: 5 },
     links: [{ tile: { x: 4, y: 6 }, toScene: 'outside', label: 'Leave bank' }],
     furniture: [
@@ -305,13 +358,18 @@ export const INTERIORS: Record<string, InteriorDef> = {
         sprite: { src: FURNITURE, sx: 288, sy: 624, sw: 48, sh: 48 } },
       { id: 'waiting', name: 'Waiting Seats', emoji: '🪑', tx: 1, ty: 4, tw: 2, th: 2, solid: true,
         sprite: { src: FURNITURE, sx: 288, sy: 480, sw: 96, sh: 96 } },
+      piece('plant1', 'Plant', '🪴', 0.2, 0.2, 0.8, 1.3, ART.plantBig),
+      piece('cabinet', 'Safe Deposit', '🗄️', 6.6, 0, 1.4, 1.2, ART.cabinet),
+      piece('rug', 'Rug', '🟥', 3.1, 2, 2.9, 1.7, ART.rugRed, false),
+      piece('plant2', 'Plant', '🪴', 8.1, 4.9, 0.8, 1.3, ART.plantBig),
     ],
+    wallDecor: [{ sprite: ART.whiteboard, tx: 3.2, tw: 1.6, th: 0.7 }],
   },
   interior_mall: {
     id: 'interior_mall', name: 'Mall',
     widthTiles: 11, heightTiles: 8,
     floorSprite: { src: ROOM_BUILDER, sx: 528, sy: 240, sw: 48, sh: 48 },
-    wallColor: '#3a2e46',
+    wallColor: '#3a2e46', wall: WALL.pink,
     spawn: { x: 5, y: 6 },
     links: [{ tile: { x: 5, y: 7 }, toScene: 'outside', label: 'Leave mall' }],
     furniture: [
@@ -340,7 +398,7 @@ export const INTERIORS: Record<string, InteriorDef> = {
     id: 'interior_restaurant', name: 'Restaurant',
     widthTiles: 10, heightTiles: 7,
     floorSprite: { src: ROOM_BUILDER, sx: 0, sy: 768, sw: 48, sh: 48 },
-    wallColor: '#4a2a28',
+    wallColor: '#4a2a28', wall: WALL.cedar,
     spawn: { x: 5, y: 5 },
     links: [{ tile: { x: 5, y: 6 }, toScene: 'outside', label: 'Leave restaurant' }],
     furniture: [
@@ -362,7 +420,7 @@ export const INTERIORS: Record<string, InteriorDef> = {
     id: 'interior_bookshop', name: 'Bookshop',
     widthTiles: 9, heightTiles: 7,
     floorSprite: { src: ROOM_BUILDER, sx: 528, sy: 240, sw: 48, sh: 48 },
-    wallColor: '#33291f',
+    wallColor: '#33291f', wall: WALL.oak,
     spawn: { x: 4, y: 5 },
     links: [{ tile: { x: 4, y: 6 }, toScene: 'outside', label: 'Leave bookshop' }],
     furniture: [
@@ -374,6 +432,9 @@ export const INTERIORS: Record<string, InteriorDef> = {
         sprite: { src: FURNITURE, sx: 240, sy: 672, sw: 96, sh: 96 } },
       { id: 'checkout', name: 'Checkout Desk', emoji: '🧾', tx: 6, ty: 4, tw: 1, th: 1, solid: true,
         sprite: { src: FURNITURE, sx: 144, sy: 192, sw: 48, sh: 48 } },
+      piece('plant', 'Plant', '🪴', 8.0, 0.2, 0.8, 1.3, ART.plantBig),
+      piece('chair', 'Reading Chair', '🪑', 7.9, 4.4, 0.9, 1.1, ART.chair),
+      piece('rug', 'Rug', '🟩', 3.4, 5.1, 2.6, 1.4, ART.rugGreen, false),
     ],
     // The "School Project Supplies" mission's shopping list — real walk-up-and-buy items, same
     // system as the supermarket (Rule 27/28: the game never picks a tier for the player).
@@ -389,6 +450,172 @@ export const INTERIORS: Record<string, InteriorDef> = {
       { id: 'textbook_econ', name: 'Textbook', brand: 'ECON101', price: 120.00, tx: 3.25, ty: 4.0, icon: '📕', flag: 'wk_textbook_new' },
     ],
   },
+
+  // ── Rooms for the rest of the town (every building you can walk into now has a real inside) ──
+  interior_library: {
+    id: 'interior_library', name: 'Library',
+    widthTiles: 11, heightTiles: 8, floorSprite: FLOOR.wood, wallColor: '#2c4038', wall: WALL.oak,
+    spawn: { x: 5, y: 7 },
+    links: [{ tile: { x: 5, y: 7.7 }, toScene: 'outside', label: 'Leave library' }],
+    wallDecor: [{ sprite: ART.worldMap, tx: 4.5, tw: 2, th: 0.9 }],
+    furniture: [
+      piece('shelf1', 'Bookshelf', '📚', 0.4, 0, 2, 1.6, ART.shelfA),
+      piece('shelf2', 'Bookshelf', '📚', 2.5, 0, 2, 1.6, ART.shelfB),
+      piece('shelf3', 'Bookshelf', '📚', 6.5, 0, 2, 1.6, ART.shelfC),
+      piece('shelf4', 'Bookshelf', '📚', 8.6, 0, 2, 1.6, ART.shelfA),
+      piece('rug', 'Rug', '🟩', 3.6, 2.4, 3.8, 2.1, ART.rugGreen, false),
+      piece('table1', 'Reading Table', '📖', 0.8, 3, 2, 1.9, ART.tableLight),
+      piece('chair1', 'Chair', '🪑', 0.2, 3.4, 0.9, 1.1, ART.chair),
+      piece('table2', 'Reading Table', '📖', 8.2, 3, 2, 1.9, ART.tableLight),
+      piece('chair2', 'Chair', '🪑', 10.1, 3.4, 0.9, 1.1, ART.chair),
+      piece('desk', "Librarian's Desk", '🖥️', 7.6, 5.6, 1, 1, ART.desk),
+      piece('desk2', "Librarian's Desk", '🖥️', 8.6, 5.6, 1, 1, ART.desk),
+      piece('rack', 'Returns Cart', '🛒', 0.4, 5.4, 1.2, 1.9, ART.whiteRack),
+      piece('globe', 'Globe', '🌐', 2, 5.9, 0.8, 0.8, ART.globe),
+      piece('plant', 'Plant', '🪴', 10.1, 5.6, 0.8, 1.3, ART.plantBig),
+    ],
+  },
+  interior_clinic: {
+    id: 'interior_clinic', name: 'Clinic',
+    widthTiles: 10, heightTiles: 7, floorSprite: FLOOR.tealTile, wallColor: '#2f4a4a', wall: WALL.mint,
+    spawn: { x: 5, y: 6 },
+    links: [{ tile: { x: 5, y: 6.7 }, toScene: 'outside', label: 'Leave clinic' }],
+    furniture: [
+      piece('reception1', 'Reception', '🖥️', 0.6, 0.2, 1, 1, ART.desk),
+      piece('reception2', 'Reception', '🖥️', 1.6, 0.2, 1, 1, ART.desk),
+      piece('files', 'Files', '🗄️', 2.8, 0, 1, 1.2, ART.locker),
+      piece('bed1', 'Bed', '🛏️', 7.4, 0.1, 2.3, 1.9, ART.bedWhite),
+      piece('bed2', 'Bed', '🛏️', 7.4, 2.5, 2.3, 1.9, ART.bedBlue),
+      piece('sofa', 'Waiting Seats', '🛋️', 0.4, 3.6, 3, 1.75, ART.sofaGrey),
+      piece('plant1', 'Plant', '🪴', 3.6, 3.9, 0.8, 0.95, ART.plantPot),
+      piece('plant2', 'Plant', '🪴', 9, 5.1, 0.8, 1.3, ART.plantBig),
+      piece('rug', 'Mat', '🟦', 4.2, 5.4, 1.6, 0.8, ART.rugBlue, false),
+    ],
+  },
+  interior_office: {
+    id: 'interior_office', name: 'Office',
+    widthTiles: 11, heightTiles: 8, floorSprite: FLOOR.concrete, wallColor: '#2a3342', wall: WALL.slate,
+    spawn: { x: 5, y: 7 },
+    links: [{ tile: { x: 5, y: 7.7 }, toScene: 'outside', label: 'Leave office' }],
+    wallDecor: [{ sprite: ART.whiteboard, tx: 4.3, tw: 2.4, th: 0.9 }],
+    furniture: [
+      piece('desk1', 'Desk', '💻', 0.6, 0.6, 1, 1.1, ART.deskPaper),
+      piece('desk2', 'Desk', '💻', 1.6, 0.6, 1, 1.1, ART.deskBook),
+      piece('desk3', 'Desk', '💻', 2.6, 0.6, 1, 1.1, ART.deskPlain),
+      piece('desk4', 'Desk', '💻', 7.4, 0.6, 1, 1.1, ART.deskBook),
+      piece('desk5', 'Desk', '💻', 8.4, 0.6, 1, 1.1, ART.deskPaper),
+      piece('desk6', 'Desk', '💻', 9.4, 0.6, 1, 1.1, ART.deskPlain),
+      piece('desk7', 'Desk', '💻', 0.6, 3.2, 1, 1.1, ART.deskPlain),
+      piece('desk8', 'Desk', '💻', 1.6, 3.2, 1, 1.1, ART.deskPaper),
+      piece('desk9', 'Desk', '💻', 8.4, 3.2, 1, 1.1, ART.deskPaper),
+      piece('desk10', 'Desk', '💻', 9.4, 3.2, 1, 1.1, ART.deskBook),
+      piece('meeting', 'Meeting Table', '🗂️', 3.6, 3, 2.4, 1.3, ART.longTable),
+      piece('cabinet', 'Cabinet', '🗄️', 0.4, 5.7, 1.7, 1.4, ART.cabinet),
+      piece('sofa', 'Break Area', '🛋️', 7.3, 5.6, 3, 1.75, ART.sofaBeige),
+      piece('plant1', 'Plant', '🪴', 3, 0.3, 0.8, 1.3, ART.plantBig),
+      piece('plant2', 'Plant', '🪴', 6.5, 0.3, 0.8, 1.3, ART.plantBig),
+    ],
+  },
+  interior_apartments: {
+    id: 'interior_apartments', name: 'Apartment Lobby',
+    widthTiles: 9, heightTiles: 7, floorSprite: FLOOR.herringbone, wallColor: '#3a2a24', wall: WALL.cedar,
+    spawn: { x: 4, y: 6 },
+    links: [{ tile: { x: 4, y: 6.7 }, toScene: 'outside', label: 'Leave building' }],
+    wallDecor: [{ sprite: ART.mirror, tx: 4.1, tw: 0.8, th: 1.1 }],
+    furniture: [
+      piece('mail1', 'Mailboxes', '📬', 0.4, 0.1, 0.95, 1.15, MAILBOX),
+      piece('mail2', 'Mailboxes', '📬', 1.4, 0.1, 0.95, 1.15, MAILBOX),
+      piece('mail3', 'Mailboxes', '📬', 2.4, 0.1, 0.95, 1.15, MAILBOX),
+      piece('cabinet', 'Cabinet', '🗄️', 6.6, 0, 1.7, 1.4, ART.cabinet),
+      piece('rug', 'Rug', '🟥', 2.6, 1.8, 3.8, 2.3, ART.rugRed, false),
+      piece('sofa', 'Sofa', '🛋️', 0.3, 3.8, 3, 1.8, ART.sofaBrown),
+      piece('lamp', 'Lamp', '💡', 3.4, 3.9, 0.9, 1.5, ART.lamp),
+      piece('wardrobe', 'Coat Cupboard', '🚪', 7.2, 3.4, 1.6, 2, ART.wardrobe),
+      piece('plant', 'Plant', '🪴', 6.1, 5.2, 0.8, 1.3, ART.plantBig),
+    ],
+  },
+  interior_gym: {
+    id: 'interior_gym', name: 'Community Gym',
+    widthTiles: 11, heightTiles: 8, floorSprite: FLOOR.rubber, wallColor: '#262a33', wall: WALL.slate,
+    spawn: { x: 5, y: 7 },
+    links: [{ tile: { x: 5, y: 7.7 }, toScene: 'outside', label: 'Leave gym' }],
+    wallDecor: [
+      { sprite: ART.mirror, tx: 1.2, tw: 0.9, th: 1.2 }, { sprite: ART.mirror, tx: 2.4, tw: 0.9, th: 1.2 },
+      { sprite: ART.mirror, tx: 7.7, tw: 0.9, th: 1.2 }, { sprite: ART.mirror, tx: 8.9, tw: 0.9, th: 1.2 },
+    ],
+    furniture: [
+      piece('mat1', 'Mat', '🟦', 0.6, 0.6, 3.2, 1.9, ART.rugBlueBig, false),
+      piece('mat2', 'Mat', '🟦', 7.2, 0.6, 3.2, 1.9, ART.rugBlueBig, false),
+      piece('bench1', 'Bench', '🏋️', 1, 3.6, 2.4, 1.3, ART.longTable),
+      piece('bench2', 'Bench', '🏋️', 7.6, 3.6, 2.4, 1.3, ART.longTable),
+      piece('locker1', 'Lockers', '🔒', 0.2, 5.8, 1, 1.2, ART.locker),
+      piece('locker2', 'Lockers', '🔒', 1.2, 5.8, 1, 1.2, ART.locker),
+      piece('locker3', 'Lockers', '🔒', 2.2, 5.8, 1, 1.2, ART.locker),
+      piece('fridge', 'Drinks', '🥤', 9.6, 5.6, 1, 1.4, ART.whiteRack),
+      piece('plant', 'Plant', '🪴', 8.6, 6, 0.8, 0.95, ART.plantPot),
+    ],
+  },
+  interior_services: {
+    id: 'interior_services', name: 'Services Centre',
+    widthTiles: 10, heightTiles: 7, floorSprite: FLOOR.creamTile, wallColor: '#2a2f42', wall: WALL.stone,
+    spawn: { x: 5, y: 6 },
+    links: [{ tile: { x: 5, y: 6.7 }, toScene: 'outside', label: 'Leave Services' }],
+    wallDecor: [{ sprite: ART.worldMap, tx: 4, tw: 2, th: 0.9 }],
+    furniture: [
+      piece('counter1', 'Counter', '🖥️', 0.8, 0.2, 1, 1, ART.desk),
+      piece('counter2', 'Counter', '🖥️', 1.8, 0.2, 1, 1, ART.desk),
+      piece('counter3', 'Counter', '🖥️', 2.8, 0.2, 1, 1, ART.desk),
+      piece('counter4', 'Counter', '🖥️', 6.2, 0.2, 1, 1, ART.desk),
+      piece('counter5', 'Counter', '🖥️', 7.2, 0.2, 1, 1, ART.desk),
+      piece('lost', 'Lost Property', '🗄️', 8.4, 0, 1.4, 1.2, ART.cabinet),
+      piece('chair1', 'Waiting Chair', '🪑', 0.6, 3.6, 0.9, 1.1, ART.chairBlue),
+      piece('chair2', 'Waiting Chair', '🪑', 1.5, 3.6, 0.9, 1.1, ART.chairBlue),
+      piece('chair3', 'Waiting Chair', '🪑', 2.4, 3.6, 0.9, 1.1, ART.chairBlue),
+      piece('chair4', 'Waiting Chair', '🪑', 6.7, 3.6, 0.9, 1.1, ART.chairBlue),
+      piece('chair5', 'Waiting Chair', '🪑', 7.6, 3.6, 0.9, 1.1, ART.chairBlue),
+      piece('chair6', 'Waiting Chair', '🪑', 8.5, 3.6, 0.9, 1.1, ART.chairBlue),
+      piece('plant1', 'Plant', '🪴', 0.3, 5.3, 0.8, 1.3, ART.plantBig),
+      piece('plant2', 'Plant', '🪴', 8.9, 5.3, 0.8, 1.3, ART.plantBig),
+    ],
+  },
+  interior_market: {
+    id: 'interior_market', name: 'Weekend Market',
+    widthTiles: 11, heightTiles: 8, floorSprite: FLOOR.brick, wallColor: '#3a3226', wall: WALL.walnut,
+    spawn: { x: 5, y: 7 },
+    links: [{ tile: { x: 5, y: 7.7 }, toScene: 'outside', label: 'Leave market' }],
+    furniture: [
+      piece('stall1', 'Fruit Stall', '🍎', 0.4, 0.4, 2.4, 2.2, ART.tableBig),
+      piece('stall2', 'Veg Stall', '🥬', 8.2, 0.4, 2.4, 2.2, ART.tableBig),
+      piece('stall3', 'Second-hand Stall', '🧥', 0.4, 4, 2.4, 2.2, ART.tableLight),
+      piece('stall4', 'Craft Stall', '🧺', 8.2, 4, 2.4, 2.2, ART.tableLight),
+      piece('rack', 'Clothes Rack', '🧥', 3.2, 0, 2, 1.6, ART.shelfD),
+      piece('rack2', 'Books & Games', '📚', 6.2, 0, 2, 1.6, ART.shelfB),
+      piece('crates', 'Dumpling Cart', '🥟', 4.2, 4.6, 2.4, 1.3, ART.longTable),
+      // produce piled on the stalls (drawn after the tables because they sit lower on screen)
+      { ...piece('fruit1', 'Apples', '🍏', 0.6, 0.9, 0.9, 0.7, ART.fruitGreen, false), sortY: 2.7 },
+      { ...piece('fruit2', 'Oranges', '🍊', 1.6, 1.2, 0.9, 0.7, ART.fruitOrange, false), sortY: 2.7 },
+      { ...piece('veg1', 'Greens', '🥬', 8.4, 0.9, 0.9, 0.7, ART.veg, false), sortY: 2.7 },
+      { ...piece('veg2', 'Plums', '🫐', 9.4, 1.2, 0.9, 0.7, ART.plums, false), sortY: 2.7 },
+      { ...piece('fruit3', 'Berries', '🍓', 8.8, 4.7, 0.9, 0.7, ART.fruitBerry, false), sortY: 6.3 },
+      { ...piece('fruit4', 'Citrus', '🍋', 4.9, 4.7, 0.9, 0.7, ART.citrus, false), sortY: 6.0 },
+    ],
+  },
+  interior_post: {
+    id: 'interior_post', name: 'Post Office',
+    widthTiles: 9, heightTiles: 7, floorSprite: FLOOR.creamTile, wallColor: '#4a2626', wall: WALL.pink,
+    spawn: { x: 4, y: 6 },
+    links: [{ tile: { x: 4, y: 6.7 }, toScene: 'outside', label: 'Leave Post Office' }],
+    wallDecor: [{ sprite: ART.worldMap, tx: 3.5, tw: 2, th: 0.9 }],
+    furniture: [
+      piece('counter1', 'Counter', '🖥️', 0.6, 0.2, 1, 1, ART.desk),
+      piece('counter2', 'Counter', '🖥️', 1.6, 0.2, 1, 1, ART.desk),
+      piece('parcels', 'Parcel Shelf', '📦', 6.4, 0, 2, 1.6, ART.shelfD),
+      piece('postbox1', 'Post Box', '📮', 0.4, 3.4, 0.95, 1.15, MAILBOX),
+      piece('postbox2', 'Post Box', '📮', 1.4, 3.4, 0.95, 1.15, MAILBOX),
+      piece('cards', 'Cards & Stationery', '✉️', 7.2, 3.2, 1.2, 1.9, ART.whiteRack),
+      piece('plant', 'Plant', '🪴', 0.3, 5.4, 0.8, 0.95, ART.plantPot),
+    ],
+  },
 };
 /** Which real interior scene each non-generic building routes to (everything else falls back to
  *  the plain interior_shop placeholder room). Keeping this here, next to INTERIORS, rather than
@@ -399,6 +626,14 @@ export const PLACE_INTERIOR_SCENE: Partial<Record<string, string>> = {
   mall: 'interior_mall',
   restaurant: 'interior_restaurant',
   shop_small: 'interior_bookshop',
+  library: 'interior_library',
+  hospital: 'interior_clinic',
+  office: 'interior_office',
+  apartment: 'interior_apartments',
+  gym: 'interior_gym',
+  police: 'interior_services',
+  market: 'interior_market',
+  post_office: 'interior_post',
 };
 export const getInterior = (sceneId: string) => INTERIORS[sceneId];
 
@@ -443,21 +678,21 @@ export const PLACES: PlaceDef[] = [
   // was previously shown here and school.png sat unused on the Bookshop, so this was the actual
   // building you were looking for, just mislabeled and wearing the wrong sprite.
   P('university', 'School', 37, 1, 10, 8, '🎓', '/sprites/buildings/school.png', 'school'),
-  P('hospital', 'Clinic', 49, 1, 9, 8, '🏥', undefined),
+  P('hospital', 'Clinic', 49, 1, 9, 8, '🏥', '/sprites/buildings/clinic.png'),
   P('supermarket', 'Supermarket', 1, 11, 10, 10, '🛒', '/sprites/buildings/supermarket.png'),
   P('bank', 'Bank', 13, 11, 10, 10, '🏦', '/sprites/buildings/bank.png'),
   P('mall', 'Mall', 25, 11, 10, 10, '🛍️', '/sprites/buildings/mall.png'),
-  P('office', 'Office', 37, 11, 10, 10, '💼', undefined),
-  P('apartment', 'Apartments', 49, 11, 9, 10, '🏢', undefined),
+  P('office', 'Office', 37, 11, 10, 10, '💼', '/sprites/buildings/office.png'),
+  P('apartment', 'Apartments', 49, 11, 9, 10, '🏢', '/sprites/buildings/apartments.png'),
   P('dairy', 'Dairy', 1, 23, 10, 10, '🥛', '/sprites/buildings/dairy.png'),
-  P('gym', 'Gym', 13, 23, 10, 10, '🏋️', undefined),
+  P('gym', 'Gym', 13, 23, 10, 10, '🏋️', '/sprites/buildings/gym.png'),
   P('restaurant', 'Restaurant', 25, 23, 10, 10, '🍔', '/sprites/buildings/cafe-work.png'),
-  P('police', 'Services', 37, 23, 10, 10, '🏛️', undefined),
-  P('market', 'Weekend Market', 49, 23, 9, 10, '🧺', undefined),
-  P('park', 'Park', 1, 35, 22, 7, '🌳', undefined, 'none'),
+  P('police', 'Services', 37, 23, 10, 10, '🏛️', '/sprites/buildings/services.png'),
+  P('market', 'Weekend Market', 49, 23, 9, 10, '🧺', '/sprites/buildings/market.png'),
+  P('park', 'Park', 1, 35, 22, 7, '🌳', '/sprites/buildings/park.png', 'none'),
   P('bus_stop', 'Bus Stop', 25, 35, 3, 4, '🚌', '/sprites/props/sign.png', 'none'),
-  P('shop_small', 'Bookshop', 37, 35, 10, 7, '📖', undefined), // Rule 50: no bookshop-specific sprite supplied
-  P('post_office', 'Post Office', 49, 35, 9, 7, '📮', undefined),
+  P('shop_small', 'Bookshop', 37, 35, 10, 7, '📖', '/sprites/buildings/bookshop.png'),
+  P('post_office', 'Post Office', 49, 35, 9, 7, '📮', '/sprites/buildings/post_office.png'),
 ];
 
 // Phase 8: school exterior detail — purely decorative props (drawn above ground, below characters;

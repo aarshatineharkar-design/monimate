@@ -16,7 +16,9 @@ export type SceneId =
   | 'outdoor' | 'interior_home' | 'interior_shop' | 'interior_supermarket' | 'bus'
   | 'interior_school_hall' | 'interior_school_classroom' | 'interior_school_cafeteria'
   | 'interior_school_library' | 'interior_school_gym'
-  | 'interior_cafe' | 'interior_bank' | 'interior_mall' | 'interior_restaurant' | 'interior_bookshop';
+  | 'interior_cafe' | 'interior_bank' | 'interior_mall' | 'interior_restaurant' | 'interior_bookshop'
+  | 'interior_library' | 'interior_clinic' | 'interior_office' | 'interior_apartments' | 'interior_gym'
+  | 'interior_services' | 'interior_market' | 'interior_post';
 
 export interface WorldState {
   /** Current active outdoor scene/place is tracked on PlayerState.world (it's "where the player

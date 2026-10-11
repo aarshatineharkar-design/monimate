@@ -12,7 +12,9 @@ export type SceneId =
   | 'interior_school_library' | 'interior_school_gym'
   // Real furnished interiors for the other MVP-adjacent buildings (previously all shared the one
   // empty 'interior_shop' placeholder room).
-  | 'interior_cafe' | 'interior_bank' | 'interior_mall' | 'interior_restaurant' | 'interior_bookshop';
+  | 'interior_cafe' | 'interior_bank' | 'interior_mall' | 'interior_restaurant' | 'interior_bookshop'
+  | 'interior_library' | 'interior_clinic' | 'interior_office' | 'interior_apartments' | 'interior_gym'
+  | 'interior_services' | 'interior_market' | 'interior_post';
 
 // ── Player ──────────────────────────────────────────────────────────────────
 export interface PlayerWorld {
@@ -64,6 +66,21 @@ export interface DayRecord {
   travel: ('walk' | 'bike' | 'bus')[];
   lateToSchool: boolean;
   bedtimeMinuteOfDay: number | null;
+  /** Money decisions made today, in order — read by the decision card and the day recap.
+   *  Optional so saves from before it existed still load. */
+  decisions?: DecisionRecord[];
+}
+
+/** One choice the player made, and how it reads money-wise (see content/verdicts.ts). */
+export interface DecisionRecord {
+  key: string;              // `missionId:choiceId` or `life:eventId:choiceId`
+  title: string;            // what the decision was about (mission / event name)
+  choice: string;           // the option picked, as shown on the button
+  verdict?: 'good' | 'bad' | 'tradeoff';
+  consequence: string;
+  lesson?: string;
+  amount: number;           // money change (+ earned, − spent, 0 none)
+  minutes: number;          // game clock when it was made
 }
 
 export interface WeekRecord {

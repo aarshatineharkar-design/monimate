@@ -16,6 +16,13 @@ Rules:
   source and timestamp. Money never goes negative: `GameStore.spend()` returns `false` instead.
 - **Saves are versioned.** `GameState.version` is 3; `src/lib/saveMigration.ts` upgrades older saves.
   Bump the version and add a migration whenever the saved shape changes.
+- **Every money decision gets a verdict.** `GameStore.applyChoice()` / `resolveLifeEvent()` log the
+  choice into `today.decisions` with its verdict from `src/lib/content/verdicts.ts` (`good` /
+  `tradeoff` / `bad`, keyed `missionId:choiceId`) and its lesson. The page shows a decision card for
+  each (`takeDecisions()`) and the morning recap lists the whole day. When you add a choice that's a
+  real money decision, add its verdict there — `polishPass.test.ts` fails on keys that no longer exist.
+- **The bus waits.** Standing still at a stop when a bus pulls in holds the clock for
+  `BUS_HOLD_REAL_SECONDS` real seconds (`busHoldSecondsLeft()` drives the HUD countdown).
 - `types/` holds the domain types; `systems/interfaces.ts` holds contracts for systems not built yet
   (Mission, Event, NPC, Relationship, Progression, Save) — the next ones to move in.
 

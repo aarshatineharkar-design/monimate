@@ -14,10 +14,11 @@ import { createClient } from '../../lib/supabase/client';
 import { loadSave, writeSave, takeLegacySave, listSaves, deleteSave, type SaveSummary } from '../../lib/persistence/cloudSave';
 import { signOut } from '../login/actions';
 import { LIFE_PATHS, LifePath, LifePathConfig, getLifePath, makeInitialFinance, makeInitialGoals } from '../../lib/gameData';
-import { createInitialState, GameStore, LevelSummary } from '../../lib/store';
+import { createInitialState, GameStore, LevelSummary, BUS_HOLD_REAL_SECONDS } from '../../lib/store';
 import { GameLoop } from '../../lib/loop';
 import { askMentorChat, askMentorWeeklyRecap } from '../../lib/mentor';
-import { speakLine, stopSpeaking } from '../../lib/tts';
+import { speakLine, stopSpeaking, estimateSpeechMs, isSpeechSupported } from '../../lib/tts';
+import { sfx } from '../../lib/sound';
 import { MoveInput, drawDayNightOverlay, drawMinimap, hudTime, waypointReadout } from '../../lib/render';
 import {
   PLACES, TILE_PX, isOpen as placeIsOpen, groundSprite,
@@ -27,7 +28,7 @@ import {
 } from '../../lib/world';
 import { buildJournal, MissionChoice, MissionDef, trackedMission } from '../../lib/missions';
 import { dayToSummaryView, weekToSummaryView } from '../../lib/summary';
-import type { GameState, NpcRuntime } from '../../lib/types';
+import type { DayRecord, DecisionRecord, GameState, NpcRuntime } from '../../lib/types';
 import { formatDay, formatTime, parts } from '../../lib/clock';
 import { pathText, placeName, pathUnlocked, maxLevel, LEVELS_TO_UNLOCK } from '../../lib/pathRules';
 import { LIFE_EVENTS } from '../../lib/lifeEvents';
@@ -37,7 +38,7 @@ const MAP_W = 60, MAP_H = 44;
 
 /** Small talk when an NPC has nothing mission-related to say. Lines depend on the day, the time,
  *  your money, your goal and how things stand with them — so chatting never feels canned. */
-function idleLineFor(npcId: string, store: GameStore): string {
+function idlePoolFor(npcId: string, store: GameStore): string[] {
   const s = store.state, p = parts(s.minutes), cash = store.cash;
   const flags = s.world.flags, rel = s.world.relationships;
   const goal = store.weekGoalId();
@@ -119,8 +120,30 @@ function idleLineFor(npcId: string, store: GameStore): string {
       add(true, 'Fresh bread came in this morning.', "Let me know if you can't find something.");
       break;
   }
-  const pool = lines.length ? lines : ['Hey.'];
-  return pool[Math.floor(Math.random() * pool.length)];
+  return lines.length ? lines : ['Hey.'];
+}
+
+/** A short chat: two or three different lines from the pool, kept in pool order (the situational
+ *  lines are added first, the general ones last), so it reads like one conversation that ends —
+ *  pressing E again moves it on instead of starting it over. */
+function chatLinesFor(npcId: string, store: GameStore): string[] {
+  const pool = [...new Set(idlePoolFor(npcId, store))];
+  const want = Math.min(pool.length, pool.length >= 4 ? 3 : 2);
+  const picked = new Set<number>();
+  while (picked.size < want) picked.add(Math.floor(Math.random() * pool.length));
+  return [...picked].sort((a, b) => a - b).map(i => pool[i]);
+}
+
+/** Returns `value` only once it has stayed the same for `ms` — closing (null) is instant. Used so
+ *  panels don't snap open the same frame something else closes: each beat gets a breath. */
+function useSettled<T>(value: T | null, ms: number): T | null {
+  const [settled, setSettled] = useState<T | null>(value);
+  useEffect(() => {
+    if (value === null) { setSettled(null); return; }
+    const t = setTimeout(() => setSettled(value), ms);
+    return () => clearTimeout(t);
+  }, [value, ms]);
+  return settled;
 }
 
 // ── Sprite cache: loads each image once, draw() just reads whatever is ready this frame. ─────
@@ -384,29 +407,105 @@ function GameCanvas({ supabase, player, initialState, notice, onChangePath }: {
   const storeRef = useRef<GameStore | null>(null);
   const loopRef = useRef<GameLoop | null>(null);
   const [, forceTick] = useState(0);
-  const [dialogueLines, setDialogueLines] = useState<{ npc?: string; text: string } | null>(null);
-  const dialogueLinesRef = useRef<{ npc?: string; text: string } | null>(null);
+  // A short non-mission conversation (small talk, a purchase receipt, a bus notice). Its lines play
+  // one after another in step with the voice; E / Enter / tap moves it on and it closes by itself
+  // after the last line.
+  type Chat = { npc?: string; lines: string[]; chatWith?: string };
+  const [dialogueLines, setChat] = useState<Chat | null>(null);
+  const dialogueLinesRef = useRef<Chat | null>(null);
   dialogueLinesRef.current = dialogueLines;
-  useEffect(() => {
-    if (!dialogueLines) return;
-    const t = setTimeout(() => setDialogueLines(null), 4000);
-    return () => clearTimeout(t);
-  }, [dialogueLines]);
-  useEffect(() => {
-    if (dialogueLines && voiceOn) speakLine(dialogueLines.npc, dialogueLines.text);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [dialogueLines]);
+  const setDialogueLines = useCallback((c: { npc?: string; text?: string; lines?: string[]; chatWith?: string } | null) => {
+    setChat(c ? { npc: c.npc, lines: c.lines ?? (c.text ? [c.text] : []), chatWith: c.chatWith } : null);
+  }, []);
+  // People you've just chatted with won't start the same small talk again for a while (game minutes).
+  const chattedAtRef = useRef<Map<string, number>>(new Map());
+  const recentlyChatted = (npcId: string) => {
+    const t = chattedAtRef.current.get(npcId);
+    return t !== undefined && (storeRef.current?.state.minutes ?? 0) - t < 90;
+  };
+  const closeChat = useCallback(() => {
+    const c = dialogueLinesRef.current;
+    if (c?.chatWith && storeRef.current) chattedAtRef.current.set(c.chatWith, storeRef.current.state.minutes);
+    stopSpeaking();
+    setChat(null);
+  }, []);
+  // E / Enter / the NEXT button: move whichever conversation is open on by one beat.
+  const [advanceSignal, setAdvanceSignal] = useState(0);
+  const conversationOpenRef = useRef(false);
   // The phone (null = closed). Journal, wallet, relationships, Kai and settings all live in it.
   const [phoneApp, setPhoneApp] = useState<PhoneApp | null>(null);
   const phoneOpenRef = useRef(false);
   phoneOpenRef.current = phoneApp !== null;
-  // One notification queue for everything (achievements, new messages, results, notices).
+  // One notification queue for everything (achievements, new messages, results, notices). They're
+  // released one at a time, a beat apart, and held while someone is talking or a card/menu is up —
+  // so a message never lands on top of Mum mid-sentence. `urgent` ones (can't afford, etc.) skip the hold.
   const [toasts, setToasts] = useState<Toast[]>([]);
+  const toastsRef = useRef<Toast[]>([]);
+  toastsRef.current = toasts;
+  const toastQueueRef = useRef<Omit<Toast, 'key'>[]>([]);
+  const lastToastAtRef = useRef(0);
+  const busyRef = useRef(false);
   const pushToast = useCallback((t: Omit<Toast, 'key'>) => {
-    const key = Math.random().toString(36).slice(2);
-    setToasts(q => [...q.slice(-2), { ...t, key }]);
-    setTimeout(() => setToasts(q => q.filter(x => x.key !== key)), t.ms ?? 3800);
+    const sig = (x: Omit<Toast, 'key'>) => x.icon + '|' + x.lines.join('|');
+    if (toastQueueRef.current.some(x => sig(x) === sig(t))) return;
+    toastQueueRef.current.push(t);
   }, []);
+  useEffect(() => {
+    const id = setInterval(() => {
+      const q = toastQueueRef.current;
+      while (q.length && q[0].isStale?.()) q.shift();
+      if (!q.length) return;
+      const now = performance.now();
+      if (now - lastToastAtRef.current < 1100) return;
+      if (busyRef.current && !q[0].urgent) return;
+      const t = q.shift()!;
+      lastToastAtRef.current = now;
+      const key = Math.random().toString(36).slice(2);
+      setToasts(cur => [...cur.slice(-1), { ...t, key }]);
+      try { sfx.notify(); } catch { /* audio is optional */ }
+      setTimeout(() => setToasts(cur => cur.filter(x => x.key !== key)), t.ms ?? 4200);
+    }, 200);
+    return () => clearInterval(id);
+  }, []);
+
+  // Decision cards: every money choice gets a moment of feedback — smart move / trade-off / costly —
+  // with what happened and the lesson. One at a time; tap to dismiss early.
+  const [decisionCard, setDecisionCard] = useState<(DecisionRecord & { uid: number }) | null>(null);
+  const decisionQueueRef = useRef<DecisionRecord[]>([]);
+  const decisionUidRef = useRef(0);
+  const decisionCardRef = useRef<DecisionRecord | null>(null);
+  const modalOpenRef = useRef(false); // a full-screen card is up — decision cards wait their turn
+  decisionCardRef.current = decisionCard;
+  useEffect(() => {
+    const id = setInterval(() => {
+      if (decisionCardRef.current || modalOpenRef.current || !decisionQueueRef.current.length) return;
+      const d = decisionQueueRef.current.shift()!;
+      const card = { ...d, uid: ++decisionUidRef.current };
+      decisionCardRef.current = card;
+      // Notifications on screen step aside for the card and come back after it.
+      if (toastsRef.current.length) {
+        toastQueueRef.current.unshift(...toastsRef.current.map(t => {
+          const rest: Omit<Toast, 'key'> & { key?: string } = { ...t };
+          delete rest.key;
+          return { ...rest, ms: Math.max(2500, (t.ms ?? 4200) - 1500) };
+        }));
+        setToasts([]);
+      }
+      setDecisionCard(card);
+      try {
+        if (d.verdict === 'good') sfx.goodMove();
+        else if (d.verdict === 'bad') sfx.badMove();
+        else sfx.tradeoff();
+      } catch { /* audio is optional */ }
+    }, 250);
+    return () => clearInterval(id);
+  }, []);
+  useEffect(() => {
+    if (!decisionCard) return;
+    const ms = 5500 + (decisionCard.lesson ? Math.min(5000, decisionCard.lesson.length * 45) : 0);
+    const t = setTimeout(() => setDecisionCard(null), ms);
+    return () => clearTimeout(t);
+  }, [decisionCard]);
   const seenInboxRef = useRef<Set<string>>(new Set());
   const [showPiggy, setShowPiggy] = useState(false);
   const [dayCard, setDayCard] = useState<ReturnType<GameStore['todaySummary']> | null>(null);
@@ -431,14 +530,6 @@ function GameCanvas({ supabase, player, initialState, notice, onChangePath }: {
   const helpParentsSnapshotRef = useRef<{ balance: number; energy: number } | null>(null);
   const [isTouch, setIsTouch] = useState(false);
   const [voiceOn, setVoiceOn] = useState(true);
-  const [skipSignal, setSkipSignal] = useState(0); // bumped by the touch "SKIP" button to fast-forward dialogue
-  const [lessonToast, setLessonToast] = useState<string | null>(null);
-  const lessonToastTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const showLesson = useCallback((lesson: string) => {
-    if (lessonToastTimer.current) clearTimeout(lessonToastTimer.current);
-    setLessonToast(lesson);
-    lessonToastTimer.current = setTimeout(() => setLessonToast(null), 5000);
-  }, []);
   useEffect(() => () => stopSpeaking(), []); // stop any speech mid-line if the page/component unmounts
 
   // Detect a touch/coarse-pointer device (phone/tablet) so we can show on-screen controls.
@@ -507,9 +598,18 @@ function GameCanvas({ supabase, player, initialState, notice, onChangePath }: {
   // Blueprint day loop: WAKE UP -> PHONE. The very first time, the phone opens by itself on Mum's message.
   useEffect(() => {
     if (store.state.world.flags.includes('phone_intro') || store.phoneInbox().length === 0) return;
-    store.state.world.flags.push('phone_intro');
-    setPhoneApp('messages');
+    // A beat after waking up, the phone buzzes — instead of everything appearing on the first frame.
+    const t = setTimeout(() => {
+      if (store.state.world.flags.includes('phone_intro')) return;
+      store.state.world.flags.push('phone_intro');
+      setPhoneApp('messages');
+    }, 1400);
+    return () => clearTimeout(t);
   }, [store]);
+  // The first few seconds after loading belong to waking up and the phone — side asks (like Mum's
+  // chores) wait until then.
+  const [settledIn, setSettledIn] = useState(false);
+  useEffect(() => { const t = setTimeout(() => setSettledIn(true), 3200); return () => clearTimeout(t); }, []);
 
   // Help Mum progress bar: fills over ~1.2 real seconds, then store.helpParents() applies the real
   // time/energy/money change once.
@@ -551,9 +651,10 @@ function GameCanvas({ supabase, player, initialState, notice, onChangePath }: {
       keysRef.current.add(key);
       if (phoneOpenRef.current) return; // the phone has the keyboard (its own Esc/back handling)
       if (key === 'escape' && store.state.player.scene !== 'outdoor' && store.state.player.scene !== 'bus') loop.exit();
-      if (key === 'e') {
-        if (dialogueLinesRef.current) { stopSpeaking(); setDialogueLines(null); }
-        else if (!tryStartHelpParentsActivity()) handleInteract();
+      if (key === 'e' || key === 'enter') {
+        if (e.repeat) return; // holding the key down shouldn't skip a whole conversation
+        if (conversationOpenRef.current) { setAdvanceSignal(n => n + 1); return; }
+        if (key === 'e' && !tryStartHelpParentsActivity()) handleInteract();
       }
       if (key === 'j') setPhoneApp(a => (a === 'today' ? null : 'today'));
       if (key === 'p') setPhoneApp(a => (a ? null : 'home'));
@@ -570,7 +671,10 @@ function GameCanvas({ supabase, player, initialState, notice, onChangePath }: {
     if (npc) store.talkTo(npc.id);
     const step = store.actionableStep('inPerson');
     if (step) return; // handled by the main mission DialoguePanel (driven by `actionable`, not this state)
-    if (npc) { setDialogueLines({ npc: getNpcDef(npc.id)?.name ?? npc.id, text: idleLineFor(npc.id, store) }); return; }
+    if (npc && !recentlyChatted(npc.id)) {
+      setDialogueLines({ npc: getNpcDef(npc.id)?.name ?? npc.id, lines: chatLinesFor(npc.id, store), chatWith: npc.id });
+      return;
+    }
     // Phase 10: walk-up-and-buy shopping (Rule 27) — no dropdown, just interact with what's in reach.
     // Step 28: when this item is also a grocery-list need for the active shopping mission, the same
     // real purchase doubles as "physical pickup" — reusing the existing buy path rather than a second
@@ -665,6 +769,9 @@ function GameCanvas({ supabase, player, initialState, notice, onChangePath }: {
       const energyDelta = before ? before.energy - after.energy : outcome.energyConsumed;
       pushToast({ icon: '🧹', lines: ['Helped around the house',
           `${moneyDelta > 0 ? '+' : ''}$${moneyDelta.toFixed(2)} · -${energyDelta.toFixed(0)} energy · Mum +1`,] });
+      store.noteDecision('activity:help_mum', 'Mum asked for a hand', 'Helped around the house',
+        `Half an hour of chores, and Mum paid you for it.`, moneyDelta,
+        'Trading your time for money is how every job works — even small ones add up.');
     } finally {
       helpParentsResolvingRef.current = false;
     }
@@ -678,6 +785,9 @@ function GameCanvas({ supabase, player, initialState, notice, onChangePath }: {
   const declineHelpParents = useCallback(() => {
     store.adjustRelationship('Mum', -1);
     store.markDoneToday('declined_parents');
+    store.noteDecision('activity:decline_mum', 'Mum asked for a hand', 'Not right now',
+      'You kept your time free, but missed out on the money — and Mum noticed.', 0,
+      'Free time has a cost too: the money you could have earned instead (opportunity cost).');
     setHelpParentsPhaseBoth(null);
     pushToast({ icon: '🙁', lines: ["Mum looks a little disappointed, but doesn't push it.", 'Mum -1'] });
   }, [store, setHelpParentsPhaseBoth]);
@@ -699,7 +809,8 @@ function GameCanvas({ supabase, player, initialState, notice, onChangePath }: {
       loop.frame(ts, input, { w: canvas.width, h: canvas.height }, { worldW: MAP_W * TILE_PX, worldH: MAP_H * TILE_PX });
       draw(ctx, canvas.width, canvas.height, store, loop);
       for (const t of store.takeAchievementToasts()) pushToast({ icon: t.emoji, label: 'ACHIEVEMENT UNLOCKED', lines: [t.name], tone: 'gold' });
-      for (const n of store.takeNotices()) pushToast({ icon: 'ℹ️', lines: [n], ms: 5000 });
+      for (const n of store.takeNotices()) pushToast({ icon: 'ℹ️', lines: [n], ms: 5000, urgent: true });
+      for (const d of store.takeDecisions()) decisionQueueRef.current.push(d);
       // In-person objectives get a small "new objective" card; phone messages get a notification.
       for (const d of store.takeOffers()) {
         if (!d.steps[0]?.remote) pushToast({ icon: d.emoji, label: 'NEW OBJECTIVE', lines: [d.name], tone: 'blue' });
@@ -708,7 +819,8 @@ function GameCanvas({ supabase, player, initialState, notice, onChangePath }: {
         const k = `${m.def.id}:${m.rt.stepIndex}:${parts(store.state.minutes).day}`;
         if (seenInboxRef.current.has(k)) continue;
         seenInboxRef.current.add(k);
-        pushToast({ icon: '📱', label: m.step.speaker ?? m.def.name, lines: [m.step.lines[0] ?? m.def.journalText], tone: 'green', onClick: () => setPhoneApp('messages'), ms: 6000 });
+        pushToast({ icon: '📱', label: m.step.speaker ?? m.def.name, lines: [m.step.lines[0] ?? m.def.journalText], tone: 'green', onClick: () => setPhoneApp('messages'), ms: 6000,
+          isStale: () => !store.phoneInbox().some(x => x.def.id === m.def.id && x.rt.stepIndex === m.rt.stepIndex) });
         if (typeof navigator !== 'undefined' && navigator.vibrate) navigator.vibrate(80);
       }
       rafRef.current = requestAnimationFrame(frame);
@@ -757,6 +869,26 @@ function GameCanvas({ supabase, player, initialState, notice, onChangePath }: {
     !store.hasDoneToday('helped_parents') &&
     !store.hasDoneToday('declined_parents');
   const busArrived = nearStopId ? busAtStop(nearStopId, s.minutes) : null;
+
+  // ── Pacing: one conversation at a time, each opening a beat after the last one closes ──
+  // Nobody starts talking behind a full-screen card (day recap, goodnight, level summary…).
+  const screenCovered = !!(dayCard || transition || store.pendingDaySummary || store.pendingWeekSummary
+    || store.pendingLevelSummary || confirmSwitch || showPiggy);
+  modalOpenRef.current = screenCovered;
+  const missionKey = actionable && !lifeEvent && !phoneApp && !screenCovered ? `${actionable.def.id}:${actionable.rt.stepIndex}` : null;
+  const settledMission = useSettled(missionKey, 650);
+  const missionPanel = missionKey && settledMission === missionKey ? actionable : null;
+  const helpAskWanted = settledIn && !screenCovered && helpParentsEligible && helpParentsPhase === null && !actionable && !lifeEvent && !boardingAt &&
+    !classEligible && !classFailure && !helpParentsFailure && !nearbyItem && !nearStopId && !phoneApp && !dialogueLines;
+  const helpAskShown = useSettled(helpAskWanted ? 'help' : null, 900) === 'help' && helpAskWanted;
+  const classWanted = !screenCovered && classEligible && !!rules.study && !actionable && !lifeEvent && !boardingAt && !classFailure && !phoneApp && !dialogueLines;
+  const classShown = useSettled(classWanted ? 'class' : null, 500) === 'class' && classWanted;
+  const chatShown = !!dialogueLines && !actionable && !lifeEvent && !boardingAt && !screenCovered;
+  conversationOpenRef.current = !!missionPanel || chatShown;
+  busyRef.current = !!(missionPanel || chatShown || lifeEvent || boardingAt || transition || dayCard || store.pendingDaySummary
+    || store.pendingWeekSummary || store.pendingLevelSummary || phoneApp || decisionCard || confirmSwitch);
+  // A mission conversation takes over from small talk (and the small talk doesn't come back after).
+  useEffect(() => { if (settledMission && dialogueLinesRef.current) closeChat(); }, [settledMission, closeChat]);
   // "That's everything for today": once nothing is left and no other panel is open.
   const dayDoneNow = !dayCard && !transition && !actionable && !lifeEvent && !boardingAt && !daySummary
     && !weekSummary && !store.pendingLevelSummary && helpParentsPhase === null && store.dayComplete();
@@ -806,12 +938,9 @@ function GameCanvas({ supabase, player, initialState, notice, onChangePath }: {
               <div style={hud.dpadSpacer} />
             </div>
           </div>
-          {actionable && !lifeEvent ? (
-            // Mission dialogue starts itself the moment you're in the right place — there's
-            // nothing to "act" on, so the touch button here fast-forwards the conversation instead.
-            <button style={hud.interactBtn} onPointerDown={() => { stopSpeaking(); setSkipSignal(n => n + 1); }}>SKIP</button>
-          ) : dialogueLines && !lifeEvent && !boardingAt ? (
-            <button style={hud.interactBtn} onPointerDown={() => { stopSpeaking(); setDialogueLines(null); }}>SKIP</button>
+          {missionPanel || chatShown ? (
+            // While someone's talking, the button moves the conversation on one line at a time.
+            <button style={hud.interactBtn} onPointerDown={() => setAdvanceSignal(n => n + 1)}>NEXT</button>
           ) : (
             <button style={hud.interactBtn} onPointerDown={handleInteract}>ACT</button>
           )}
@@ -885,20 +1014,8 @@ function GameCanvas({ supabase, player, initialState, notice, onChangePath }: {
         ))}
       </div>
 
-      {/* 💡 Financial lesson callout — appears after a mission choice that has a lesson */}
-      {lessonToast && (
-        <div onClick={() => setLessonToast(null)} style={{
-          position: 'absolute', bottom: isTouch ? 210 : 70, left: '50%', transform: 'translateX(-50%)',
-          zIndex: 50, background: 'linear-gradient(135deg, #1a2a1a 0%, #0d1a0d 100%)',
-          border: '2px solid #4caf50', borderRadius: 12, padding: '10px 16px',
-          width: 'min(340px, 88vw)', boxShadow: '0 4px 20px rgba(76,175,80,0.3)',
-          animation: 'mmPop 200ms ease-out', cursor: 'pointer',
-        }}>
-          <div style={{ fontSize: 11, color: '#4caf50', fontWeight: 700, letterSpacing: 1, marginBottom: 4 }}>💡 MONEY LESSON</div>
-          <div style={{ fontSize: 13, color: '#e8f5e9', lineHeight: 1.5 }}>{lessonToast}</div>
-          <div style={{ fontSize: 10, opacity: 0.5, marginTop: 4 }}>tap to dismiss</div>
-        </div>
-      )}
+      {/* Decision card — how that choice went, money-wise, and what it teaches */}
+      {decisionCard && <DecisionCard key={decisionCard.uid} d={decisionCard} onClose={() => setDecisionCard(null)} />}
 
       {!isTouch && s.player.scene !== 'outdoor' && s.player.scene !== 'bus' && (
         <div style={hud.exitHint}>Press ESC to go outside</div>
@@ -942,9 +1059,9 @@ function GameCanvas({ supabase, player, initialState, notice, onChangePath }: {
           interact with and nothing higher-priority (a mission panel, a shop item, a bus stop) is
           already claiming the prompt slot. Reuses the same npcNearPlayer() proximity check
           handleInteract() already uses — no new detection logic, just a visible cue for it. */}
-      {nearbyNpc && !actionable && !nearbyItem && !nearStopId && !dialogueLines && !lifeEvent && !boardingAt &&
+      {nearbyNpc && !actionable && !nearbyItem && !nearStopId && !dialogueLines && !lifeEvent && !boardingAt && !recentlyChatted(nearbyNpc.id) &&
         helpParentsPhase !== 'seek' && helpParentsPhase !== 'working' && (
-        <div style={{ ...hud.buyPrompt, bottom: isTouch ? 196 : 12 }}>[E] Talk — {getNpcDef(nearbyNpc.id)?.name ?? nearbyNpc.id}</div>
+        <div style={{ ...hud.buyPrompt, bottom: isTouch ? 196 : 12 }}>{isTouch ? 'ACT' : '[E]'} Talk — {getNpcDef(nearbyNpc.id)?.name ?? nearbyNpc.id}</div>
       )}
 
       {/* Phase 14 / Step 27: bus-stop prompt — arrived bus vs. a countdown to the next one. Step 27
@@ -960,9 +1077,24 @@ function GameCanvas({ supabase, player, initialState, notice, onChangePath }: {
             🚏 {stopName(nearStopId)} · {BUS_ROUTE.name} · Fare ${store.busFare().toFixed(2)}{(s.world.rideCredits ?? 0) > 0 ? ` · 🎫 ${s.world.rideCredits} rides left` : ''}
           </div>
           {busArrived
-            ? `E: Board the bus — ${(s.world.rideCredits ?? 0) > 0 ? '1 ride from your card' : `$${store.busFare().toFixed(2)}`} · -1 energy`
+            ? <>
+                <div style={{ fontWeight: 700 }}>🚌 Bus is here! {isTouch ? 'Tap' : 'E'}: Board — {(s.world.rideCredits ?? 0) > 0 ? '1 ride from your card' : `$${store.busFare().toFixed(2)}`} · -1 energy</div>
+                {(() => {
+                  const left = store.busHoldSecondsLeft();
+                  return left > 0 ? (
+                    <div style={{ marginTop: 4 }}>
+                      <div style={{ fontSize: 11, opacity: 0.85 }}>Driver waits {Math.ceil(left)}s…</div>
+                      <div style={{ height: 4, background: 'rgba(255,255,255,0.2)', borderRadius: 2, marginTop: 2 }}>
+                        <div style={{ height: 4, width: `${(left / BUS_HOLD_REAL_SECONDS) * 100}%`, background: left < 5 ? '#ff7a59' : '#7bd88f', borderRadius: 2, transition: 'width 0.25s linear' }} />
+                      </div>
+                    </div>
+                  ) : <div style={{ fontSize: 11, opacity: 0.85 }}>Doors closing!</div>;
+                })()}
+              </>
             : nextBus
-              ? `Waiting for the bus — next arrives at ${formatTime(nextBus.arrivesAt)}`
+              ? (nextBus.arrivesAt - s.minutes <= 3
+                  ? `🚌 Bus arriving in ~${Math.max(1, Math.ceil(nextBus.arrivesAt - s.minutes))} min — stay at the stop`
+                  : `Waiting for the bus — next arrives at ${formatTime(nextBus.arrivesAt)}`)
               : 'No more buses today'}
         </div>
       )}
@@ -1006,7 +1138,7 @@ function GameCanvas({ supabase, player, initialState, notice, onChangePath }: {
           a genuine duplicate-state risk, not a stylistic preference. */}
 
       {/* Step 8: Attend Class prompt — same priority pattern as the other contextual panels above. */}
-      {classEligible && rules.study && !actionable && !lifeEvent && !boardingAt && !classFailure && (
+      {classShown && rules.study && (
         <DialoguePanel
           speaker={rules.study.teacher}
           lines={[clockParts.minuteOfDay < rules.study.bell
@@ -1044,8 +1176,7 @@ function GameCanvas({ supabase, player, initialState, notice, onChangePath }: {
           as the Attend Class panel, only shown when nothing else is active AND the player hasn't
           already been asked today (helpParentsPhase === null means "not yet accepted/declined
           today" — the panel disappears the instant a choice is made, it does not linger). */}
-      {helpParentsEligible && helpParentsPhase === null && !actionable && !lifeEvent && !boardingAt &&
-        !classEligible && !classFailure && !helpParentsFailure && !nearbyItem && !nearStopId && (
+      {helpAskShown && (
         <DialoguePanel
           speaker="Mum"
           lines={['Could you help out around the house for a bit?']}
@@ -1091,24 +1222,34 @@ function GameCanvas({ supabase, player, initialState, notice, onChangePath }: {
         </div>
       )}
 
-      {/* Idle chat / purchase confirmation / bus-timing toast — auto-dismisses, yields to real dialogue */}
-      {dialogueLines && !actionable && !lifeEvent && !boardingAt && (
-        <div style={{ ...hud.dialogue, ...(isTouch ? { bottom: 196 } : {}) }} onClick={() => { stopSpeaking(); setDialogueLines(null); }}>
-          {dialogueLines.npc && <div style={{ fontWeight: 700, color: '#ffd700', marginBottom: 4 }}>{dialogueLines.npc}</div>}
-          <div>{dialogueLines.text}</div>
-        </div>
+      {/* Small talk / purchase receipt / bus notice — plays its lines in step with the voice, then
+          closes itself. Yields to real (mission) dialogue. */}
+      {chatShown && dialogueLines && (
+        <DialoguePanel
+          key={dialogueLines.lines.join('|')}
+          speaker={dialogueLines.npc}
+          lines={dialogueLines.lines}
+          voiceOn={voiceOn}
+          advanceSignal={advanceSignal}
+          onDone={closeChat}
+          hint={isTouch ? 'tap' : 'E'}
+          style={isTouch ? { bottom: 196 } : undefined}
+        />
       )}
 
       {/* Contextual dialogue / choice panel (life event takes priority if both somehow line up) */}
-      {actionable && !lifeEvent && (
+      {missionPanel && (
         <DialoguePanel
-          speaker={actionable.step.remote && actionable.step.speaker ? `📱 ${actionable.step.speaker}` : actionable.step.speaker}
-          lines={actionable.step.lines}
-          choices={actionable.step.choices}
+          key={missionKey ?? undefined}
+          speaker={missionPanel.step.remote && missionPanel.step.speaker ? `📱 ${missionPanel.step.speaker}` : missionPanel.step.speaker}
+          lines={missionPanel.step.lines}
+          choices={missionPanel.step.choices}
           balance={store.cash}
           voiceOn={voiceOn}
-          skipSignal={skipSignal}
-          onChoose={(c) => { store.applyChoice(actionable.def.id, c); setDialogueLines(null); if (c.lesson) showLesson(c.lesson); }}
+          advanceSignal={advanceSignal}
+          numberKeys={!isTouch}
+          hint={isTouch ? 'tap' : 'E'}
+          onChoose={(c) => { store.applyChoice(missionPanel.def.id, c); setDialogueLines(null); }}
           style={isTouch ? { bottom: 196 } : undefined}
         />
       )}
@@ -1150,9 +1291,10 @@ function GameCanvas({ supabase, player, initialState, notice, onChangePath }: {
               {dayCard.missed.map((t, i) => <div key={'m' + i} style={{ fontSize: 13, marginBottom: 3, color: '#ff8080' }}>✗ {t.emoji} {t.name}</div>)}
               {dayCard.done.length + dayCard.missed.length === 0 && <div style={{ fontSize: 13, opacity: 0.7 }}>A quiet day.</div>}
             </div>
-            <div style={{ fontSize: 13, marginBottom: 14 }}>
+            <div style={{ fontSize: 13, marginBottom: 10 }}>
               <span style={{ color: '#7cfc00' }}>+${dayCard.earned.toFixed(2)}</span> earned · <span style={{ color: '#ff8080' }}>-${dayCard.spent.toFixed(2)}</span> spent · 💰 ${store.cash.toFixed(2)} left
             </div>
+            <DecisionTally decisions={s.today.decisions ?? []} />
             {s.player.place === 'home' ? (
               <>
                 <button style={btnStyle} onClick={() => playTransition('Goodnight…', `${day} is done. See you tomorrow.`, () => store.sleep(false))}>🛏️ Sleep till tomorrow</button>
@@ -1183,9 +1325,8 @@ function GameCanvas({ supabase, player, initialState, notice, onChangePath }: {
       )}
 
       {/* Day / week summaries */}
-      {daySummary && (
-        <SummaryModal title={daySummary.title} lines={[daySummary.moneyLine, daySummary.spentLine, daySummary.schoolLine, daySummary.missionsLine, daySummary.timeLine].filter(Boolean) as string[]}
-          onClose={() => store.dismissDaySummary()} />
+      {daySummary && store.pendingDaySummary && (
+        <DayRecapModal view={daySummary} rec={store.pendingDaySummary} onClose={() => store.dismissDaySummary()} />
       )}
       {!daySummary && weekSummary && (
         <SummaryModal title={weekSummary.title} lines={[weekSummary.income, weekSummary.spending, weekSummary.savings, weekSummary.missions, weekSummary.social, weekSummary.school.replace('School', rules.study?.noun === 'lecture' ? 'Lectures' : 'School'), ...weekSummary.decisions]}
@@ -1215,7 +1356,7 @@ function GameCanvas({ supabase, player, initialState, notice, onChangePath }: {
 
       {/* Sleep button (only shown at home, outdoor scene excluded) */}
       {s.player.place === 'home' && (
-        <div style={hud.homeBtns}>
+        <div style={isTouch ? { ...hud.homeBtns, bottom: 'auto', top: 116, flexDirection: 'column', alignItems: 'flex-start' } : hud.homeBtns}>
           <button style={{ ...hud.sleepBtn, position: 'static' }} onClick={() => store.sleep(false)}>🛏️ Go to sleep</button>
           {store.savingsInfo.atHome
             ? <button style={{ ...hud.sleepBtn, position: 'static', background: '#f0a0c0' }} onClick={() => setShowPiggy(true)}>{store.savingsInfo.emoji} {store.savingsInfo.name} · ${s.finance.accounts.savings.toFixed(2)}</button>
@@ -1227,37 +1368,41 @@ function GameCanvas({ supabase, player, initialState, notice, onChangePath }: {
   );
 }
 
-function DialoguePanel({ speaker, lines, choices, onChoose, balance, voiceOn, skipSignal, style }: {
-  speaker?: string; lines: string[]; choices?: MissionChoice[]; onChoose: (c: MissionChoice) => void;
+function DialoguePanel({ speaker, lines, choices, onChoose, balance, voiceOn, advanceSignal, onDone, numberKeys, hint, style }: {
+  speaker?: string; lines: string[]; choices?: MissionChoice[]; onChoose?: (c: MissionChoice) => void;
   /** When given, a choice costing more than this is shown but disabled — real trade-offs mean some
    *  options genuinely aren't available, not just unwise (Rule 3/4: the game never hides the option,
    *  but it doesn't let you spend money you don't have either). */
   balance?: number;
   /** When true, each revealed line is read aloud in a voice fingerprinted to `speaker` (src/lib/tts.ts). */
   voiceOn?: boolean;
-  /** Bump this (any changed number) to fast-forward straight to the choices — driven by the
-   *  on-screen "SKIP" touch button, since there's no keyboard shortcut to hold down on mobile. */
-  skipSignal?: number;
+  /** Bump this (any changed number) to move the conversation on one beat — E / Enter / the NEXT button. */
+  advanceSignal?: number;
+  /** A conversation without choices calls this after its last line (it closes itself). */
+  onDone?: () => void;
+  /** Desktop: 1–9 pick a choice. */
+  numberKeys?: boolean;
+  /** What to press to continue, shown in the hint ('E' or 'tap'). */
+  hint?: string;
   /** Optional style overrides (e.g. bottom offset on mobile to clear the d-pad). */
   style?: React.CSSProperties;
 }) {
-  // Reveal one line at a time (tap/click to advance) instead of dumping the whole exchange at
-  // once — reads like an actual back-and-forth instead of a wall of text with buttons under it.
+  // One line at a time, typed out while it's spoken. A line is "done" once the typing has finished
+  // AND the voice has finished saying it (or, with voice off, once there's been time to read it) —
+  // then the next line follows on its own after a short pause. So text, voice and pacing stay in
+  // step, and E / tap only ever hurries things along; it never restarts anything.
   const [shown, setShown] = useState(1);
   const [charCount, setCharCount] = useState(0);
-  const key = speaker + '|' + lines.join('|');
-  useEffect(() => { setShown(1); setCharCount(0); }, [key]);
-  const skipSignalRef = useRef(skipSignal);
-  useEffect(() => {
-    if (skipSignal !== undefined && skipSignal !== skipSignalRef.current) {
-      skipSignalRef.current = skipSignal;
-      setShown(lines.length);
-      setCharCount(lines[lines.length - 1]?.length ?? 0);
-    }
-  }, [skipSignal, lines.length]);
-  // Typewriter: animate current line character by character
+  const [spoken, setSpoken] = useState(false);
+  const onDoneRef = useRef(onDone);
+  onDoneRef.current = onDone;
+  const doneCalledRef = useRef(false);
+  const total = lines.length;
   const currentLine = lines[shown - 1] ?? '';
   const typewriterDone = charCount >= currentLine.length;
+  const atEnd = shown >= total && typewriterDone;
+
+  // Typewriter for the current line
   useEffect(() => {
     setCharCount(0);
     if (!currentLine) return;
@@ -1266,47 +1411,265 @@ function DialoguePanel({ speaker, lines, choices, onChoose, balance, voiceOn, sk
       i++;
       setCharCount(i);
       if (i >= currentLine.length) clearInterval(interval);
-    }, 22); // ~22ms per char ≈ comfortable reading speed
+    }, 24);
     return () => clearInterval(interval);
-  }, [key, shown]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [shown]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Voice (or reading time) for the current line
   useEffect(() => {
-    if (voiceOn) speakLine(speaker, lines[shown - 1] ?? '');
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [key, shown, voiceOn]);
-  const atEnd = shown >= lines.length && typewriterDone;
+    setSpoken(false);
+    if (!currentLine) { setSpoken(true); return; }
+    let live = true;
+    const finish = () => { if (live) setSpoken(true); };
+    const voiced = !!voiceOn && isSpeechSupported();
+    if (voiced) speakLine(speaker, currentLine, { onEnd: finish });
+    const t = voiced ? null : setTimeout(finish, estimateSpeechMs(currentLine, speaker) * 0.8 + 400);
+    return () => { live = false; if (t) clearTimeout(t); };
+  }, [shown, voiceOn]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Stop talking if the panel goes away mid-line
+  useEffect(() => () => stopSpeaking(), []);
+
+  const finishConversation = () => {
+    if (doneCalledRef.current) return;
+    doneCalledRef.current = true;
+    onDoneRef.current?.();
+  };
+
+  // Move on by itself once a line has been typed and said
+  const lineDone = typewriterDone && spoken;
+  useEffect(() => {
+    if (!lineDone) return;
+    if (shown < total) {
+      const t = setTimeout(() => setShown(n => Math.min(n + 1, total)), 550);
+      return () => clearTimeout(t);
+    }
+    if (!choices?.length && onDoneRef.current) {
+      const t = setTimeout(finishConversation, 1500);
+      return () => clearTimeout(t);
+    }
+  }, [lineDone, shown, total]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // E / Enter / NEXT / tap: finish typing → next line → (no choices) close
+  const advance = () => {
+    if (!typewriterDone) { setCharCount(currentLine.length); return; }
+    if (shown < total) { stopSpeaking(); setShown(n => n + 1); return; }
+    if (!choices?.length) { stopSpeaking(); finishConversation(); }
+  };
+  const lastAdvance = useRef(advanceSignal);
+  useEffect(() => {
+    if (advanceSignal === undefined || advanceSignal === lastAdvance.current) return;
+    lastAdvance.current = advanceSignal;
+    advance();
+  }, [advanceSignal]); // eslint-disable-line react-hooks/exhaustive-deps
+
   // Choices appear right where the player was clicking to advance; ignore clicks on them for a
   // moment so a fast click-through can't pick an option by accident.
   const choicesShownAt = useRef(0);
-  useEffect(() => { if (atEnd) choicesShownAt.current = performance.now(); }, [atEnd, key]);
-  const choiceReady = () => performance.now() - choicesShownAt.current > 350;
-  const handlePanelClick = () => {
-    if (!typewriterDone) { setCharCount(currentLine.length); return; } // finish typing first
-    if (!atEnd) setShown(n => n + 1);
+  useEffect(() => { if (atEnd) choicesShownAt.current = performance.now(); }, [atEnd]);
+  const choiceReady = () => performance.now() - choicesShownAt.current > 450;
+  const pick = (c: MissionChoice) => {
+    const affordable = balance === undefined || -c.cost <= balance;
+    if (!affordable || !choiceReady() || !onChoose) return;
+    stopSpeaking();
+    onChoose(c);
   };
+
+  // Desktop: number keys pick a choice once they're on screen
+  useEffect(() => {
+    if (!numberKeys || !atEnd || !choices?.length) return;
+    const onKey = (e: KeyboardEvent) => {
+      if ((e.target as HTMLElement)?.tagName === 'INPUT' || e.repeat) return;
+      const n = Number(e.key);
+      if (Number.isInteger(n) && n >= 1 && n <= choices.length) pick(choices[n - 1]);
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }); // re-bound each render so it always sees the current choices/balance
+
   return (
-    <div style={{ ...hud.dialogue, ...style }} onClick={handlePanelClick}>
-      {speaker && <div style={{ fontWeight: 700, color: '#ffd700', marginBottom: 4 }}>{speaker}</div>}
-      {lines.slice(0, shown - 1).map((l, i) => <div key={i} style={{ marginBottom: 4 }}>{l}</div>)}
-      {currentLine && <div style={{ marginBottom: 4 }}>{currentLine.slice(0, charCount)}{!typewriterDone && <span style={{ opacity: 0.7 }}>▌</span>}</div>}
-      {!atEnd && typewriterDone && <div style={{ fontSize: 11, opacity: 0.6, marginTop: 6 }}>▾ tap to continue</div>}
-      {atEnd && choices && (
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 6, marginTop: 10 }}>
-          {choices.map(c => {
+    <div style={{ ...hud.dialogue, animation: 'mmDialogIn 240ms ease-out', ...style }} onClick={advance}>
+      {speaker && (
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 6 }}>
+          <span style={{ fontWeight: 700, color: '#ffd700' }}>{speaker}</span>
+          {total > 1 && (
+            <span style={{ display: 'flex', gap: 4 }} aria-hidden>
+              {lines.map((_, i) => (
+                <span key={i} style={{ width: 6, height: 6, borderRadius: 3, background: i < shown ? '#ffd700' : 'rgba(255,255,255,0.25)', transition: 'background 200ms' }} />
+              ))}
+            </span>
+          )}
+        </div>
+      )}
+      {lines.slice(0, shown - 1).map((l, i) => <div key={i} style={{ marginBottom: 4, opacity: 0.7 }}>{l}</div>)}
+      {currentLine && (
+        <div key={shown} style={{ marginBottom: 4, animation: 'mmLineIn 200ms ease-out' }}>
+          {currentLine.slice(0, charCount)}{!typewriterDone && <span style={{ opacity: 0.7 }}>▌</span>}
+        </div>
+      )}
+      {!atEnd && typewriterDone && (
+        <div style={{ fontSize: 11, opacity: 0.6, marginTop: 6 }}>▾ {hint ? `${hint} to continue` : 'tap to continue'}</div>
+      )}
+      {atEnd && !choices?.length && onDone && (
+        <div style={{ fontSize: 11, opacity: 0.5, marginTop: 6 }}>{hint ? `${hint} to close` : 'tap to close'}</div>
+      )}
+      {atEnd && !!choices?.length && (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 6, marginTop: 10, animation: 'mmLineIn 220ms ease-out' }}>
+          {choices.map((c, i) => {
             const affordable = balance === undefined || -c.cost <= balance;
             return (
               <button
                 key={c.id}
-                style={{ ...hud.choiceBtn, ...(affordable ? {} : hud.choiceBtnDisabled) }}
+                style={{ ...hud.choiceBtn, ...(affordable ? {} : hud.choiceBtnDisabled), display: 'flex', gap: 8, alignItems: 'flex-start' }}
                 disabled={!affordable}
-                onClick={(e) => { e.stopPropagation(); if (affordable && choiceReady()) onChoose(c); }}
+                onClick={(e) => { e.stopPropagation(); pick(c); }}
               >
-                <div>{c.label}{!affordable && <span style={{ color: '#ff8080', fontWeight: 400 }}> — can't afford</span>}</div>
-                <div style={{ fontSize: 11, opacity: 0.7 }}>{c.sublabel}</div>
+                {numberKeys && <span style={{ fontSize: 10, opacity: 0.55, border: '1px solid rgba(255,255,255,0.3)', borderRadius: 3, padding: '0 4px', marginTop: 1 }}>{i + 1}</span>}
+                <span>
+                  <div>{c.label}{!affordable && <span style={{ color: '#ff8080', fontWeight: 400 }}> — can't afford</span>}</div>
+                  <div style={{ fontSize: 11, opacity: 0.7 }}>{c.sublabel}</div>
+                </span>
               </button>
             );
           })}
         </div>
       )}
+    </div>
+  );
+}
+
+const VERDICT_STYLE: Record<'good' | 'bad' | 'tradeoff' | 'none', { label: string; icon: string; color: string; bg: string }> = {
+  good:     { label: 'SMART MOVE',  icon: '✅', color: '#3fb950', bg: 'linear-gradient(135deg, #12261a 0%, #0b170f 100%)' },
+  bad:      { label: 'COSTLY MOVE', icon: '⚠️', color: '#ff6b6b', bg: 'linear-gradient(135deg, #2a1414 0%, #1a0b0b 100%)' },
+  tradeoff: { label: 'TRADE-OFF',   icon: '⚖️', color: '#f0b429', bg: 'linear-gradient(135deg, #2a2210 0%, #19140a 100%)' },
+  none:     { label: 'DECISION',    icon: '📝', color: '#79c0ff', bg: 'linear-gradient(135deg, #111c2a 0%, #0b1119 100%)' },
+};
+const money2 = (n: number) => `${n < 0 ? '-' : '+'}$${Math.abs(n).toFixed(2)}`;
+const cleanLabel = (l: string) => l.replace(/^\P{L}+/u, '').trim();
+
+/** The card that pops up right after a money decision: smart / trade-off / costly, what it did to
+ *  your money, what happened, and the lesson. Tap to dismiss; it also fades on its own. */
+function DecisionCard({ d, onClose }: { d: DecisionRecord; onClose: () => void }) {
+  const v = VERDICT_STYLE[d.verdict ?? 'none'];
+  return (
+    <div onClick={onClose} role="status" style={{
+      position: 'absolute', top: 58, left: '50%', transform: 'translateX(-50%)', zIndex: 60,
+      width: 'min(380px, 92vw)', background: v.bg, border: `2px solid ${v.color}`, borderRadius: 12,
+      padding: '10px 14px', color: '#fff', fontFamily: 'monospace', cursor: 'pointer',
+      boxShadow: `0 6px 24px ${v.color}40`, animation: 'mmCardIn 280ms cubic-bezier(.2,1.3,.4,1)',
+    }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 4 }}>
+        <span style={{ fontSize: 12, fontWeight: 700, letterSpacing: 1, color: v.color }}>{v.icon} {v.label}</span>
+        {d.amount !== 0 && (
+          <span style={{ fontSize: 13, fontWeight: 700, color: d.amount > 0 ? '#7cfc00' : '#ff8080' }}>{money2(d.amount)}</span>
+        )}
+      </div>
+      <div style={{ fontSize: 13, fontWeight: 700, marginBottom: 2 }}>{cleanLabel(d.choice)}</div>
+      <div style={{ fontSize: 12, opacity: 0.85, lineHeight: 1.45 }}>{d.consequence}</div>
+      {d.lesson && (
+        <div style={{ marginTop: 8, paddingTop: 7, borderTop: '1px solid rgba(255,255,255,0.12)', fontSize: 12, lineHeight: 1.5, color: '#e8f5e9' }}>
+          <span style={{ color: '#ffd23f', fontWeight: 700 }}>💡 Money lesson · </span>{d.lesson}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** "Today so far" strip on the end-of-day card: how many smart / trade-off / costly decisions, and
+ *  the lesson of the day. */
+function DecisionTally({ decisions }: { decisions: DecisionRecord[] }) {
+  if (!decisions.length) return null;
+  const n = (v: DecisionRecord['verdict']) => decisions.filter(d => d.verdict === v).length;
+  const lesson = lessonOfTheDay(decisions);
+  return (
+    <div style={{ background: '#0d1117', borderRadius: 8, padding: '8px 12px', marginBottom: 12, textAlign: 'left' }}>
+      <div style={{ fontSize: 12, display: 'flex', gap: 12, justifyContent: 'center', marginBottom: lesson ? 6 : 0 }}>
+        <span style={{ color: '#3fb950' }}>✅ {n('good')} smart</span>
+        <span style={{ color: '#f0b429' }}>⚖️ {n('tradeoff')} trade-off</span>
+        <span style={{ color: '#ff6b6b' }}>⚠️ {n('bad')} costly</span>
+      </div>
+      {lesson && <div style={{ fontSize: 12, lineHeight: 1.45 }}><span style={{ color: '#ffd23f', fontWeight: 700 }}>💡 Today: </span>{lesson}</div>}
+    </div>
+  );
+}
+
+/** The day's headline lesson: the one from your costliest slip if there was one (that's the one
+ *  worth remembering), otherwise from your best move. */
+function lessonOfTheDay(decisions: DecisionRecord[]): string | null {
+  const withLesson = decisions.filter(d => d.lesson);
+  const bad = withLesson.filter(d => d.verdict === 'bad').sort((a, b) => a.amount - b.amount)[0];
+  const good = withLesson.filter(d => d.verdict === 'good').sort((a, b) => b.amount - a.amount)[0];
+  return (bad ?? good ?? withLesson[0])?.lesson ?? null;
+}
+
+/** The morning-after recap of yesterday: money in/out, every decision colour-coded, and the
+ *  lessons it taught — so each day ends on what you learned, not just a balance. */
+function DayRecapModal({ view, rec, onClose }: { view: ReturnType<typeof dayToSummaryView>; rec: DayRecord; onClose: () => void }) {
+  const decisions = rec.decisions ?? [];
+  const lessons = [...new Set(decisions.filter(d => d.lesson).map(d => d.lesson!))];
+  const headline = lessonOfTheDay(decisions);
+  const n = (v: DecisionRecord['verdict']) => decisions.filter(d => d.verdict === v).length;
+  const scored = n('good') + n('bad') + n('tradeoff');
+  const delta = rec.endBalance - rec.startBalance;
+  return (
+    <div style={hud.modalBackdrop}>
+      <div style={{ ...hud.modal, width: 'min(440px, 94vw)', maxHeight: '88dvh', overflowY: 'auto', animation: 'mmPop 260ms ease-out' }}>
+        <h2 style={{ margin: '0 0 4px', textAlign: 'center' }}>{view.title}</h2>
+        <div style={{ textAlign: 'center', fontSize: 13, marginBottom: 12 }}>
+          {view.moneyLine} <span style={{ color: delta >= 0 ? '#7cfc00' : '#ff8080', fontWeight: 700 }}>({money2(delta)})</span>
+          <div style={{ opacity: 0.75, fontSize: 12, marginTop: 2 }}>{view.spentLine}</div>
+        </div>
+
+        {scored > 0 && (
+          <div style={{ marginBottom: 12 }}>
+            <div style={{ display: 'flex', height: 8, borderRadius: 4, overflow: 'hidden', background: '#21262d' }}>
+              <div style={{ width: `${(n('good') / scored) * 100}%`, background: '#3fb950' }} />
+              <div style={{ width: `${(n('tradeoff') / scored) * 100}%`, background: '#f0b429' }} />
+              <div style={{ width: `${(n('bad') / scored) * 100}%`, background: '#ff6b6b' }} />
+            </div>
+            <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 11, marginTop: 4, opacity: 0.85 }}>
+              <span style={{ color: '#3fb950' }}>✅ {n('good')} smart</span>
+              <span style={{ color: '#f0b429' }}>⚖️ {n('tradeoff')} trade-off</span>
+              <span style={{ color: '#ff6b6b' }}>⚠️ {n('bad')} costly</span>
+            </div>
+          </div>
+        )}
+
+        <div style={{ fontSize: 12, fontWeight: 700, letterSpacing: 1, opacity: 0.7, marginBottom: 6 }}>YOUR DECISIONS</div>
+        {decisions.length === 0 && <div style={{ fontSize: 13, opacity: 0.7, marginBottom: 10 }}>No big money decisions today.</div>}
+        {decisions.map((d, i) => {
+          const v = VERDICT_STYLE[d.verdict ?? 'none'];
+          return (
+            <div key={i} style={{ display: 'flex', gap: 8, alignItems: 'flex-start', padding: '6px 8px', marginBottom: 4, borderRadius: 6, background: '#0d1117', borderLeft: `3px solid ${v.color}` }}>
+              <span style={{ fontSize: 13 }}>{v.icon}</span>
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <div style={{ fontSize: 12, fontWeight: 700 }}>{cleanLabel(d.choice)}</div>
+                <div style={{ fontSize: 11, opacity: 0.7 }}>{d.consequence}</div>
+              </div>
+              {d.amount !== 0 && <span style={{ fontSize: 12, fontWeight: 700, color: d.amount > 0 ? '#7cfc00' : '#ff8080', whiteSpace: 'nowrap' }}>{money2(d.amount)}</span>}
+            </div>
+          );
+        })}
+
+        {lessons.length > 0 && (
+          <>
+            <div style={{ fontSize: 12, fontWeight: 700, letterSpacing: 1, opacity: 0.7, margin: '12px 0 6px' }}>💡 WHAT YOU LEARNED</div>
+            {headline && (
+              <div style={{ fontSize: 13, lineHeight: 1.5, padding: '8px 10px', borderRadius: 8, background: '#1f1a08', border: '1px solid #ffd23f', marginBottom: 6 }}>
+                <span style={{ color: '#ffd23f', fontWeight: 700 }}>Lesson of the day: </span>{headline}
+              </div>
+            )}
+            {lessons.filter(l => l !== headline).slice(0, 4).map((l, i) => (
+              <div key={i} style={{ fontSize: 12, lineHeight: 1.45, marginBottom: 4, paddingLeft: 10, borderLeft: '2px solid #4caf50' }}>{l}</div>
+            ))}
+          </>
+        )}
+
+        <div style={{ fontSize: 11, opacity: 0.6, marginTop: 12, textAlign: 'center' }}>
+          {[view.schoolLine, view.missionsLine, view.timeLine].filter(Boolean).join(' · ')}
+        </div>
+        <button style={{ ...btnStyle, marginTop: 14 }} onClick={onClose}>Start the day</button>
+      </div>
     </div>
   );
 }
@@ -1480,7 +1843,12 @@ function draw(ctx: CanvasRenderingContext2D, cw: number, ch: number, store: Game
   // Y-sort buildings themselves against the player).
   for (const p of PLACES) {
     const x = p.tx * TILE_PX, y = p.ty * TILE_PX, w = p.tw * TILE_PX, h = p.th * TILE_PX;
-    if (p.interior === 'none') { ctx.fillStyle = 'rgba(60,120,60,0.5)'; ctx.fillRect(x, y, w, h); continue; }
+    if (p.interior === 'none') {
+      const parkImg = p.id === 'park' ? getImg(p.sprite ?? '') : null;
+      if (parkImg) ctx.drawImage(parkImg, x, y, w, h);
+      else { ctx.fillStyle = 'rgba(60,120,60,0.5)'; ctx.fillRect(x, y, w, h); }
+      continue;
+    }
     const open = placeIsOpen(p.id, s.minutes);
     const img = p.sprite ? getImg(p.sprite) : null;
     if (img) {
@@ -1627,8 +1995,10 @@ function drawInterior(ctx: CanvasRenderingContext2D, cw: number, ch: number, sto
   // native size and a huge monitor never blows it up into blurry oversized tiles. Every draw call
   // below this point still uses plain room-local pixel coordinates (tx*T, ty*T, …) — only the
   // translate/scale setup changes, so nothing else in this function needed to move.
-  const scale = Math.min(3, Math.max(1, Math.min((cw * 0.92) / roomW, (ch * 0.85) / roomH)));
-  const ox = Math.round((cw - roomW * scale) / 2), oy = Math.round((ch - roomH * scale) / 2);
+  // A back wall (wallpaper strip) sits above row 0 — it's part of the picture, so fit it in too.
+  const wallH = interior.wall ? T * 1.5 : 0;
+  const scale = Math.min(3, Math.max(1, Math.min((cw * 0.92) / roomW, (ch * 0.85) / (roomH + wallH))));
+  const ox = Math.round((cw - roomW * scale) / 2), oy = Math.round((ch - (roomH + wallH) * scale) / 2 + wallH * scale);
 
   ctx.save();
   ctx.translate(ox, oy);
@@ -1636,7 +2006,19 @@ function drawInterior(ctx: CanvasRenderingContext2D, cw: number, ch: number, sto
 
   // walls (room bounding rect) + floor
   ctx.fillStyle = interior.wallColor;
-  ctx.fillRect(-8, -8, roomW + 16, roomH + 16);
+  ctx.fillRect(-8, -8 - wallH, roomW + 16, roomH + 16 + wallH);
+  if (interior.wall) {
+    const wallImg = getImg('/sprites/interiors/room_builder.png');
+    if (wallImg) {
+      for (let tx = 0; tx < interior.widthTiles; tx++) {
+        ctx.drawImage(wallImg, interior.wall.sx, interior.wall.sy, 48, 96, tx * T, -wallH, T, wallH);
+      }
+    }
+    for (const d of interior.wallDecor ?? []) {
+      const img = getImg(d.sprite.src);
+      if (img) ctx.drawImage(img, d.sprite.sx, d.sprite.sy, d.sprite.sw, d.sprite.sh, d.tx * T, -wallH + (wallH - d.th * T) * 0.45, d.tw * T, d.th * T);
+    }
+  }
   const floorImg = getImg(interior.floorSprite.src);
   for (let ty = 0; ty < interior.heightTiles; ty++) {
     for (let tx = 0; tx < interior.widthTiles; tx++) {
@@ -1645,6 +2027,13 @@ function drawInterior(ctx: CanvasRenderingContext2D, cw: number, ch: number, sto
         ctx.drawImage(floorImg, f.sx, f.sy, f.sw, f.sh, tx * T, ty * T, T, T);
       } else { ctx.fillStyle = '#7a5a3a'; ctx.fillRect(tx * T, ty * T, T, T); }
     }
+  }
+  if (interior.wall) {
+    // a soft shadow where the back wall meets the floor
+    const g = ctx.createLinearGradient(0, 0, 0, T * 0.35);
+    g.addColorStop(0, 'rgba(0,0,0,0.28)'); g.addColorStop(1, 'rgba(0,0,0,0)');
+    ctx.fillStyle = g;
+    ctx.fillRect(0, 0, roomW, T * 0.35);
   }
 
   // door markers — one per link (leave the building, or hop to another room in it)
@@ -1661,7 +2050,7 @@ function drawInterior(ctx: CanvasRenderingContext2D, cw: number, ch: number, sto
   // furniture (Y-sorted with the player below)
   type Drawable = { y: number; draw: () => void };
   const drawables: Drawable[] = interior.furniture.map(f => ({
-    y: (f.ty + f.th) * T,
+    y: (f.sortY ?? f.ty + f.th) * T,
     draw: () => {
       const x = f.tx * T, y = f.ty * T, w = f.tw * T, h = f.th * T;
       if (f.sprite) {
@@ -1869,6 +2258,10 @@ interface Toast {
   lines: string[];
   tone?: 'plain' | 'gold' | 'blue' | 'green';
   ms?: number;
+  /** Shown even while a conversation is open (e.g. "You can't afford that"). */
+  urgent?: boolean;
+  /** Dropped from the queue if it no longer applies by the time it would show (a message already read). */
+  isStale?: () => boolean;
   onClick?: () => void;
 }
 const TOAST_COLORS: Record<NonNullable<Toast['tone']>, string> = { plain: '#555', gold: '#ffd23f', blue: '#7cc7ff', green: '#3fb950' };
@@ -1879,6 +2272,9 @@ const TRANSITION_CSS = `
 @keyframes mmFade { 0% { opacity: 0 } 15% { opacity: 1 } 85% { opacity: 1 } 100% { opacity: 0 } }
 @keyframes mmPop { from { transform: scale(0.85); opacity: 0 } to { transform: scale(1); opacity: 1 } }
 @keyframes mmPhoneUp { from { transform: translateY(40px); opacity: 0 } to { transform: translateY(0); opacity: 1 } }
+@keyframes mmDialogIn { from { transform: translate(-50%, 14px); opacity: 0 } to { transform: translate(-50%, 0); opacity: 1 } }
+@keyframes mmLineIn { from { transform: translateY(4px); opacity: 0 } to { transform: translateY(0); opacity: 1 } }
+@keyframes mmCardIn { from { transform: translate(-50%, -16px) scale(0.94); opacity: 0 } to { transform: translate(-50%, 0) scale(1); opacity: 1 } }
 @keyframes mmToastIn { from { transform: translateY(-12px); opacity: 0 } to { transform: translateY(0); opacity: 1 } }
 @keyframes mmPulse { 0%, 100% { transform: scale(1) } 50% { transform: scale(1.08) } }
 @keyframes mmRunFrames { from { background-position: -1152px 0 } to { background-position: -1536px 0 } }

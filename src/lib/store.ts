@@ -44,7 +44,7 @@ import {
 import type { MissionStep } from './missions';
 import { DAILY_POOLS } from './dailyMissions';
 import type {
-  ActivityTag, DayRecord, GameEvent, GameState, MissionRuntime, NpcRuntime, PlaceId, SceneId, WeekRecord,
+  ActivityTag, DayRecord, DecisionRecord, GameEvent, GameState, MissionRuntime, NpcRuntime, PlaceId, SceneId, WeekRecord,
 } from './types';
 import { ACHIEVEMENTS, checkAchievements } from './achievements';
 import { LIFE_EVENTS, rollLifeEvent } from './lifeEvents';
@@ -53,10 +53,14 @@ import {
   doorTile, getPlace, isOpen, closedReason, npcPlaceAt, rideMinutes, routeTiles, stopById, tileToPx,
   getInterior, INTERIOR_TILE_PX, PLACE_INTERIOR_SCENE, npcRoomAt, interiorBlocked,
 } from './world';
+import { verdictFor } from './content/verdicts';
 import type { ShopItemDef } from './world';
 
 export const BASE_MINUTES_PER_SECOND = TIME_SCALE;
 const RIDE_REAL_SECONDS = 6;          // a bus trip plays out over ~6 real seconds
+/** When a bus pulls in at the stop the player is standing at, the driver holds the doors for this
+ *  many REAL seconds (the clock pauses) so there's time to decide. Walking away ends the hold. */
+export const BUS_HOLD_REAL_SECONDS = 15;
 const SCHOOL_END = hm(15, 30);         // anyone who never made it to class/lectures is absent from here
 const PASS_OUT_AT = hm(2, 0);         // stay up past 2 AM and you fall asleep where you are
 const WAKE_AT = hm(7, 0);
@@ -204,6 +208,9 @@ export class GameStore {
   private activities!: ActivitySystem;
   /** One-line notices for the HUD (e.g. "Closed — opens at 7:30 AM"), drained by takeNotices(). */
   private noticeQueue: string[] = [];
+  private decisionQueue: DecisionRecord[] = [];
+  /** Driver-waits hold for the bus at the player's stop: which arrival it's for, and real seconds left. */
+  private busHold: { key: string; left: number } | null = null;
 
   /** This path's rules (goals, cast, timetable, week start/recap) — see pathRules.ts. */
   readonly rules: PathRules;
@@ -307,6 +314,22 @@ export class GameStore {
   tick(dtSec: number, movedTiles: number, mode: 'walk' | 'bike' = 'walk') {
     const s = this.state;
     if (s.paused || s.sleeping) return;
+    // The bus driver waits while you're standing at the stop deciding — the clock holds for up to
+    // BUS_HOLD_REAL_SECONDS real seconds per arrival (moving off ends the hold).
+    if (!s.ride && s.player.scene === 'outdoor' && movedTiles === 0) {
+      const stopId = this.playerNearBusStop();
+      const bus = stopId ? busAtStop(stopId, s.minutes) : null;
+      if (bus) {
+        const key = `${stopId}@${bus.arrivesAt}`;
+        if (!this.busHold || this.busHold.key !== key) this.busHold = { key, left: BUS_HOLD_REAL_SECONDS };
+        if (this.busHold.left > 0) {
+          this.busHold.left -= dtSec;
+          this.stepNpcs(dtSec * BASE_MINUTES_PER_SECOND * 0.25);
+          this.touch();
+          return;
+        }
+      }
+    }
     let minutes: number;
     if (s.ride) {
       const total = s.ride.endsAt - s.ride.startedAt;
@@ -1350,10 +1373,31 @@ export class GameStore {
         const cur = s.world.relationships[choice.relationship.npc] ?? 0;
         s.world.relationships[choice.relationship.npc] = Math.max(-5, Math.min(5, cur + choice.relationship.delta));
       }
+      this.recordDecision({
+        key: `life:${def!.id}:${choice.id}`, title: `${def!.emoji} ${def!.text}`, choice: choice.label,
+        consequence: choice.consequence, lesson: choice.lesson, amount: choice.amount,
+      });
     }
     s.pendingLifeEvent = undefined;
     this.touch(true);
   }
+
+  // ══ DECISIONS ════════════════════════════════════════════════════════════
+  /** Log a choice into today's record with its money verdict, and queue it for the decision card.
+   *  Only real decisions are kept: ones with a verdict or a lesson. */
+  private recordDecision(d: Omit<DecisionRecord, 'verdict' | 'minutes'>) {
+    const verdict = verdictFor(d.key);
+    if (!verdict && !d.lesson) return; // plain receipts (pocket money arriving) aren't decisions
+    const rec: DecisionRecord = { ...d, verdict, minutes: this.state.minutes };
+    (this.state.today.decisions ??= []).push(rec);
+    this.decisionQueue.push(rec);
+  }
+  /** Log a decision made through a UI activity rather than a mission choice (e.g. helping Mum). */
+  noteDecision(key: string, title: string, choice: string, consequence: string, amount = 0, lesson?: string) {
+    this.recordDecision({ key, title, choice, consequence, amount, lesson });
+  }
+  /** Decisions made since the UI last asked (consumes the queue) — drives the decision card. */
+  takeDecisions(): DecisionRecord[] { const q = this.decisionQueue; this.decisionQueue = []; return q; }
 
   startMission(id: string) {
     const rt = this.runtime(id);
@@ -1471,6 +1515,10 @@ export class GameStore {
     }
     if (choice.social) s.today.socialActivities += 1;
     rt.outcome = choice.id;
+    this.recordDecision({
+      key: `${def.id}:${choice.id}`, title: def.name, choice: choice.label,
+      consequence: choice.consequence, lesson: choice.lesson, amount: choice.cost,
+    });
 
     // Started in time = can't expire underneath you: a 3-hour trial shift begun at 1:20 must not be
     // marked "missed" at 3:30 halfway through it. Leave a little time for a follow-up step, too.
@@ -1795,6 +1843,17 @@ export class GameStore {
     return null;
   }
 
+  /** Real seconds the bus at the player's stop will keep waiting (0 if no bus is holding). */
+  busHoldSecondsLeft(): number {
+    const s = this.state;
+    const stopId = this.playerNearBusStop();
+    const bus = stopId ? busAtStop(stopId, s.minutes) : null;
+    if (!bus) return 0;
+    const key = `${stopId}@${bus.arrivesAt}`;
+    if (!this.busHold || this.busHold.key !== key) return BUS_HOLD_REAL_SECONDS;
+    return Math.max(0, this.busHold.left);
+  }
+
   playerNearBusStop(): string | null {
     const s = this.state;
     for (const stop of Object.values(BUS_STOPS)) {
@@ -1860,7 +1919,7 @@ export class GameStore {
     s.today.bedtimeMinuteOfDay = passedOut ? PASS_OUT_AT : p.minuteOfDay;
     s.today.endBalance = s.finance.accounts.cash;
     if (this.rules.study && p.dayOfWeek < 5 && s.today.schoolAttended === null) s.today.schoolAttended = false;
-    const record: DayRecord = { ...s.today, missionsCompleted: [...s.today.missionsCompleted], missionsMissed: [...s.today.missionsMissed], travel: [...s.today.travel] };
+    const record: DayRecord = { ...s.today, missionsCompleted: [...s.today.missionsCompleted], missionsMissed: [...s.today.missionsMissed], travel: [...s.today.travel], decisions: [...(s.today.decisions ?? [])] };
     s.weekDays.push(record);
     this.emit({ type: 'day_end', day: record.day, minutes: s.minutes });
 

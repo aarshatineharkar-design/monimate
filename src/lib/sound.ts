@@ -413,4 +413,21 @@ export const sfx = {
   chime() {
     [659, 784, 988].forEach((f, i) => tone(f, 0.15, 'sine', 0.1, i * 0.1));
   },
+
+  /** Decision feedback: a bright two-note rise for a smart move, a soft low dip for a costly one. */
+  goodMove() {
+    tone(660, 0.09, 'triangle', 0.09);
+    tone(990, 0.14, 'triangle', 0.09, 0.08);
+  },
+  badMove() {
+    tone(300, 0.12, 'triangle', 0.09);
+    tone(220, 0.18, 'triangle', 0.08, 0.1);
+  },
+  tradeoff() {
+    tone(520, 0.1, 'sine', 0.07);
+  },
+  /** A soft blip for a new message / notification. */
+  notify() {
+    tone(880, 0.06, 'sine', 0.06);
+  },
 };
